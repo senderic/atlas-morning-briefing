@@ -11,7 +11,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from scripts.bedrock_client import BedrockClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,15 +47,15 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, bedrock: BedrockClient, config: Dict[str, Any]):
+    def __init__(self, llm_client, config: Dict[str, Any]):
         """
         Initialize BriefingIntelligence.
 
         Args:
-            bedrock: BedrockClient instance.
+            llm_client: LLM client instance (e.g. BedrockClient or GeminiClient).
             config: Full config dictionary.
         """
-        self.bedrock = bedrock
+        self.bedrock = llm_client
         self.config = config
         self.topics = config.get("arxiv_topics", [])
 

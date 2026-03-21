@@ -32,27 +32,30 @@ logger = logging.getLogger(__name__)
 class EmailDistributor:
     """Distributes briefings via email to multiple recipients."""
 
-    SMTP_SERVER = "smtp.gmail.com"
-    SMTP_PORT = 587
-
     def __init__(
         self,
         sender_email: str,
         sender_password: str,
+        smtp_server: str = "smtp.gmail.com",
+        smtp_port: int = 587,
     ):
         """
         Initialize EmailDistributor.
 
         Args:
-            sender_email: Gmail address.
-            sender_password: Gmail app password.
+            sender_email: Sender email address.
+            sender_password: Email password or app password.
+            smtp_server: SMTP server address.
+            smtp_port: SMTP server port.
         """
         self.sender_email = sender_email
         self.sender_password = sender_password
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create and authenticate SMTP connection."""
-        server = smtplib.SMTP(self.SMTP_SERVER, self.SMTP_PORT)
+        server = smtplib.SMTP(self.smtp_server, self.smtp_port)
         server.starttls()
         server.login(self.sender_email, self.sender_password)
         return server

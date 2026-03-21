@@ -134,6 +134,29 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                                 "(expected: heavy, medium, light)"
                             )
 
+    # --- Gemini config ---
+    gemini = config.get("gemini")
+    if gemini is not None:
+        if not isinstance(gemini, dict):
+            errors.append("'gemini' must be a dictionary")
+        else:
+            models = gemini.get("models")
+            if models is not None:
+                if not isinstance(models, dict):
+                    errors.append("gemini.models must be a dictionary")
+                else:
+                    for tier in models:
+                        if tier not in ("heavy", "medium", "light"):
+                            warnings.append(
+                                f"gemini.models.{tier} is not a recognized tier "
+                                "(expected: heavy, medium, light)"
+                            )
+
+    # --- LLM Provider config ---
+    llm_provider = config.get("llm_provider", "bedrock")
+    if llm_provider not in ("bedrock", "gemini"):
+        errors.append(f"'llm_provider' must be 'bedrock' or 'gemini', got '{llm_provider}'")
+
     # --- Log results ---
     for w in warnings:
         logger.warning(f"Config warning: {w}")
@@ -171,14 +194,23 @@ def check_environment(config: Dict[str, Any], dry_run: bool = False) -> List[str
                 "BRAVE_API_KEY not set -- news aggregation will be skipped"
             )
 
-    # Email requires Gmail credentials (unless dry run)
+    # Email requires SMTP/Gmail credentials (unless dry run)
     if not dry_run:
-        if not os.environ.get("GMAIL_USER"):
-            warnings.append("GMAIL_USER not set -- Kindle delivery will be skipped")
-        if not os.environ.get("GMAIL_APP_PASSWORD"):
+        smtp_user = config.get("smtp_user", os.environ.get("SMTP_USER", os.environ.get("GMAIL_USER")))
+        smtp_pass = config.get("smtp_password", os.environ.get("SMTP_PASSWORD", os.environ.get("GMAIL_APP_PASSWORD")))
+        if not smtp_user:
+            warnings.append("SMTP_USER/GMAIL_USER not set -- Email delivery will be skipped")
+        if not smtp_pass:
             warnings.append(
-                "GMAIL_APP_PASSWORD not set -- Kindle delivery will be skipped"
+                "SMTP_PASSWORD/GMAIL_APP_PASSWORD not set -- Email delivery will be skipped"
             )
+
+    # LLM config
+    llm_provider = config.get("llm_provider", "bedrock").lower()
+    if llm_provider == "gemini":
+        gemini_config = config.get("gemini", {})
+        if not gemini_config.get("api_key") and not os.environ.get("GEMINI_API_KEY"):
+            warnings.append("Gemini API key not found in config.yaml or GEMINI_API_KEY env var -- Gemini features will be disabled")
 
     for w in warnings:
         logger.warning(w)

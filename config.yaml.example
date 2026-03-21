@@ -145,6 +145,10 @@ pdf:
   include_toc: true
   include_emoji: false
 
+# LLM Provider Configuration
+# Choose between "bedrock" or "gemini"
+llm_provider: "bedrock"
+
 # Amazon Bedrock configuration
 # Set enabled: false to run in deterministic mode (no LLM, zero cost)
 bedrock:
@@ -156,6 +160,24 @@ bedrock:
     heavy: "us.anthropic.claude-sonnet-4-20250514-v1:0"
     medium: "us.anthropic.claude-sonnet-4-20250514-v1:0"
     light: "amazon.nova-lite-v1:0"
+
+# Google Gemini configuration
+# Requires GEMINI_API_KEY environment variable, or api_key configured here
+gemini:
+  enabled: true
+  # api_key: "YOUR_GEMINI_API_KEY"
+  temperature: 0.3
+  max_tokens: 2048
+  models:
+    heavy: "gemini-2.5-pro"
+    medium: "gemini-2.5-flash"
+    light: "gemini-2.5-flash-8b"
+
+# SMTP Configuration (Optional, defaults to Gmail if using GMAIL_USER)
+# smtp_server: "smtp.gmail.com"
+# smtp_port: 587
+# smtp_user: "your-sender@gmail.com"
+# smtp_password: "your-app-password"
 
 # Logging
 log_level: "INFO"

@@ -35,6 +35,7 @@ from scripts.pdf_generator import PDFGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.bedrock_client import BedrockClient
+from scripts.gemini_client import GeminiClient
 from scripts.intelligence import BriefingIntelligence
 
 
@@ -75,10 +76,16 @@ class BriefingRunner:
             "elapsed_seconds": 0,
         }
 
-        # Initialize Bedrock client and intelligence layer
-        bedrock_config = config.get("bedrock", {})
-        self.bedrock = BedrockClient(bedrock_config)
-        self.intelligence = BriefingIntelligence(self.bedrock, config)
+        # Initialize LLM client and intelligence layer
+        llm_provider = config.get("llm_provider", "bedrock").lower()
+        if llm_provider == "gemini":
+            gemini_config = config.get("gemini", {})
+            self.llm_client = GeminiClient(gemini_config)
+        else:
+            bedrock_config = config.get("bedrock", {})
+            self.llm_client = BedrockClient(bedrock_config)
+
+        self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -751,17 +758,21 @@ class BriefingRunner:
             logger.info("Dry run: Skipping all distribution")
             return {}
 
-        sender_email = os.environ.get("GMAIL_USER")
-        sender_password = os.environ.get("GMAIL_APP_PASSWORD")
+        sender_email = self.config.get("smtp_user", os.environ.get("SMTP_USER", os.environ.get("GMAIL_USER")))
+        sender_password = self.config.get("smtp_password", os.environ.get("SMTP_PASSWORD", os.environ.get("GMAIL_APP_PASSWORD")))
+        smtp_server = self.config.get("smtp_server", os.environ.get("SMTP_SERVER", "smtp.gmail.com"))
+        smtp_port = self.config.get("smtp_port", int(os.environ.get("SMTP_PORT", 587)))
 
         if not sender_email or not sender_password:
-            logger.warning("Gmail credentials not set, skipping distribution")
+            logger.warning("SMTP credentials not set, skipping distribution")
             return {}
 
         try:
             distributor = EmailDistributor(
                 sender_email=sender_email,
                 sender_password=sender_password,
+                smtp_server=smtp_server,
+                smtp_port=smtp_port,
             )
 
             results = distributor.distribute(
