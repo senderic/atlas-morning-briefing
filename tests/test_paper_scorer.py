@@ -2,6 +2,7 @@
 """Tests for paper_scorer module."""
 
 import pytest
+from datetime import datetime, timezone, timedelta
 from scripts.paper_scorer import PaperScorer
 
 
@@ -16,6 +17,12 @@ def default_scorer():
 
 @pytest.fixture
 def sample_papers():
+    now = datetime.now(timezone.utc)
+    # Use dates within the last few days to ensure they are considered relatively recent
+    date1 = (now - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    date2 = (now - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    date3 = (now - timedelta(days=0)).isoformat().replace("+00:00", "Z")
+
     return [
         {
             "id": "2401.00001",
@@ -23,7 +30,7 @@ def sample_papers():
             "summary": "We propose a benchmark for evaluating multi-agent systems. "
             "Code available at github.com/example/benchmark.",
             "authors": ["Alice", "Bob"],
-            "published": "2026-03-05T00:00:00Z",
+            "published": date1,
             "categories": ["cs.AI"],
             "arxiv_url": "http://arxiv.org/abs/2401.00001",
             "pdf_link": "http://arxiv.org/pdf/2401.00001.pdf",
@@ -33,7 +40,7 @@ def sample_papers():
             "title": "Quantum Computing for Drug Discovery",
             "summary": "We demonstrate quantum advantage for molecular simulation.",
             "authors": ["Charlie"],
-            "published": "2026-03-04T00:00:00Z",
+            "published": date2,
             "categories": ["quant-ph"],
             "arxiv_url": "http://arxiv.org/abs/2401.00002",
             "pdf_link": "http://arxiv.org/pdf/2401.00002.pdf",
@@ -44,7 +51,7 @@ def sample_papers():
             "summary": "A simple and efficient approach to tool use evaluation. "
             "Source code is provided.",
             "authors": ["Diana", "Eve"],
-            "published": "2026-03-06T00:00:00Z",
+            "published": date3,
             "categories": ["cs.CL"],
             "arxiv_url": "http://arxiv.org/abs/2401.00003",
             "pdf_link": "http://arxiv.org/pdf/2401.00003.pdf",
@@ -104,12 +111,14 @@ class TestCalculateTopicMatch:
 
 class TestCalculateRecencyScore:
     def test_recent_paper_scores_high(self, default_scorer):
-        paper = {"published": "2026-03-06T00:00:00Z"}
+        now = datetime.now(timezone.utc)
+        recent_date = (now - timedelta(hours=12)).isoformat().replace("+00:00", "Z")
+        paper = {"published": recent_date}
         score = default_scorer.calculate_recency_score(paper)
         assert score > 0.9
 
     def test_old_paper_scores_low(self, default_scorer):
-        paper = {"published": "2025-01-01T00:00:00Z"}
+        paper = {"published": "2020-01-01T00:00:00Z"}
         score = default_scorer.calculate_recency_score(paper)
         assert score < 0.1
 

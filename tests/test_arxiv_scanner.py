@@ -5,15 +5,22 @@ import pytest
 from scripts.arxiv_scanner import ArxivScanner
 
 
-SAMPLE_ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
+from datetime import datetime, timezone, timedelta
+
+def get_sample_arxiv_xml():
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    old = "2020-01-01T00:00:00Z"
+    
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <title>ArXiv Query</title>
   <entry>
     <id>http://arxiv.org/abs/2401.00001v1</id>
     <title>Evaluating Multi-Agent Systems</title>
     <summary>We propose a benchmark for agent evaluation.</summary>
-    <published>2026-03-05T00:00:00Z</published>
-    <updated>2026-03-05T00:00:00Z</updated>
+    <published>{recent}</published>
+    <updated>{recent}</updated>
     <author><name>Alice Smith</name></author>
     <author><name>Bob Jones</name></author>
     <category term="cs.AI"/>
@@ -24,8 +31,8 @@ SAMPLE_ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <id>http://arxiv.org/abs/2401.00002v1</id>
     <title>Old Paper on Something</title>
     <summary>This is an old paper.</summary>
-    <published>2020-01-01T00:00:00Z</published>
-    <updated>2020-01-01T00:00:00Z</updated>
+    <published>{old}</published>
+    <updated>{old}</updated>
     <author><name>Charlie</name></author>
     <category term="cs.AI"/>
   </entry>
@@ -46,9 +53,10 @@ def scanner():
 class TestParseArxivResponse:
     def test_parses_valid_entry(self, scanner):
         from datetime import datetime, timedelta, timezone
+        xml = get_sample_arxiv_xml()
         start_date = datetime.now(timezone.utc) - timedelta(days=30)
-        papers = scanner._parse_arxiv_response(SAMPLE_ARXIV_XML, start_date)
-        # Should include the 2026 paper, might include the 2020 one depending on start_date
+        papers = scanner._parse_arxiv_response(xml, start_date)
+        # Should include the recent paper
         assert len(papers) >= 1
         paper = papers[0]
         assert paper["title"] == "Evaluating Multi-Agent Systems"
@@ -58,17 +66,19 @@ class TestParseArxivResponse:
 
     def test_filters_by_date(self, scanner):
         from datetime import datetime, timedelta, timezone
+        xml = get_sample_arxiv_xml()
         # Start date after the old paper
         start_date = datetime(2025, 1, 1, tzinfo=timezone.utc)
-        papers = scanner._parse_arxiv_response(SAMPLE_ARXIV_XML, start_date)
+        papers = scanner._parse_arxiv_response(xml, start_date)
         titles = [p["title"] for p in papers]
         assert "Evaluating Multi-Agent Systems" in titles
         assert "Old Paper on Something" not in titles
 
     def test_skips_entries_without_date(self, scanner):
         from datetime import datetime, timezone
+        xml = get_sample_arxiv_xml()
         start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        papers = scanner._parse_arxiv_response(SAMPLE_ARXIV_XML, start_date)
+        papers = scanner._parse_arxiv_response(xml, start_date)
         titles = [p["title"] for p in papers]
         assert "No Date Paper" not in titles
 
