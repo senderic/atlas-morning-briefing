@@ -46,3 +46,4 @@ logs/*.log
 !references/*.md
 atlas-morning-briefing.json
 .env
+uv.lock
