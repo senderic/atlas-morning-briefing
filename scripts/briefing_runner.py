@@ -34,7 +34,7 @@ from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
-from scripts.bedrock_client import BedrockClient
+from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 
 
@@ -75,10 +75,10 @@ class BriefingRunner:
             "elapsed_seconds": 0,
         }
 
-        # Initialize Bedrock client and intelligence layer
-        bedrock_config = config.get("bedrock", {})
-        self.bedrock = BedrockClient(bedrock_config)
-        self.intelligence = BriefingIntelligence(self.bedrock, config)
+        # Initialize Gemini client and intelligence layer
+        gemini_config = config.get("gemini", config.get("bedrock", {}))
+        self.gemini = GeminiCLIClient(gemini_config)
+        self.intelligence = BriefingIntelligence(self.gemini, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -486,7 +486,7 @@ class BriefingRunner:
             "Be specific about which sectors/stocks moved and why.\n\n"
             f"<stock_data>\n{data_block}\n</stock_data>"
         )
-        result = self.intelligence.bedrock.invoke(
+        result = self.intelligence.gemini.invoke(
             prompt, tier="light", max_tokens=150
         )
         return result.strip() if result else ""
@@ -627,7 +627,7 @@ class BriefingRunner:
             "5 = groundbreaking, 1 = routine.\n"
             "Be factual. Do not add information not in the abstract."
         )
-        result = self.intelligence.bedrock.invoke(
+        result = self.intelligence.gemini.invoke(
             prompt, tier="light", max_tokens=500
         )
         if not result:
