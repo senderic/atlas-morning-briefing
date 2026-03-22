@@ -4,18 +4,15 @@
 
 # Topics to scan on arxiv
 arxiv_topics:
+  - "Autonomous Weapon Systems"
+  - "AI in Electronic Warfare"
+  - "Computer Vision for ISR"
+  - "Multi-Agent Combat Simulations"
+  - "Edge AI for Battlefield Systems"
+  - "Secure LLM Deployment in Defense"
+  - "Formal Verification for Autonomous Systems"
   - "Agentic AI"
-  - "Agent Evaluation"
   - "Multi-Agent Systems"
-  - "Tool Use LLM"
-  - "VLA Robotics"
-  - "World Models"
-  - "NKI Trainium"
-  - "Physical AI Embodied"
-  - "Autonomous Driving End-to-End"
-  - "Reinforcement Learning Code Generation"
-  - "LLM Inference Optimization"
-  - "AI Safety Alignment"
 
 # RSS feeds to monitor
 blog_feeds:
@@ -68,41 +65,48 @@ blog_feeds:
 
 # Interest profile for relevance filtering
 interest_profile:
-  - topic: "Agentic AI"
+  - topic: "AI in Defense and Electronic Warfare"
     weight: 1.0
-  - topic: "Trainium NKI Neuron SDK"
+  - topic: "Defense Contractor AI integration and development practices"
     weight: 0.9
-  - topic: "VLA Robotics Physical AI"
+  - topic: "AI foundation model market share shifts (Claude vs Gemini vs GPT)"
     weight: 0.8
-  - topic: "Multi-Agent Systems"
-    weight: 0.8
-  - topic: "Enterprise AI adoption"
+  - topic: "Battlefield Edge Computing"
     weight: 0.7
-  - topic: "LLM inference optimization"
-    weight: 0.7
-  - topic: "Autonomous driving"
+  - topic: "Autonomous Driving End-to-End"
     weight: 0.6
-  - topic: "AI safety alignment"
-    weight: 0.5
 
 # Stock watchlist (Finnhub API)
 stocks:
-  - AMZN
+  - NVDA
+  - MSFT
+  - PLTR
   - GOOGL
-  - TSLA
+  - AMZN
+  - META
+  - VRT
+  - ANET
+  - EQIX
+  - LMT
+  - RTX
+  - NOC
+  - GD
   - SPY
 
 # News search queries (Brave Search API)
 news_queries:
-  - "AI artificial intelligence breakthrough"
-  - "LLM agent framework"
-  - "autonomous driving AI"
-  - "OpenAI GPT model release"
-  - "Anthropic Claude"
-  - "Google DeepMind Gemini"
-  - "AI regulation policy"
-  - "semiconductor chip Nvidia"
-  - "robotics embodied AI"
+  - "Department of Defense AI contracts and prototypes"
+  - "Defense tech startup AI innovation SBIR"
+  - "DIU Defense Innovation Unit AI projects"
+  - "AI model benchmarks Claude vs Gemini vs GPT-4"
+  - "AI foundation model market share shifts"
+  - "Palantir AIP defense implementation"
+  - "Anduril Lattice AI updates"
+  - "Lockheed Martin AI development practices"
+  - "Northrop Grumman AI systems"
+  - "DARPA AI research breakthroughs"
+  - "Shield AI autonomous flight updates"
+  - "Epirus AI electronic warfare"
 
 # Paper scoring weights
 paper_scoring:
