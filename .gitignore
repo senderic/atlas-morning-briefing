@@ -10,7 +10,7 @@ __pycache__/
 
 # Environment and secrets
 .env
-config.yaml
+# config.yaml
 config.yaml.local
 
 # Build artifacts
