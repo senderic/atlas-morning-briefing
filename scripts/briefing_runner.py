@@ -22,6 +22,10 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import yaml
+from dotenv import load_dotenv
+
+# Load environment variables from .env if it exists
+load_dotenv()
 
 # Ensure scripts directory is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1064,10 +1068,40 @@ class BriefingRunner:
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
+    """
+    Load configuration from YAML file with environment variable expansion.
+    Supports ${VAR} and ${VAR:-default} syntax.
+    """
+    pattern = re.compile(r"\$\{(\w+)(?::-(.*?))?\}")
+
+    def env_var_constructor(loader, node):
+        value = loader.construct_scalar(node)
+        match = pattern.match(value)
+        if match:
+            var_name, default = match.groups()
+            return os.environ.get(var_name, default if default is not None else value)
+        return value
+
+    # Add constructor for any string that matches the pattern
+    yaml.SafeLoader.add_implicit_resolver("!env", pattern, None)
+    yaml.SafeLoader.add_constructor("!env", env_var_constructor)
+
     try:
         with open(config_path, "r") as f:
-            return yaml.safe_load(f)
+            # First read as raw string to expand environment variables
+            content = f.read()
+            
+            # Helper to replace ${VAR} with os.environ.get(VAR)
+            def replace_env_var(match):
+                var_name = match.group(1)
+                default = match.group(2)
+                val = os.environ.get(var_name)
+                if val is not None:
+                    return val
+                return default if default is not None else match.group(0)
+            
+            expanded_content = pattern.sub(replace_env_var, content)
+            return yaml.safe_load(expanded_content)
     except FileNotFoundError:
         logger.error(f"Config file not found: {config_path}")
         sys.exit(2)

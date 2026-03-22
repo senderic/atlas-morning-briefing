@@ -116,13 +116,13 @@ paper_scoring:
 repro_min_score: 12
 
 # Delivery settings
-kindle_email: "YOUR_NAME@kindle.com"
-sender_email: "your-sender@gmail.com"
+kindle_email: "${KINDLE_EMAIL:-YOUR_NAME@kindle.com}"
+sender_email: "${SENDER_EMAIL:-your-sender@gmail.com}"
 output_format: "kindle"
 
 # Email distribution list (receives rich HTML briefing)
 email_recipients:
-  - "your-email@example.com"
+  - "${RECIPIENT_EMAIL:-your-email@example.com}"
 
 # File naming pattern
 file_naming: "Atlas-Briefing-{yyyy}.{mm}.{dd}"

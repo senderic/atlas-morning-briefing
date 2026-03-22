@@ -25,3 +25,4 @@ nh3>=0.2.14
 # XML security (optional, falls back to stdlib)
 defusedxml>=0.7.1
 
+python-dotenv>=1.0.0
