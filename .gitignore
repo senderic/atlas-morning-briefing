@@ -17,6 +17,7 @@ config.yaml.local
 build/
 dist/
 *.pdf
+*.epub
 
 # Runtime data
 .atlas-state.json

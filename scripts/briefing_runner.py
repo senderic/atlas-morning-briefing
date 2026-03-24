@@ -36,6 +36,7 @@ from scripts.stock_fetcher import StockFetcher
 from scripts.news_aggregator import NewsAggregator
 from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
+from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
@@ -75,6 +76,7 @@ class BriefingRunner:
             "intelligence_enabled": False,
             "errors": [],
             "pdf_generated": False,
+            "epub_generated": False,
             "email_sent": False,
             "elapsed_seconds": 0,
         }
@@ -735,18 +737,36 @@ class BriefingRunner:
             self.errors.append(f"PDF generation: {e}")
             return False
 
+    def generate_epub(self, markdown_content: str, output_path: str) -> bool:
+        """Generate EPUB from markdown."""
+        try:
+            logger.info("=== Generating EPUB ===")
+            generator = EPUBGenerator(
+                title=f"Morning Briefing - {datetime.now().strftime('%Y-%m-%d')}",
+                author="Atlas"
+            )
+            generator.generate_epub(markdown_content, output_path)
+            self.status["epub_generated"] = True
+            return True
+
+        except Exception as e:
+            logger.error(f"EPUB generation failed: {e}")
+            self.errors.append(f"EPUB generation: {e}")
+            return False
+
     def distribute_briefing(
-        self, markdown_content: str, pdf_path: str, subject: str
+        self, markdown_content: str, pdf_path: str, subject: str, epub_path: Optional[str] = None
     ) -> Dict[str, bool]:
         """
         Distribute briefing to all configured channels.
 
-        Sends PDF to Kindle + rich HTML to email recipients.
+        Sends PDF/EPUB to Kindle + rich HTML to email recipients.
 
         Args:
             markdown_content: Markdown briefing content.
             pdf_path: Path to generated PDF.
             subject: Email subject / filename.
+            epub_path: Optional path to generated EPUB.
 
         Returns:
             Dictionary mapping channel -> success boolean.
@@ -772,6 +792,7 @@ class BriefingRunner:
                 config=self.config,
                 markdown_content=markdown_content,
                 pdf_path=pdf_path,
+                epub_path=epub_path,
                 subject=subject,
                 dry_run=self.dry_run,
             )
@@ -1035,14 +1056,18 @@ class BriefingRunner:
         pdf_path = f"{filename}.pdf"
         pdf_success = self.generate_pdf(markdown_content, pdf_path)
 
-        if not pdf_success:
-            logger.error("Failed to generate PDF")
+        # --- Generate EPUB (Reflowable for Kindle) ---
+        epub_path = f"{filename}.epub"
+        epub_success = self.generate_epub(markdown_content, epub_path)
+
+        if not pdf_success and not epub_success:
+            logger.error("Failed to generate both PDF and EPUB")
             self.status["elapsed_seconds"] = round(time.time() - start_time, 1)
             self.save_status()
             return 2
 
-        # --- Distribute to all channels (Kindle PDF + HTML email) ---
-        self.distribute_briefing(markdown_content, pdf_path, filename)
+        # --- Distribute to all channels (Kindle EPUB/PDF + HTML email) ---
+        self.distribute_briefing(markdown_content, pdf_path, filename, epub_path=epub_path)
 
         # --- Save state for cross-day tracking ---
         # Save updated trending_topics and weekly_items from current run
