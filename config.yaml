@@ -125,6 +125,7 @@ sender_email: "${SENDER_EMAIL:-your-sender@gmail.com}"
 output_format: "kindle"
 
 # Email distribution list (receives rich HTML briefing)
+# Can be a list or a comma-separated string in environment variables
 email_recipients:
   - "${RECIPIENT_EMAIL:-your-email@example.com}"
 

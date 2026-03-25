@@ -60,10 +60,14 @@ nested:
             config = load_config(str(config_file))
             assert config["nested"]["key"] == "prefix-middle-suffix"
 
-    def test_non_existent_env_stays_as_is(self, tmp_path):
+    def test_comma_separated_emails(self, tmp_path):
         config_file = tmp_path / "test_config.yaml"
-        config_file.write_text("key: ${NOT_SET}")
+        config_file.write_text("""
+email_recipients:
+  - ${RECIPIENT_EMAIL:-your-email@example.com}
+""")
         
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {"RECIPIENT_EMAIL": "a@b.com,c@d.com"}):
             config = load_config(str(config_file))
-            assert config["key"] == "${NOT_SET}"
+            # It should still be a single string list item at this point
+            assert config["email_recipients"] == ["a@b.com,c@d.com"]

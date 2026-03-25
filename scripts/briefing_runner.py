@@ -24,8 +24,8 @@ from urllib.parse import urlparse
 import yaml
 from dotenv import load_dotenv
 
-# Load environment variables from .env if it exists
-load_dotenv()
+# Load environment variables from .env if it exists, override existing shell env
+load_dotenv(override=True)
 
 # Ensure scripts directory is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

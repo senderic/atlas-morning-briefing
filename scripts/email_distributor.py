@@ -318,60 +318,55 @@ class EmailDistributor:
 
         try:
             with self._connect_smtp() as server:
+                msg = MIMEMultipart("alternative")
+                msg["From"] = self.sender_email
+                msg["To"] = ", ".join(recipients)
+                msg["Subject"] = subject
+
+                # Plain text fallback (stripped markdown)
+                plain_text = re.sub(r"[#*\[\]()]", "", markdown_content)
+                msg.attach(MIMEText(plain_text, "plain", "utf-8"))
+
+                # Rich HTML version
+                msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+                # Optional attachment
+                if attachment_path:
+                    doc_file = Path(attachment_path)
+                    if doc_file.exists():
+                        with open(doc_file, "rb") as f:
+                            ext = doc_file.suffix.lower()
+                            subtype = "pdf" if ext == ".pdf" else "epub+zip" if ext == ".epub" else "octet-stream"
+                            
+                            attachment = MIMEApplication(
+                                f.read(), _subtype=subtype
+                            )
+                            attachment.add_header(
+                                "Content-Disposition",
+                                "attachment",
+                                filename=doc_file.name,
+                            )
+                            # Switch to mixed for attachment support
+                            msg_with_attach = MIMEMultipart("mixed")
+                            msg_with_attach["From"] = msg["From"]
+                            msg_with_attach["To"] = msg["To"]
+                            msg_with_attach["Subject"] = msg["Subject"]
+                            msg_with_attach.attach(msg)
+                            msg_with_attach.attach(attachment)
+                            msg = msg_with_attach
+
+                server.send_message(msg)
+                
+                # Update results for all recipients
                 for recipient in recipients:
-                    try:
-                        msg = MIMEMultipart("alternative")
-                        msg["From"] = self.sender_email
-                        msg["To"] = recipient
-                        msg["Subject"] = subject
-
-                        # Plain text fallback (stripped markdown)
-                        plain_text = re.sub(r"[#*\[\]()]", "", markdown_content)
-                        msg.attach(MIMEText(plain_text, "plain", "utf-8"))
-
-                        # Rich HTML version
-                        msg.attach(MIMEText(html_content, "html", "utf-8"))
-
-                        # Optional attachment
-                        if attachment_path:
-                            doc_file = Path(attachment_path)
-                            if doc_file.exists():
-                                with open(doc_file, "rb") as f:
-                                    ext = doc_file.suffix.lower()
-                                    subtype = "pdf" if ext == ".pdf" else "epub+zip" if ext == ".epub" else "octet-stream"
-                                    
-                                    attachment = MIMEApplication(
-                                        f.read(), _subtype=subtype
-                                    )
-                                    attachment.add_header(
-                                        "Content-Disposition",
-                                        "attachment",
-                                        filename=doc_file.name,
-                                    )
-                                    # Switch to mixed for attachment support
-                                    msg_with_attach = MIMEMultipart("mixed")
-                                    msg_with_attach["From"] = msg["From"]
-                                    msg_with_attach["To"] = msg["To"]
-                                    msg_with_attach["Subject"] = msg["Subject"]
-                                    msg_with_attach.attach(msg)
-                                    msg_with_attach.attach(attachment)
-                                    msg = msg_with_attach
-
-                        server.send_message(msg)
-                        masked_r = recipient[:3] + "***" + recipient[recipient.index("@"):] if "@" in recipient else "***"
-                        logger.info(f"HTML briefing sent to: {masked_r}")
-                        results[recipient] = True
-
-                    except Exception as e:
-                        masked_r = recipient[:3] + "***" + recipient[recipient.index("@"):] if "@" in recipient else "***"
-                        logger.error(f"Failed to send to {masked_r}: {e}")
-                        results[recipient] = False
+                    masked_r = recipient[:3] + "***" + recipient[recipient.index("@"):] if "@" in recipient else "***"
+                    logger.info(f"HTML briefing sent to: {masked_r}")
+                    results[recipient] = True
 
         except Exception as e:
-            logger.error(f"SMTP connection failed: {e}")
-            for r in recipients:
-                if r not in results:
-                    results[r] = False
+            logger.error(f"Failed to send HTML email: {e}")
+            for recipient in recipients:
+                results[recipient] = False
 
         sent = sum(1 for v in results.values() if v)
         logger.info(f"Email distribution: {sent}/{len(recipients)} sent successfully")
@@ -419,7 +414,18 @@ class EmailDistributor:
                 )
 
         # Email list (HTML)
-        email_recipients = config.get("email_recipients", [])
+        email_recipients_raw = config.get("email_recipients", [])
+        email_recipients_set = set()
+        for r in email_recipients_raw:
+            if isinstance(r, str) and "," in r:
+                for email in r.split(","):
+                    if email.strip():
+                        email_recipients_set.add(email.strip())
+            elif r:
+                email_recipients_set.add(r)
+        
+        email_recipients = list(email_recipients_set)
+
         if email_recipients:
             # For regular email, PDF is usually preferred as an attachment
             attachment = pdf_path if pdf_path else epub_path
