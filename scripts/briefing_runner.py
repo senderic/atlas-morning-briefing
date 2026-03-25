@@ -379,6 +379,13 @@ class BriefingRunner:
 
         md = []
 
+        # Add title and timestamp (localized with timezone)
+        now = datetime.now().astimezone()
+        timestamp_str = now.strftime("%A, %B %d, %Y | %I:%M %p %Z")
+        md.append("# Atlas Morning Briefing\n")
+        md.append(f"*{timestamp_str}*\n\n")
+        md.append("---\n\n")
+
         # Editorial intro (from synthesis)
         if synthesis and synthesis.get("editorial_intro"):
             intro = synthesis["editorial_intro"].strip()

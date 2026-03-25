@@ -1,0 +1,18 @@
+# Minimal test config
+arxiv_topics:
+  - "Artificial Intelligence"
+blog_feeds: []
+stocks:
+  - AAPL
+news_queries: []
+pdf:
+  font_size: 10
+  line_spacing: 1.5
+gemini:
+  enabled: false
+bedrock:
+  enabled: false
+output_format: "kindle"
+file_naming: "Test-Briefing-{yyyy}.{mm}.{dd}"
+max_papers: 1
+arxiv_days_back: 1

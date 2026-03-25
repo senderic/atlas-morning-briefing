@@ -124,7 +124,6 @@ code { font-family: monospace; background-color: #f6f8fa; padding: 2px 4px; bord
     <link rel="stylesheet" type="text/css" href="style.css"/>
 </head>
 <body>
-    <h1>{self.title}</h1>
     {xhtml_content}
 </body>
 </html>'''
