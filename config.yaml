@@ -92,6 +92,8 @@ stocks:
   - NOC
   - GD
   - SPY
+  - VGT
+  - QQQ
 
 # News search queries (Brave Search API)
 news_queries:
