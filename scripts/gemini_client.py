@@ -114,26 +114,46 @@ class GeminiCLIClient:
             logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
 
             # Using --accept-raw-output-risk to suppress the warning and get clean output
+            # We pass the prompt via stdin to avoid "Argument list too long" errors
+            # and use --prompt "" to ensure headless mode.
             cmd = [
                 "gemini", 
                 "--model", model_id, 
-                "--prompt", full_prompt, 
                 "--approval-mode", "yolo", 
                 "--raw-output", 
-                "--accept-raw-output-risk"
+                "--accept-raw-output-risk",
+                "--prompt", ""
             ]
             
-            # Execute headless
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Execute headless with prompt from stdin
+            # Added timeout to prevent hanging indefinitely
+            try:
+                result = subprocess.run(
+                    cmd, 
+                    input=full_prompt, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=120  # 2 minute timeout per call
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(f"Gemini CLI call timed out after 120s (model: {model_id})")
+                return None
+
+            if result.returncode != 0:
+                logger.error(f"Gemini CLI failed with exit code {result.returncode}")
+                if result.stderr:
+                    logger.error(f"Gemini CLI stderr: {result.stderr.strip()}")
+                return None
             
             output = result.stdout.strip()
+            
+            # Remove any trailing "Loaded cached credentials." or similar if they leaked into stdout
+            if "Loaded cached credentials." in output:
+                output = output.split("Loaded cached credentials.")[-1].strip()
             
             logger.info(f"Gemini response received ({len(output)} chars)")
             return output
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Gemini CLI invocation failed: {e.stderr}")
-            return None
         except Exception as e:
             logger.error(f"Unexpected error during Gemini invocation: {e}")
             return None

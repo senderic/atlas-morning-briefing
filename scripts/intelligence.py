@@ -1323,6 +1323,70 @@ class BriefingIntelligence:
         logger.warning("Weekly Deep Dive generation failed")
         return ""
 
+    def generate_monthly_retrospective(
+        self,
+        monthly_items: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Generate a monthly retrospective and strategic overview.
+
+        Uses Opus (heavy tier) to synthesize 30 days of data into a narrative
+        identifying major strategic shifts, technology adoption patterns,
+        and a 90-day outlook.
+
+        Args:
+            monthly_items: List of highlights accumulated over the month.
+
+        Returns:
+            Markdown string for the "Monthly Retrospective" section (800-1200 words).
+        """
+        if not self.available or not monthly_items:
+            return ""
+
+        # Group items by date (sort by date)
+        items_by_date = {}
+        for item in monthly_items:
+            date = item.get("date", "unknown")
+            if date not in items_by_date:
+                items_by_date[date] = []
+            items_by_date[date].append(item)
+
+        # Build context from monthly items (limit to top highlights per day)
+        context_parts = []
+        for date in sorted(items_by_date.keys()):
+            items = items_by_date[date]
+            titles = [f"- {i.get('title', '')} ({i.get('type', 'item')})" for i in items]
+            context_parts.append(f"{date}:\n" + "\n".join(titles))
+
+        if not context_parts:
+            return ""
+
+        context_str = "\n\n".join(context_parts)
+
+        prompt = (
+            "You are writing a 'Monthly AI Retrospective' for a senior research audience. "
+            "Based on the last 30 days of research papers, blogs, and news below, "
+            "synthesize a strategic narrative that:\n\n"
+            "1. Major Strategic Shifts: Identify the 3 most significant shifts in the AI landscape this month.\n"
+            "2. Adoption Patterns: Analyze how these technologies are being applied in real-world or defense contexts.\n"
+            "3. Technology Outlook: Provide a 90-day outlook on where these trends are heading.\n\n"
+            "Write 800-1200 words. Be high-level, analytical, and synthesize connections "
+            "that wouldn't be obvious from a daily or weekly view. "
+            "Focus on 'why' and 'what's next' rather than just summarizing 'what'.\n\n"
+            f"<monthly_highlights>\n{context_str}\n</monthly_highlights>"
+        )
+
+        result = self.gemini.invoke(
+            prompt, tier="heavy", max_tokens=2500, system_prompt=SYSTEM_PROMPT
+        )
+
+        if result:
+            logger.info("Monthly Retrospective generated successfully")
+            return result.strip()
+
+        logger.warning("Monthly Retrospective generation failed")
+        return ""
+
     def _detect_cross_source_signals(
         self,
         papers: List[Dict[str, Any]],

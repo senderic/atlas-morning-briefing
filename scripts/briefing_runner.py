@@ -55,20 +55,23 @@ class BriefingRunner:
     # Default section order
     DEFAULT_SECTION_ORDER = ["stocks", "news", "top_papers", "blogs"]
 
-    def __init__(self, config: Dict[str, Any], dry_run: bool = False):
+    def __init__(self, config: Dict[str, Any], dry_run: bool = False, briefing_type: str = "daily"):
         """
         Initialize BriefingRunner.
 
         Args:
             config: Configuration dictionary.
             dry_run: If True, don't send email.
+            briefing_type: Type of briefing ('daily', 'weekly', 'monthly').
         """
         self.config = config
         self.dry_run = dry_run
+        self.briefing_type = briefing_type.lower()
         self.errors = []
         self._briefing_title = self._format_filename(datetime.now())
         self.status = {
             "timestamp": datetime.now().isoformat(),
+            "type": self.briefing_type,
             "papers_found": 0,
             "blogs_found": 0,
             "stocks_fetched": 0,
@@ -87,14 +90,26 @@ class BriefingRunner:
         self.intelligence = BriefingIntelligence(self.gemini, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
+    def _get_days_back(self) -> int:
+        """Determine number of days to look back based on briefing type."""
+        if self.briefing_type == "weekly":
+            return 7
+        elif self.briefing_type == "monthly":
+            return 30
+        return self.config.get("arxiv_days_back", 3)
+
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Run arxiv paper scan."""
         try:
-            logger.info("=== Scanning ArXiv Papers ===")
+            logger.info(f"=== Scanning ArXiv Papers ({self.briefing_type}) ===")
             if topics is None:
                 topics = self.config.get("arxiv_topics", [])
-            days_back = self.config.get("arxiv_days_back", 7)
+            
+            days_back = self._get_days_back()
             max_papers = self.config.get("max_papers", 20)
+            if self.briefing_type != "daily":
+                # Increase volume for weekly/monthly
+                max_papers = max_papers * (2 if self.briefing_type == "weekly" else 4)
 
             if not topics:
                 logger.warning("No arxiv_topics configured, skipping")
@@ -118,10 +133,12 @@ class BriefingRunner:
     def run_blog_scan(self) -> List[Dict[str, Any]]:
         """Run blog feed scan."""
         try:
-            logger.info("=== Scanning Blog Feeds ===")
+            logger.info(f"=== Scanning Blog Feeds ({self.briefing_type}) ===")
             feeds = self.config.get("blog_feeds", [])
-            days_back = self.config.get("arxiv_days_back", 7)
+            days_back = self._get_days_back()
             max_blogs = self.config.get("max_blogs", 10)
+            if self.briefing_type != "daily":
+                max_blogs = max_blogs * (2 if self.briefing_type == "weekly" else 4)
 
             if not feeds:
                 logger.warning("No blog_feeds configured, skipping")
@@ -461,12 +478,12 @@ class BriefingRunner:
 
     def _format_filename(self, now: datetime) -> str:
         """Format the output filename from config pattern, ignoring unknown keys."""
-        file_naming = self.config.get("file_naming", "Atlas-Briefing-{yyyy}.{mm}.{dd}")
+        file_naming = self.config.get("file_naming", "Atlas-Briefing-{type}-{yyyy}.{mm}.{dd}")
         known_vars = {
             "yyyy": now.strftime("%Y"),
             "mm": now.strftime("%m"),
             "dd": now.strftime("%d"),
-            "type": "Daily",
+            "type": self.briefing_type.capitalize(),
         }
         return file_naming.format_map(known_vars)
 
@@ -859,6 +876,7 @@ class BriefingRunner:
         emerging_themes: List[str],
         trending_topics: Optional[Dict[str, Any]] = None,
         weekly_items: Optional[List[Dict[str, Any]]] = None,
+        monthly_items: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Save current briefing state for next run's trend tracking and dedup."""
         state = {
@@ -878,6 +896,9 @@ class BriefingRunner:
         # Feature 2: Save weekly items for Saturday deep dive
         if weekly_items is not None:
             state["weekly_items"] = weekly_items
+        # Save monthly items
+        if monthly_items is not None:
+            state["monthly_items"] = monthly_items
         try:
             with open(STATE_FILENAME, "w") as f:
                 json.dump(state, f, indent=2)
@@ -1005,33 +1026,50 @@ class BriefingRunner:
                 # Add to synthesis for rendering in Executive Summary
                 synthesis["entity_mentions"] = entity_mentions
 
-        # Feature 2: Weekly Deep Dive (accumulate items & generate on Saturday)
+        # Feature 2 & Monthly: Weekly Deep Dive / Monthly Retrospective
         now = datetime.now()
         is_saturday = now.weekday() == 5
+        is_first_of_month = now.day == 1
+        
+        # Determine if we should generate synthesis
+        force_weekly = self.briefing_type == "weekly"
+        force_monthly = self.briefing_type == "monthly"
+        
         weekly_deep_dive = ""
+        monthly_retrospective = ""
+        
         weekly_items = previous_state.get("weekly_items", [])
+        monthly_items = previous_state.get("monthly_items", [])
 
-        # Accumulate today's top items for the week
-        today_str = now.strftime("%Y-%m-%d")
-        for paper in top_papers[:3]:
-            weekly_items.append({
-                "date": today_str,
-                "type": "paper",
-                "title": paper.get("title", ""),
-            })
-        for article in news[:3]:
-            weekly_items.append({
-                "date": today_str,
-                "type": "news",
-                "title": article.get("title", ""),
-            })
+        # Accumulate today's top items (only on daily runs to avoid duplication)
+        if self.briefing_type == "daily":
+            today_str = now.strftime("%Y-%m-%d")
+            for paper in top_papers[:3]:
+                item = {"date": today_str, "type": "paper", "title": paper.get("title", "")}
+                weekly_items.append(item)
+                monthly_items.append(item)
+            for article in news[:3]:
+                item = {"date": today_str, "type": "news", "title": article.get("title", "")}
+                weekly_items.append(item)
+                monthly_items.append(item)
+                
+            # Keep monthly_items limited to last 100 highlights to avoid state bloat
+            if len(monthly_items) > 100:
+                monthly_items = monthly_items[-100:]
 
-        # On Saturday, generate the deep dive and clear weekly_items
-        if is_saturday and self.intelligence.available and weekly_items:
-            logger.info("=== Intelligence Layer: Weekly Deep Dive (Saturday) ===")
+        # Generate Weekly Deep Dive
+        if (is_saturday or force_weekly) and self.intelligence.available and weekly_items:
+            logger.info(f"=== Intelligence Layer: Weekly Deep Dive ({'Standalone' if force_weekly else 'Saturday'}) ===")
             weekly_deep_dive = self.intelligence.generate_weekly_deep_dive(weekly_items)
-            # Clear weekly items after generation
-            weekly_items = []
+            if not force_weekly: # Only clear if it was the scheduled run
+                weekly_items = []
+
+        # Generate Monthly Retrospective
+        if (is_first_of_month or force_monthly) and self.intelligence.available and monthly_items:
+            logger.info(f"=== Intelligence Layer: Monthly Retrospective ({'Standalone' if force_monthly else 'First of Month'}) ===")
+            monthly_retrospective = self.intelligence.generate_monthly_retrospective(monthly_items)
+            if not force_monthly: # Only clear if it was the scheduled run
+                monthly_items = []
 
         # --- Check if we have any data ---
         has_data = any([papers, blogs, stocks, news])
@@ -1044,11 +1082,16 @@ class BriefingRunner:
         # --- Generate markdown briefing ---
         filename = self._format_filename(now)
         self._briefing_title = filename
+        
+        # We need to append monthly retrospective to markdown if generated
         markdown_content = self.generate_markdown_briefing(
             papers, blogs, stocks, news, top_papers, synthesis,
             market_trend=market_trend,
             weekly_deep_dive=weekly_deep_dive,
         )
+        
+        if monthly_retrospective:
+            markdown_content += f"\n\n## Monthly AI Retrospective\n\n{monthly_retrospective}\n"
 
         # --- Save markdown ---
         md_path = f"{filename}.md"
@@ -1077,11 +1120,12 @@ class BriefingRunner:
         self.distribute_briefing(markdown_content, pdf_path, filename, epub_path=epub_path)
 
         # --- Save state for cross-day tracking ---
-        # Save updated trending_topics and weekly_items from current run
+        # Save updated trending_topics, weekly_items and monthly_items from current run
         self._save_state(
             top_papers, blogs, news, stocks, emerging_themes,
             trending_topics=previous_state.get("trending_topics", {}),
-            weekly_items=weekly_items  # Use updated weekly_items from this run
+            weekly_items=weekly_items,
+            monthly_items=monthly_items
         )
 
         # --- Finalize ---
@@ -1157,6 +1201,13 @@ def main() -> int:
         help="Generate briefing but don't send email",
     )
     parser.add_argument(
+        "--type",
+        type=str,
+        default="daily",
+        choices=["daily", "weekly", "monthly"],
+        help="Briefing type (daily, weekly, monthly)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -1182,7 +1233,7 @@ def main() -> int:
     check_environment(config, dry_run=args.dry_run)
 
     # Run briefing
-    runner = BriefingRunner(config=config, dry_run=args.dry_run)
+    runner = BriefingRunner(config=config, dry_run=args.dry_run, briefing_type=args.type)
     return runner.run()
 
 

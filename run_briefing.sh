@@ -7,11 +7,13 @@ export PATH="/home/eric/.nvm/versions/node/v20.19.5/bin:/usr/local/sbin:/usr/loc
 # Navigate to project directory
 cd /home/eric/atlas-morning-briefing
 
-# Load environment variables (optional if .env is used by python)
-# if [ -f .env ]; then
-#   export $(grep -v '^#' .env | xargs)
-# fi
+# Load environment variables from .env if it exists
+if [ -f .env ]; then
+  set -o allexport
+  source .env
+  set +o allexport
+fi
 
-# Run the briefing runner with DEBUG log level as requested
-# Using the venv python directly
-/home/eric/atlas-morning-briefing/.venv/bin/python3 scripts/briefing_runner.py --config config.yaml --log-level DEBUG 2>&1 | logger -t atlas-briefing
+# Run the briefing runner
+# Using the venv python directly and passing all arguments
+/home/eric/atlas-morning-briefing/.venv/bin/python3 scripts/briefing_runner.py --config config.yaml "$@" 2>&1 | logger -t atlas-briefing

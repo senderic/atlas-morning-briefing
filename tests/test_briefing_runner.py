@@ -67,7 +67,7 @@ class TestDeduplicateNewsAndBlogs:
 class TestGenerateMarkdownBriefing:
     def test_generates_title(self, runner):
         md = runner.generate_markdown_briefing([], [], [], [], [])
-        assert "Executive Summary" in md or md == ""  # title removed from markdown body
+        assert "# Atlas Morning Briefing" in md
 
     def test_includes_stocks(self, runner):
         stocks = [{"symbol": "AMZN", "name": "Amazon", "current_price": 200.0, "change": 5.0, "percent_change": 2.5}]

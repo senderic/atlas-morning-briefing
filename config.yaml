@@ -132,7 +132,7 @@ email_recipients:
   - "${RECIPIENT_EMAIL:-your-email@example.com}"
 
 # File naming pattern
-file_naming: "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+file_naming: "Atlas-Briefing-{type}-{yyyy}.{mm}.{dd}"
 
 # Paper recommendations
 num_paper_picks: 3
