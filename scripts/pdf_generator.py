@@ -272,6 +272,40 @@ class PDFGenerator:
                 flowables.append(Paragraph(content, self.styles["heading3"]))
             elif line_type == "body":
                 if content:
+                    # Special handling for [RIGHT] alignment markers (usually for subtitles)
+                    if "[RIGHT]" in content and "[/RIGHT]" in content:
+                        parts = content.split("[RIGHT]")
+                        left_text = parts[0].strip()
+                        right_text = parts[1].split("[/RIGHT]")[0].strip()
+                        
+                        # Process both parts as markdown (e.g. bold/italic)
+                        # We do it manually here because this is a special case
+                        def process_md(text):
+                            text = re.sub(r"\*\*(.+?)\*\*", "<b>\\1</b>", text)
+                            text = text.replace("**", "")
+                            text = re.sub(r"\*(.+?)\*", "<i>\\1</i>", text)
+                            return text
+
+                        left_text = process_md(left_text)
+                        right_text = process_md(right_text)
+                        
+                        # Create a two-column table with no borders for alignment
+                        page_width = self.page_size[0] - 1.0 * inch_unit
+                        data = [[
+                            Paragraph(left_text, self.styles["body"]),
+                            Paragraph(right_text, ParagraphStyle("RightAlign", parent=self.styles["body"], alignment=2)) # 2 = Right
+                        ]]
+                        table = Table(data, colWidths=[page_width * 0.6, page_width * 0.4])
+                        table.setStyle(TableStyle([
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                            ("TOPPADDING", (0, 0), (-1, -1), 0),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                        ]))
+                        flowables.append(table)
+                        continue
+
                     # Convert markdown formatting to placeholders before
                     # HTML-escaping, so user content is escaped but our
                     # markup tags survive.  \x00 = '<'  \x01 = '>'

@@ -65,6 +65,7 @@ class BriefingRunner:
         """
         self.config = config
         self.dry_run = dry_run
+        self.user_name = os.getenv("USER_NAME", "")
         self.errors = []
         self._briefing_title = self._format_filename(datetime.now())
         self.status = {
@@ -383,7 +384,9 @@ class BriefingRunner:
         now = datetime.now().astimezone()
         timestamp_str = now.strftime("%A, %B %d, %Y | %I:%M %p %Z")
         md.append("# Atlas Morning Briefing\n")
-        md.append(f"*{timestamp_str}*\n\n")
+        
+        user_suffix = f" [RIGHT]for {self.user_name}[/RIGHT]" if self.user_name else ""
+        md.append(f"*{timestamp_str}{user_suffix}*\n\n")
         md.append("---\n\n")
 
         # Editorial intro (from synthesis)

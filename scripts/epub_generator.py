@@ -64,6 +64,9 @@ class EPUBGenerator:
             extensions=["tables", "fenced_code", "nl2br"],
             output_format="xhtml",
         )
+
+        # Handle [RIGHT] markers for alignment
+        html_content = html_content.replace("[RIGHT]", '<span style="float: right;">').replace("[/RIGHT]", "</span>")
         
         # Aggressive cleaning for Kindle parser
         # 1. Ensure all & are escaped to &amp;

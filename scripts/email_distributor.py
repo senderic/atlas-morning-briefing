@@ -73,6 +73,9 @@ class EmailDistributor:
             extensions=["tables", "fenced_code", "nl2br"],
         )
 
+        # Handle [RIGHT] markers for alignment
+        html_body = html_body.replace("[RIGHT]", '<span style="float: right;">').replace("[/RIGHT]", "</span>")
+
         # Sanitize HTML to prevent XSS from untrusted content
         # (LLM outputs, news titles, blog titles may contain malicious markup)
         if HAS_NH3:
