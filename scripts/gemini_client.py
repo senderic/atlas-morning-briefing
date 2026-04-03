@@ -22,9 +22,9 @@ class GeminiCLIClient:
 
     # Default model IDs for each tier based on gemini-cli help
     DEFAULT_MODELS = {
-        "heavy": "gemini-3-pro-preview",
-        "medium": "gemini-3-flash-preview",
-        "light": "gemini-2.5-flash-lite",
+        "heavy": "pro",
+        "medium": "flash",
+        "light": "flash",
     }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -77,63 +77,62 @@ class GeminiCLIClient:
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         system_prompt: Optional[str] = None,
+        allow_fallback: bool = True,
     ) -> Optional[str]:
         """
-        Invoke a Gemini model via CLI.
+        Invoke a Gemini model via CLI with recursive tier fallback.
 
         Args:
             prompt: User prompt text.
             tier: Model tier - "heavy", "medium", or "light".
-            max_tokens: Override default max tokens (ignored by CLI usually, but passed if supported).
+            max_tokens: Override default max tokens.
             temperature: Override default temperature.
             system_prompt: Optional system prompt.
+            allow_fallback: If True, recurse to lower tiers on failure.
 
         Returns:
-            Model response text, or None if invocation fails.
+            Model response text, or None if all attempts fail.
         """
         if not self.available:
-            logger.debug("Gemini CLI not available, skipping invocation")
             return None
 
         if self._call_count >= self.max_calls:
-            logger.warning(
-                f"LLM call budget exhausted ({self.max_calls} calls). "
-                "Skipping invocation."
-            )
+            logger.warning(f"LLM call budget exhausted. Skipping {tier}.")
             return None
-        self._call_count += 1
 
         model_id = self.models.get(tier, self.models["medium"])
-        
-        # Build the full prompt including system prompt if provided
-        full_prompt = prompt
-        if system_prompt:
-            full_prompt = f"{system_prompt}\n\nUser Request: {prompt}"
+        full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         try:
             logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
+            self._call_count += 1
 
-            # Using --accept-raw-output-risk to suppress the warning and get clean output
             cmd = [
-                "gemini", 
-                "--model", model_id, 
-                "--prompt", full_prompt, 
-                "--approval-mode", "yolo", 
-                "--raw-output", 
-                "--accept-raw-output-risk"
+                "gemini", "--model", model_id, "--prompt", full_prompt,
+                "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
             ]
             
-            # Execute headless
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
             output = result.stdout.strip()
             
-            logger.info(f"Gemini response received ({len(output)} chars)")
-            return output
+            if output:
+                logger.info(f"Gemini response received ({len(output)} chars) from {tier}")
+                return output
+            
+            raise ValueError(f"Empty response from {tier}")
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Gemini CLI invocation failed: {e.stderr}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error during Gemini invocation: {e}")
+        except (subprocess.CalledProcessError, Exception) as e:
+            logger.error(f"Tier {tier} failed: {str(e)[:100]}")
+            
+            # Recursive fallback
+            if allow_fallback:
+                next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
+                if next_tier:
+                    logger.info(f"--- Falling back from {tier} to {next_tier} ---")
+                    return self.invoke(
+                        prompt, tier=next_tier, max_tokens=max_tokens,
+                        temperature=temperature, system_prompt=system_prompt,
+                        allow_fallback=True
+                    )
+            
             return None

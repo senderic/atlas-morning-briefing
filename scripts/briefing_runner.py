@@ -414,6 +414,10 @@ class BriefingRunner:
             intro = "\n".join(cleaned).strip()
             md.append("## Executive Summary\n\n")
             md.append(f"{intro}\n\n")
+        else:
+            # Fallback if synthesis failed
+            md.append("## Executive Summary\n\n")
+            md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
 
             # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
             # Only show if an entity has a spike (e.g., 5+ mentions).
@@ -585,17 +589,25 @@ class BriefingRunner:
     def _render_blogs(self, blogs: List[Dict[str, Any]]) -> str:
         """Render blog updates section (top 5, with summaries, sorted by score)."""
         md = ["## Blog Updates\n\n"]
-        sorted_blogs = sorted(blogs[:5], key=lambda x: x.get("score_combined", 0), reverse=True)
-        # Only filter by score when scores are present (Bedrock enabled)
-        if any(b.get("score_combined") for b in sorted_blogs):
+        
+        # Sort by score if available, otherwise use original order
+        if any(b.get("score_combined") for b in blogs):
+            sorted_blogs = sorted(blogs[:8], key=lambda x: x.get("score_combined", 0), reverse=True)
+            # Only filter low scores if we actually have scores
             sorted_blogs = [b for b in sorted_blogs if b.get("score_combined", 0) >= 3]
+        else:
+            sorted_blogs = blogs[:5]
+
+        if not sorted_blogs:
+            return ""
+
         for article in sorted_blogs:
             article_title = article.get("title", "")
             source = article.get("source", "")
             link = article.get("link", "")
             score = article.get("score_combined")
             summary = self._clean_summary(
-                article.get("brief_summary", ""), article_title, source
+                article.get("brief_summary", article.get("summary", "")), article_title, source
             )
 
             score_tag = f" {self._render_stars(score)}" if score else ""
@@ -604,6 +616,9 @@ class BriefingRunner:
             else:
                 md.append(f"**{article_title}** *({source})*{score_tag}\n")
             if summary:
+                # Limit summary length if it wasn't processed by LLM
+                if not article.get("brief_summary") and len(summary) > 300:
+                    summary = summary[:297] + "..."
                 md.append(f"{summary}\n")
             md.append("\n")
         return "".join(md)
@@ -665,15 +680,24 @@ class BriefingRunner:
     def _render_top_papers(self, top_papers: List[Dict[str, Any]]) -> str:
         """Render top papers section (top 3, with summaries, scores, and repro assessment)."""
         md = ["## Top Papers\n\n"]
-        sorted_papers = sorted(top_papers[:3], key=lambda x: x.get("score_combined", 0), reverse=True)
-        # Only filter by score when scores are present (Bedrock enabled)
-        if any(p.get("score_combined") for p in sorted_papers):
+        
+        # Determine sorting and filtering
+        if any(p.get("score_combined") for p in top_papers):
+            sorted_papers = sorted(top_papers[:5], key=lambda x: x.get("score_combined", 0), reverse=True)
+            # Only filter by score when scores are present
             sorted_papers = [p for p in sorted_papers if p.get("score_combined", 0) >= 3]
+        else:
+            sorted_papers = top_papers[:3]
+
+        if not sorted_papers:
+            md.append("*No highly relevant papers found today based on scoring.*\n\n")
+            return "".join(md)
+
         for i, paper in enumerate(sorted_papers, 1):
             paper_title = paper.get("title", "")
             authors = paper.get("authors", [])
             arxiv_url = paper.get("arxiv_url", "")
-            brief_summary = paper.get("brief_summary", "")
+            brief_summary = paper.get("brief_summary", paper.get("summary", ""))
             relevance_reason = paper.get("relevance_reason", "")
             score = paper.get("score_combined")
             repro_total = paper.get("repro_total")
@@ -689,6 +713,9 @@ class BriefingRunner:
                 md.append(f"*{', '.join(authors[:3])}*\n\n")
 
             if brief_summary:
+                # Limit length if it's the raw abstract
+                if not paper.get("brief_summary") and len(brief_summary) > 600:
+                    brief_summary = brief_summary[:597] + "..."
                 md.append(f"{brief_summary}\n\n")
             elif relevance_reason:
                 md.append(f"{relevance_reason}\n\n")
