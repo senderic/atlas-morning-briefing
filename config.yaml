@@ -159,7 +159,7 @@ gemini:
   models:
     heavy: "pro"
     medium: "flash"
-    light: "flash"
+    light: "flash-lite"
 
 # Amazon Bedrock configuration
 # Set enabled: false to run in deterministic mode (no LLM, zero cost)
