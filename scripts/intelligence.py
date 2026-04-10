@@ -197,7 +197,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="heavy", max_tokens=2000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", max_tokens=2000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
             logger.warning("Stage 1 filtering failed, returning all papers")
@@ -809,7 +809,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="heavy", max_tokens=500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", max_tokens=500, system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
@@ -1024,7 +1024,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="heavy", max_tokens=1000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", max_tokens=1500, system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return {}
