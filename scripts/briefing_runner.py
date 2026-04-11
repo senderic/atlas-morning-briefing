@@ -583,6 +583,11 @@ class BriefingRunner:
                 md.append(f"**{article_title}**\n")
             if summary:
                 md.append(f"{summary}\n")
+
+            author_blurb = article.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -620,6 +625,11 @@ class BriefingRunner:
                 if not article.get("brief_summary") and len(summary) > 300:
                     summary = summary[:297] + "..."
                 md.append(f"{summary}\n")
+
+            author_blurb = article.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -720,6 +730,10 @@ class BriefingRunner:
             elif relevance_reason:
                 md.append(f"{relevance_reason}\n\n")
 
+            author_blurb = paper.get("author_blurb")
+            if author_blurb:
+                md.append(f"#### Source Author Information\n{author_blurb}\n\n")
+
             # Show reproduction feasibility badge
             if repro_total is not None:
                 badge = "✅" if repro_total >= 18 else "🟡" if repro_total >= 12 else "🔴"
@@ -748,6 +762,11 @@ class BriefingRunner:
             md.append("\n")
             if brief_summary:
                 md.append(f"{brief_summary}\n")
+
+            author_blurb = paper.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -1017,6 +1036,20 @@ class BriefingRunner:
 
             # Ensure top 3 papers all have summaries (batched)
             top_papers = self._ensure_paper_summaries(top_papers[:3]) + top_papers[3:]
+
+            # --- Generate author blurbs for all sections ---
+            logger.info("=== Intelligence Layer: Generating Author Blurbs ===")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                fut_news_blurbs = pool.submit(self.intelligence.generate_author_blurbs, news, "news")
+                fut_blogs_blurbs = pool.submit(self.intelligence.generate_author_blurbs, blogs, "blogs")
+                fut_top_papers_blurbs = pool.submit(self.intelligence.generate_author_blurbs, top_papers[:5], "papers")
+                fut_recent_papers_blurbs = pool.submit(self.intelligence.generate_author_blurbs, papers[:5], "papers")
+
+                # Lists are mutated in-place by generate_author_blurbs
+                fut_news_blurbs.result()
+                fut_blogs_blurbs.result()
+                fut_top_papers_blurbs.result()
+                fut_recent_papers_blurbs.result()
 
             synthesis = self.intelligence.synthesize_briefing(
                 papers, blogs[:5], stocks, news[:5], top_papers[:3],

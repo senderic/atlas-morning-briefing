@@ -355,6 +355,70 @@ class BriefingIntelligence:
 
         return topics + additions
 
+    def generate_author_blurbs(
+        self, items: List[Dict[str, Any]], item_type: str = "item"
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate blurbs about authors or organizations for a list of items.
+
+        Uses the medium tier model to research and summarize author background,
+        past work, and trustworthiness.
+
+        Args:
+            items: List of item dictionaries (papers, news, or blogs).
+            item_type: String describing the type of items (e.g., "papers").
+
+        Returns:
+            Items with added 'author_blurb' key.
+        """
+        if not self.available or not items:
+            return items
+
+        # Prepare items for batch prompt
+        item_texts = []
+        for i, item in enumerate(items):
+            title = _sanitize_prompt_input(item.get("title", "Untitled"), max_length=200)
+
+            # Handle different ways authors/sources are stored
+            if item_type == "papers":
+                authors = ", ".join(item.get("authors", [])[:3])
+                source_info = f"Authors: {authors}"
+            elif item_type == "blogs":
+                author = item.get("author", "")
+                source = item.get("source", "")
+                source_info = f"Author: {author}, Blog: {source}"
+            else:  # news or generic
+                source = item.get("source", "")
+                source_info = f"Source/Organization: {source}"
+
+            item_texts.append(f"[{i+1}] {title}\n{source_info}")
+
+        items_block = "\n\n".join(item_texts)
+        prompt = (
+            f"For each {item_type[:-1] if item_type.endswith('s') else item_type} below, "
+            "provide a concise blurb (2-3 sentences) about the author(s) or the organization. "
+            "Include who they are, their past work, what they are known for, and how trustworthy they seem. "
+            "Base your assessment of trustworthiness on reputable sources such as PBS, NPR, NYT, "
+            "or university publications. If the author is an organization, describe the organization's reputation.\n\n"
+            f"<items>\n{items_block}\n</items>\n\n"
+            "Respond as a numbered list matching the input numbering."
+        )
+
+        result = self.gemini.invoke(
+            prompt, tier="medium", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+        )
+        if not result:
+            return items
+
+        # Parse numbered blurbs back to items
+        blurbs = _parse_numbered_list(result, len(items))
+        for i, blurb in enumerate(blurbs):
+            if i < len(items):
+                items[i]["author_blurb"] = blurb.strip()
+
+        logger.info(f"Generated author blurbs for {len(blurbs)} {item_type}")
+        return items
+
     def summarize_papers(
         self, papers: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
