@@ -79,3 +79,21 @@ def test_generate_author_blurbs_empty_list(intelligence, mock_gemini):
     result = intelligence.generate_author_blurbs([])
     assert result == []
     mock_gemini.invoke.assert_not_called()
+
+def test_extract_missing_authors_blogs(intelligence, mock_gemini):
+    items = [
+        {"title": "Missing Author Blog", "source": "TechCrunch", "summary": "An article by John Doe about AI."}
+    ]
+    # First call is extract_missing_authors (light), second is generate_author_blurbs (medium)
+    mock_gemini.invoke.side_effect = ["[1] John Doe", "[1] Blurb for John Doe."]
+
+    result = intelligence.generate_author_blurbs(items, "blogs")
+
+    assert result[0]["author"] == "John Doe"
+    assert result[0]["author_blurb"] == "Blurb for John Doe."
+
+    assert mock_gemini.invoke.call_count == 2
+    # Verify tiers used
+    calls = mock_gemini.invoke.call_args_list
+    assert calls[0].kwargs["tier"] == "light"
+    assert calls[1].kwargs["tier"] == "medium"

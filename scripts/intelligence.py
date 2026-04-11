@@ -374,6 +374,9 @@ class BriefingIntelligence:
         if not self.available or not items:
             return items
 
+        # Attempt to extract missing authors using the light model first
+        items = self.extract_missing_authors(items, item_type)
+
         # Prepare items for batch prompt
         item_texts = []
         for i, item in enumerate(items):
@@ -406,7 +409,8 @@ class BriefingIntelligence:
             "provide a concise blurb (2-3 sentences) about the author(s) or the organization. "
             "Include who they are, their past work, what they are known for, and how trustworthy they seem. "
             "Base your assessment of trustworthiness on reputable sources such as PBS, NPR, NYT, "
-            "or university publications. If the author is an organization, describe the organization's reputation.\n\n"
+            "or university publications. If the author is an organization or if an individual author "
+            "cannot be definitively determined, provide a blurb about the organization's reputation.\n\n"
             f"<items>\n{items_block}\n</items>\n\n"
             "Respond as a numbered list matching the input numbering."
         )
@@ -424,6 +428,73 @@ class BriefingIntelligence:
                 items[i]["author_blurb"] = blurb.strip()
 
         logger.info(f"Generated author blurbs for {len(blurbs)} {item_type}")
+        return items
+
+    def extract_missing_authors(
+        self, items: List[Dict[str, Any]], item_type: str = "item"
+    ) -> List[Dict[str, Any]]:
+        """
+        Use the light tier model to extract missing author names from text.
+
+        Args:
+            items: List of item dictionaries.
+            item_type: Type of items.
+
+        Returns:
+            Items with updated 'author' or 'authors' keys where they were missing.
+        """
+        if not self.available:
+            return items
+
+        to_extract = []
+        indices = []
+        for i, item in enumerate(items):
+            if item_type == "papers":
+                if not item.get("authors"):
+                    to_extract.append(item)
+                    indices.append(i)
+            elif item_type == "blogs":
+                if not item.get("author"):
+                    to_extract.append(item)
+                    indices.append(i)
+            # News usually only has 'source' (organization), but might have an author in snippet
+            elif item_type == "news":
+                if "author" not in item:
+                    to_extract.append(item)
+                    indices.append(i)
+
+        if not to_extract:
+            return items
+
+        item_texts = []
+        for i, item in enumerate(to_extract):
+            title = _sanitize_prompt_input(item.get("title", ""), max_length=200)
+            summary = _sanitize_prompt_input(
+                item.get("summary", item.get("description", item.get("snippet", "")))[:300],
+                max_length=350
+            )
+            item_texts.append(f"[{i+1}] Title: {title}\nText: {summary}")
+
+        prompt = (
+            f"Extract the primary author(s) name from these {item_type}. "
+            "If no individual author is mentioned, identify the organization or source. "
+            "Be very concise. Return ONLY the name(s), one per line, matching input numbering.\n\n"
+            f"<items>\n" + "\n\n".join(item_texts) + "\n</items>"
+        )
+
+        result = self.gemini.invoke(prompt, tier="light", max_tokens=500)
+        if not result:
+            return items
+
+        extracted = _parse_numbered_list(result, len(to_extract))
+        for i, name in enumerate(extracted):
+            idx = indices[i]
+            if item_type == "papers":
+                items[idx]["authors"] = [name]
+            else:
+                items[idx]["author"] = name
+
+        logger.info(f"Extracted missing authors for {len(extracted)} {item_type}")
         return items
 
     def summarize_papers(
