@@ -381,12 +381,19 @@ class BriefingIntelligence:
 
             # Handle different ways authors/sources are stored
             if item_type == "papers":
-                authors = ", ".join(item.get("authors", [])[:3])
-                source_info = f"Authors: {authors}"
+                authors_list = item.get("authors", [])
+                if authors_list:
+                    authors = ", ".join(authors_list[:3])
+                    source_info = f"Authors: {authors}"
+                else:
+                    source_info = "Authors: Unknown"
             elif item_type == "blogs":
                 author = item.get("author", "")
                 source = item.get("source", "")
-                source_info = f"Author: {author}, Blog: {source}"
+                if author:
+                    source_info = f"Author: {author}, Blog: {source}"
+                else:
+                    source_info = f"Blog: {source}"
             else:  # news or generic
                 source = item.get("source", "")
                 source_info = f"Source/Organization: {source}"
