@@ -113,7 +113,7 @@ class GeminiCLIClient:
                 "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900)
             output = result.stdout.strip()
             
             if output:
@@ -122,18 +122,22 @@ class GeminiCLIClient:
             
             raise ValueError(f"Empty response from {tier}")
 
-        except (subprocess.CalledProcessError, Exception) as e:
+        except subprocess.TimeoutExpired:
+            logger.error(f"Tier {tier} timed out after 15 minutes")
+        except Exception as e:
             logger.error(f"Tier {tier} failed: {str(e)[:100]}")
-            
-            # Recursive fallback
-            if allow_fallback:
-                next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
-                if next_tier:
-                    logger.info(f"--- Falling back from {tier} to {next_tier} ---")
-                    return self.invoke(
-                        prompt, tier=next_tier, max_tokens=max_tokens,
-                        temperature=temperature, system_prompt=system_prompt,
-                        allow_fallback=True
-                    )
-            
+        else:
             return None
+
+        # Recursive fallback for both timeout and other failures
+        if allow_fallback:
+            next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
+            if next_tier:
+                logger.info(f"--- Falling back from {tier} to {next_tier} ---")
+                return self.invoke(
+                    prompt, tier=next_tier, max_tokens=max_tokens,
+                    temperature=temperature, system_prompt=system_prompt,
+                    allow_fallback=True
+                )
+
+        return None

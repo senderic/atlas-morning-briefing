@@ -73,15 +73,16 @@ class EmailDistributor:
             extensions=["tables", "fenced_code", "nl2br"],
         )
 
-        # Handle [RIGHT] markers for alignment
-        html_body = html_body.replace("[RIGHT]", '<span style="float: right;">').replace("[/RIGHT]", "</span>")
-
         # Sanitize HTML to prevent XSS from untrusted content
         # (LLM outputs, news titles, blog titles may contain malicious markup)
         if HAS_NH3:
             html_body = nh3.clean(html_body)
         else:
             logger.warning("nh3 not installed; HTML email output is not sanitized")
+
+        # Handle [RIGHT] markers for alignment — applied after sanitization so
+        # the injected style attribute is not stripped by nh3.
+        html_body = html_body.replace("[RIGHT]", '<span style="float: right;">').replace("[/RIGHT]", "</span>")
 
         # Wrap in a styled HTML template
         html = f"""<!DOCTYPE html>
