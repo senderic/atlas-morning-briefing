@@ -109,6 +109,8 @@ body { font-family: sans-serif; line-height: 1.5; margin: 5%; }
 h1 { text-align: center; color: #1a1a1a; }
 h2 { color: #1f6feb; border-bottom: 1px solid #e1e4e8; padding-bottom: 5px; margin-top: 1.5em; }
 h3 { color: #24292f; margin-top: 1.2em; }
+h4 { color: #57606a; font-size: 0.85em; margin-top: 1em; text-transform: uppercase; letter-spacing: 0.05em; }
+h4 + p { font-size: 0.9em; color: #57606a; margin-top: 0; }
 p { margin: 0.5em 0; }
 table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.9em; }
 th, td { border: 1px solid #d0d7de; padding: 6px; text-align: left; }

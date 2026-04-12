@@ -412,7 +412,9 @@ class BriefingIntelligence:
             "or university publications. If the author is an organization or if an individual author "
             "cannot be definitively determined, provide a blurb about the organization's reputation.\n\n"
             f"<items>\n{items_block}\n</items>\n\n"
-            "Respond as a numbered list matching the input numbering."
+            "Respond ONLY with a numbered list matching the input numbering. "
+            "Do not include any introductory text, thought process, or preamble. "
+            "Each item must start with [n] or n."
         )
 
         result = self.gemini.invoke(
@@ -1546,6 +1548,7 @@ class BriefingIntelligence:
 def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
     """
     Parse a numbered list response from the model.
+    Ignores conversational preambles before the first numbered item.
 
     Args:
         text: Model response text.
@@ -1572,7 +1575,7 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                 stripped = stripped[bracket_end + 1:].strip()
             except (ValueError, IndexError):
                 pass
-        elif stripped[0].isdigit():
+        elif stripped and stripped[0].isdigit():
             for sep in [".", ")", ":"]:
                 if sep in stripped[:4]:
                     try:
@@ -1583,14 +1586,21 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                     break
 
         if new_num is not None and new_num != current_num:
-            if current_lines:
+            # Only append if we've already started a numbered section
+            if current_lines and current_num != -1:
                 items.append(" ".join(current_lines))
             current_num = new_num
             current_lines = [stripped] if stripped else []
         else:
             current_lines.append(stripped)
 
-    if current_lines:
+    # Append the last item if it exists and had a number
+    if current_lines and current_num != -1:
+        items.append(" ".join(current_lines))
+
+    # If we found no numbered items, we might have received one giant block.
+    # We'll allow it only if we were expecting exactly one item.
+    if not items and expected_count == 1 and current_lines:
         items.append(" ".join(current_lines))
 
     return items[:expected_count]

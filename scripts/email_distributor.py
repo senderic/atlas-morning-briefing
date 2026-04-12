@@ -126,6 +126,21 @@ class EmailDistributor:
     margin-top: 20px;
     margin-bottom: 4px;
   }}
+  h4 {{
+    color: #57606a;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 16px;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }}
+  h4 + p {{
+    font-size: 13px;
+    color: #57606a;
+    margin-top: 0;
+    line-height: 1.4;
+  }}
   p {{
     margin: 8px 0;
     font-size: 14px;
