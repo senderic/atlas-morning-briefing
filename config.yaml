@@ -13,6 +13,9 @@ arxiv_topics:
   - "Formal Verification for Autonomous Systems"
   - "Agentic AI"
   - "Multi-Agent Systems"
+  - "On-device AI Inference"
+  - "Offline Machine Learning"
+  - "Embedded AI for Restricted Environments"
 
 # RSS feeds to monitor
 blog_feeds:
@@ -75,6 +78,8 @@ interest_profile:
     weight: 0.7
   - topic: "Autonomous Driving End-to-End"
     weight: 0.6
+  - topic: "Off-grid AI systems and local NVIDIA-based inference"
+    weight: 0.8
 
 # Stock watchlist (Finnhub API)
 stocks:
@@ -109,6 +114,9 @@ news_queries:
   - "DARPA AI research breakthroughs"
   - "Shield AI autonomous flight updates"
   - "Epirus AI electronic warfare"
+  - "NVIDIA GPU based AI systems for off-grid operations"
+  - "Local LLM deployment on single-node workstations for specialized tasks"
+  - "tactical edge AI hardware and offline model execution"
 
 # Paper scoring weights
 paper_scoring:
