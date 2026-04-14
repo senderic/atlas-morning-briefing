@@ -25,7 +25,7 @@ class GeminiCLIClient:
     DEFAULT_MODELS = {
         "heavy": "pro",
         "medium": "flash",
-        "light": "flash",
+        "light": "flash-lite",
     }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -104,6 +104,11 @@ class GeminiCLIClient:
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
+        # Prepare environment variables for the subprocess call
+        process_env = os.environ.copy()
+        if "GEMINI_API_KEY" in process_env:
+            logger.info("Using GEMINI_API_KEY from environment for gemini-cli call (passed in thru env)")
+
         try:
             logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
             self._call_count += 1
@@ -112,10 +117,9 @@ class GeminiCLIClient:
                 "gemini", "--model", model_id, "--prompt", full_prompt,
                 "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
             ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900)
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
             output = result.stdout.strip()
-            
             if output:
                 logger.info(f"Gemini response received ({len(output)} chars) from {tier}")
                 return output

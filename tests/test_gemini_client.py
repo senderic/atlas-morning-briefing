@@ -34,9 +34,9 @@ class TestGeminiCLIClient:
 
     def test_default_models(self):
         client = GeminiCLIClient({})
-        assert client.models["heavy"] == "gemini-3-pro-preview"
-        assert client.models["medium"] == "gemini-3-flash-preview"
-        assert client.models["light"] == "gemini-2.5-flash-lite"
+        assert client.models["heavy"] == "pro"
+        assert client.models["medium"] == "flash"
+        assert client.models["light"] == "flash-lite"
 
     @patch("subprocess.run")
     def test_available_true(self, mock_run):
