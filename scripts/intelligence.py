@@ -59,6 +59,7 @@ class BriefingIntelligence:
         self.gemini = gemini
         self.config = config
         self.topics = config.get("arxiv_topics", [])
+        self.source_blurb_cache: Dict[str, str] = {}
 
     @property
     def available(self) -> bool:
@@ -377,31 +378,50 @@ class BriefingIntelligence:
         # Attempt to extract missing authors using the light model first
         items = self.extract_missing_authors(items, item_type)
 
-        # Prepare items for batch prompt
-        item_texts = []
-        for i, item in enumerate(items):
-            title = _sanitize_prompt_input(item.get("title", "Untitled"), max_length=200)
-
+        # 1. Map each item to its source_info and check cache
+        item_source_infos = []
+        for item in items:
             # Handle different ways authors/sources are stored
             if item_type == "papers":
                 authors_list = item.get("authors", [])
                 if authors_list:
+                    # Clean each author name
+                    authors_list = [str(a).strip() for a in authors_list if str(a).strip()]
                     authors = ", ".join(authors_list[:3])
-                    source_info = f"Authors: {authors}"
+                    s_info = f"Authors: {authors}"
                 else:
-                    source_info = "Authors: Unknown"
+                    s_info = "Authors: Unknown"
             elif item_type == "blogs":
-                author = item.get("author", "")
-                source = item.get("source", "")
+                author = str(item.get("author", "")).strip()
+                source = str(item.get("source", "")).strip()
                 if author:
-                    source_info = f"Author: {author}, Blog: {source}"
+                    s_info = f"Author: {author}, Blog: {source}"
                 else:
-                    source_info = f"Blog: {source}"
+                    s_info = f"Blog: {source}"
             else:  # news or generic
-                source = item.get("source", "")
-                source_info = f"Source/Organization: {source}"
+                source = str(item.get("source", "")).strip()
+                s_info = f"Source/Organization: {source}"
+            
+            item_source_infos.append(s_info)
 
-            item_texts.append(f"[{i+1}] {title}\n{source_info}")
+        # 2. Identify missing blurbs (deduplicated by normalized source)
+        missing_sources = {}  # norm_source -> (original_s_info, sample_title)
+        for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
+            norm_source = s_info.strip().lower()
+            if norm_source in self.source_blurb_cache:
+                item["author_blurb"] = self.source_blurb_cache[norm_source]
+            elif norm_source not in missing_sources:
+                title = _sanitize_prompt_input(item.get("title", "Untitled"), max_length=200)
+                missing_sources[norm_source] = (s_info, title)
+
+        if not missing_sources:
+            return items
+
+        # 3. Prepare batch prompt for missing items only
+        fetch_list = list(missing_sources.items()) # list of (norm_source, (s_info, title))
+        item_texts = []
+        for i, (norm_source, (s_info, title)) in enumerate(fetch_list):
+            item_texts.append(f"[{i+1}] {title}\n{s_info}")
 
         items_block = "\n\n".join(item_texts)
         prompt = (
@@ -423,13 +443,20 @@ class BriefingIntelligence:
         if not result:
             return items
 
-        # Parse numbered blurbs back to items
-        blurbs = _parse_numbered_list(result, len(items))
+        # Parse numbered blurbs and update cache
+        blurbs = _parse_numbered_list(result, len(fetch_list))
         for i, blurb in enumerate(blurbs):
-            if i < len(items):
-                items[i]["author_blurb"] = blurb.strip()
+            if i < len(fetch_list):
+                norm_source = fetch_list[i][0]
+                self.source_blurb_cache[norm_source] = blurb.strip()
 
-        logger.info(f"Generated author blurbs for {len(blurbs)} {item_type}")
+        # 4. Apply newly fetched blurbs to all items
+        for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
+            norm_source = s_info.strip().lower()
+            if norm_source in self.source_blurb_cache:
+                items[i]["author_blurb"] = self.source_blurb_cache[norm_source]
+
+        logger.info(f"Generated {len(blurbs)} new source blurbs for {item_type}")
         return items
 
     def extract_missing_authors(

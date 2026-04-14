@@ -586,7 +586,7 @@ class BriefingRunner:
 
             author_blurb = article.get("author_blurb")
             if author_blurb:
-                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
 
             md.append("\n")
         return "".join(md)
@@ -628,7 +628,7 @@ class BriefingRunner:
 
             author_blurb = article.get("author_blurb")
             if author_blurb:
-                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
 
             md.append("\n")
         return "".join(md)
@@ -732,7 +732,7 @@ class BriefingRunner:
 
             author_blurb = paper.get("author_blurb")
             if author_blurb:
-                md.append(f"#### Source Author Information\n{author_blurb}\n\n")
+                md.append(f"#### Source Information\n{author_blurb}\n\n")
 
             # Show reproduction feasibility badge
             if repro_total is not None:
@@ -765,7 +765,7 @@ class BriefingRunner:
 
             author_blurb = paper.get("author_blurb")
             if author_blurb:
-                md.append(f"\n#### Source Author Information\n{author_blurb}\n")
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
 
             md.append("\n")
         return "".join(md)
@@ -955,7 +955,7 @@ class BriefingRunner:
         # --- Run scanners in parallel (papers + blogs + stocks are independent) ---
         from concurrent.futures import ThreadPoolExecutor
         logger.info("=== Parallel data fetch (papers/blogs/stocks) ===")
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
             fut_papers = pool.submit(self.run_arxiv_scan, topics)
             fut_blogs = pool.submit(self.run_blog_scan)
             fut_stocks = pool.submit(self.run_stock_fetch)
@@ -1000,7 +1000,7 @@ class BriefingRunner:
 
             # --- Parallel batch 1: papers, news, blogs are independent ---
             logger.info("=== Intelligence Layer: Parallel enrichment (papers/news/blogs) ===")
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_papers = pool.submit(self._enrich_papers, papers, topics)
                 fut_news = pool.submit(self.intelligence.rank_and_summarize_news, news, topics)
                 fut_blogs = pool.submit(self.intelligence.rank_and_summarize_blogs, blogs, topics)
@@ -1010,7 +1010,7 @@ class BriefingRunner:
                 blogs = fut_blogs.result()
 
             # --- Parallel batch 2: stocks + themes (both depend on news) ---
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_stocks = pool.submit(self.intelligence.correlate_stocks_and_news, stocks, news)
                 fut_themes = pool.submit(self.intelligence.detect_emerging_themes, papers, blogs, news)
 
@@ -1039,7 +1039,7 @@ class BriefingRunner:
 
             # --- Generate author blurbs for all sections ---
             logger.info("=== Intelligence Layer: Generating Author Blurbs ===")
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_news_blurbs = pool.submit(self.intelligence.generate_author_blurbs, news, "news")
                 fut_blogs_blurbs = pool.submit(self.intelligence.generate_author_blurbs, blogs, "blogs")
                 fut_top_papers_blurbs = pool.submit(self.intelligence.generate_author_blurbs, top_papers[:5], "papers")

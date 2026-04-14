@@ -110,6 +110,9 @@ class GeminiCLIClient:
             logger.info("Using GEMINI_API_KEY from environment for gemini-cli call (passed in thru env)")
 
         try:
+            # Add a small delay to avoid burst rate limits on Gemini Free Tier
+            time.sleep(2)
+            
             logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
             self._call_count += 1
 
@@ -128,8 +131,12 @@ class GeminiCLIClient:
 
         except subprocess.TimeoutExpired:
             logger.error(f"Tier {tier} timed out after 15 minutes")
+        except subprocess.CalledProcessError as e:
+            # Capture full stderr to diagnose rate limits (429) or other API errors
+            error_msg = e.stderr.strip() if e.stderr else str(e)
+            logger.error(f"Tier {tier} command failed: {error_msg}")
         except Exception as e:
-            logger.error(f"Tier {tier} failed: {str(e)[:100]}")
+            logger.error(f"Tier {tier} failed: {str(e)}")
         else:
             return None
 

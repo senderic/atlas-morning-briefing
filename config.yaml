@@ -153,6 +153,9 @@ max_papers: 30
 max_blogs: 12
 max_news: 15
 
+# Concurrency settings
+max_workers: 1
+
 # PDF settings
 pdf:
   font_size: 10
