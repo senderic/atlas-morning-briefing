@@ -175,7 +175,7 @@ bedrock:
   enabled: false
 
 # Logging
-log_level: "INFO"
+log_level: "DEBUG"
 
 # Tracked entities for competitive intelligence
 tracked_entities:

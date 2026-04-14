@@ -7,7 +7,7 @@ from scripts.email_distributor import EmailDistributor
 from dotenv import load_dotenv
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 def test_email():

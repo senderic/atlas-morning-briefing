@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.gemini_client import GeminiCLIClient
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 

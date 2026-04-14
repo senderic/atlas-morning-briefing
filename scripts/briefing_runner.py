@@ -43,7 +43,7 @@ from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = ".atlas-state.json"
@@ -1222,7 +1222,7 @@ def main() -> int:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )
