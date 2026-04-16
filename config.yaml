@@ -167,6 +167,7 @@ pdf:
 gemini:
   enabled: true
   max_calls_per_run: 50
+  retry_wait_seconds: 61
   models:
     heavy: "pro"
     medium: "flash"

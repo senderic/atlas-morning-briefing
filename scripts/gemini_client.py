@@ -35,7 +35,7 @@ class GeminiCLIClient:
         Args:
             config: Optional Gemini configuration from config.yaml.
                     Keys: models (dict of tier->model_id),
-                    max_calls_per_run.
+                    max_calls_per_run, retry_wait_seconds.
         """
         config = config or {}
         self.enabled = config.get("enabled", True)
@@ -49,6 +49,7 @@ class GeminiCLIClient:
         }
 
         self.max_calls = config.get("max_calls_per_run", 50)
+        self.retry_wait_seconds = config.get("retry_wait_seconds", 61)
         self._call_count = 0
         self._available = None
 
@@ -135,6 +136,12 @@ class GeminiCLIClient:
             # Capture full stderr to diagnose rate limits (429) or other API errors
             error_msg = e.stderr.strip() if e.stderr else str(e)
             logger.error(f"Tier {tier} command failed: {error_msg}")
+            
+            # If it's a quota/capacity error, wait 61s before falling back
+            quota_keywords = ["RESOURCE_EXHAUSTED", "capacity", "rate limit", "429"]
+            if any(keyword.lower() in error_msg.lower() for keyword in quota_keywords):
+                logger.info(f"Quota error detected for {tier}. Waiting {self.retry_wait_seconds}s before fallback...")
+                time.sleep(self.retry_wait_seconds)
         except Exception as e:
             logger.error(f"Tier {tier} failed: {str(e)}")
         else:
