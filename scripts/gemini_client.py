@@ -13,7 +13,13 @@ import os
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
+from tenacity import (
+    retry, 
+    stop_after_attempt, 
+    wait_random_exponential, 
+    retry_if_exception, 
+    before_sleep_log
+)
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -131,8 +137,9 @@ class GeminiCLIClient:
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
-        # Higher persistence for the Heavy (Pro) model to avoid falling back too early
-        max_attempts = 6 if tier == "heavy" else 4
+        # Ultra-persistence for the Heavy (Pro) model to avoid falling back early
+        # 12 attempts gives it ~30-45 minutes of total retry time if needed
+        max_attempts = 12 if tier == "heavy" else 4
 
         def is_transient_error(exception):
             """Check if the error is worth retrying."""
