@@ -132,10 +132,11 @@ class GeminiCLIClient:
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         try:
-            # Define retry logic with tenacity
+            # Define retry logic with tenacity: incrementing wait (61s, 121s, 181s)
+            # stop_after_attempt(4) = 1 initial + 3 retries
             @retry(
-                stop=stop_after_attempt(3),
-                wait=wait_fixed(self.retry_wait_seconds),
+                stop=stop_after_attempt(4),
+                wait=wait_incrementing(start=self.retry_wait_seconds, increment=60),
                 retry=retry_if_exception_type((subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError)),
                 before_sleep=before_sleep_log(logger, logging.INFO),
                 reraise=True
@@ -146,7 +147,7 @@ class GeminiCLIClient:
             return retry_call()
 
         except Exception as e:
-            logger.error(f"All 3 attempts for tier {tier} failed: {str(e)}")
+            logger.error(f"All attempts for tier {tier} failed after 3 retries: {str(e)}")
             
             # Recursive fallback for both timeout and other failures
             if allow_fallback:
