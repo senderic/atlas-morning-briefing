@@ -14,4 +14,4 @@ cd /home/eric/atlas-morning-briefing
 
 # Run the briefing runner with DEBUG log level as requested
 # Using the venv python directly
-/home/eric/atlas-morning-briefing/.venv/bin/python3 scripts/briefing_runner.py --config config.yaml --log-level DEBUG 2>&1 | logger -t atlas-briefing
+/home/eric/atlas-morning-briefing/.venv/bin/python3 scripts/briefing_runner.py --config config.yaml --log-level DEBUG "$@" 2>&1 | logger -t atlas-briefing
