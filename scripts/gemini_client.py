@@ -131,13 +131,31 @@ class GeminiCLIClient:
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
+        # Higher persistence for the Heavy (Pro) model to avoid falling back too early
+        max_attempts = 6 if tier == "heavy" else 4
+
+        def is_transient_error(exception):
+            """Check if the error is worth retrying."""
+            if isinstance(exception, (subprocess.TimeoutExpired, ValueError)):
+                return True
+            if isinstance(exception, subprocess.CalledProcessError):
+                error_msg = (exception.stderr or str(exception)).lower()
+                # Stop retrying if we hit the daily hard quota
+                if "daily" in error_msg or "rpd" in error_msg:
+                    logger.warning(f"Hard daily quota reached for {tier}. Skipping retries.")
+                    return False
+                # Retry on typical transient errors
+                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500"]
+                return any(kw in error_msg for kw in quota_keywords)
+            return False
+
         try:
-            # Define retry logic with tenacity: incrementing wait (61s, 121s, 181s)
-            # stop_after_attempt(4) = 1 initial + 3 retries
+            # Define retry logic with tenacity: exponential backoff with jitter
+            # Starts ~60s, scales exponentially with random jitter up to 240s
             @retry(
-                stop=stop_after_attempt(4),
-                wait=wait_incrementing(start=self.retry_wait_seconds, increment=60),
-                retry=retry_if_exception_type((subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError)),
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_random_exponential(multiplier=30, min=60, max=240),
+                retry=retry_if_exception(is_transient_error),
                 before_sleep=before_sleep_log(logger, logging.INFO),
                 reraise=True
             )
@@ -147,7 +165,7 @@ class GeminiCLIClient:
             return retry_call()
 
         except Exception as e:
-            logger.error(f"All attempts for tier {tier} failed after 3 retries: {str(e)}")
+            logger.error(f"All attempts for tier {tier} failed after {max_attempts-1} retries: {str(e)}")
             
             # Recursive fallback for both timeout and other failures
             if allow_fallback:
