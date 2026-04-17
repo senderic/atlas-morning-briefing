@@ -13,6 +13,7 @@ import os
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -72,6 +73,31 @@ class GeminiCLIClient:
         
         return self._available
 
+    def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
+        """Execute the gemini command. Internal method for tenacity retries."""
+        process_env = os.environ.copy()
+        if "GEMINI_API_KEY" in process_env:
+            logger.info("Using GEMINI_API_KEY from environment for gemini-cli call (passed in thru env)")
+
+        # Add a small delay to avoid burst rate limits on Gemini Free Tier
+        time.sleep(2)
+        
+        logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
+        self._call_count += 1
+
+        cmd = [
+            "gemini", "--model", model_id, "--prompt", prompt,
+            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+        output = result.stdout.strip()
+        if not output:
+            raise ValueError(f"Empty response from {tier}")
+            
+        logger.info(f"Gemini response received ({len(output)} chars) from {tier}")
+        return output
+
     def invoke(
         self,
         prompt: str,
@@ -105,57 +131,32 @@ class GeminiCLIClient:
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
-        # Prepare environment variables for the subprocess call
-        process_env = os.environ.copy()
-        if "GEMINI_API_KEY" in process_env:
-            logger.info("Using GEMINI_API_KEY from environment for gemini-cli call (passed in thru env)")
-
         try:
-            # Add a small delay to avoid burst rate limits on Gemini Free Tier
-            time.sleep(2)
-            
-            logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
-            self._call_count += 1
+            # Define retry logic with tenacity
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_fixed(self.retry_wait_seconds),
+                retry=retry_if_exception_type((subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError)),
+                before_sleep=before_sleep_log(logger, logging.INFO),
+                reraise=True
+            )
+            def retry_call():
+                return self._execute_command(model_id, full_prompt, tier)
 
-            cmd = [
-                "gemini", "--model", model_id, "--prompt", full_prompt,
-                "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
-            ]
+            return retry_call()
 
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
-            output = result.stdout.strip()
-            if output:
-                logger.info(f"Gemini response received ({len(output)} chars) from {tier}")
-                return output
-            
-            raise ValueError(f"Empty response from {tier}")
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"Tier {tier} timed out after 15 minutes")
-        except subprocess.CalledProcessError as e:
-            # Capture full stderr to diagnose rate limits (429) or other API errors
-            error_msg = e.stderr.strip() if e.stderr else str(e)
-            logger.error(f"Tier {tier} command failed: {error_msg}")
-            
-            # If it's a quota/capacity error, wait 61s before falling back
-            quota_keywords = ["RESOURCE_EXHAUSTED", "capacity", "rate limit", "429"]
-            if any(keyword.lower() in error_msg.lower() for keyword in quota_keywords):
-                logger.info(f"Quota error detected for {tier}. Waiting {self.retry_wait_seconds}s before fallback...")
-                time.sleep(self.retry_wait_seconds)
         except Exception as e:
-            logger.error(f"Tier {tier} failed: {str(e)}")
-        else:
-            return None
-
-        # Recursive fallback for both timeout and other failures
-        if allow_fallback:
-            next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
-            if next_tier:
-                logger.info(f"--- Falling back from {tier} to {next_tier} ---")
-                return self.invoke(
-                    prompt, tier=next_tier, max_tokens=max_tokens,
-                    temperature=temperature, system_prompt=system_prompt,
-                    allow_fallback=True
-                )
+            logger.error(f"All 3 attempts for tier {tier} failed: {str(e)}")
+            
+            # Recursive fallback for both timeout and other failures
+            if allow_fallback:
+                next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
+                if next_tier:
+                    logger.info(f"--- Falling back from {tier} to {next_tier} ---")
+                    return self.invoke(
+                        prompt, tier=next_tier, max_tokens=max_tokens,
+                        temperature=temperature, system_prompt=system_prompt,
+                        allow_fallback=True
+                    )
 
         return None
