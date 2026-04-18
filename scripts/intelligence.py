@@ -935,7 +935,7 @@ class BriefingIntelligence:
         """
         Correlate stock movements with news headlines.
 
-        Uses the heavy tier model for cross-domain reasoning.
+        Uses the medium tier model.
 
         Args:
             stocks: Stock data with price changes.

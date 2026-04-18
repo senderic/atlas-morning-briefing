@@ -464,6 +464,10 @@ class BriefingRunner:
                 md.append(f"- {error}\n")
             md.append("\n")
 
+        # Gemini Usage Summary
+        if self.gemini:
+            md.append(self.gemini.get_usage_summary())
+
         return "".join(md)
 
     def _format_filename(self, now: datetime) -> str:

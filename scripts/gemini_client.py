@@ -60,6 +60,13 @@ class GeminiCLIClient:
         self._call_count = 0
         self._available = None
 
+        # Usage tracking
+        self.usage_stats = {
+            "heavy": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "medium": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "light": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+        }
+
     @property
     def available(self) -> bool:
         """Check if Gemini CLI is available and enabled."""
@@ -93,16 +100,51 @@ class GeminiCLIClient:
 
         cmd = [
             "gemini", "--model", model_id, "--prompt", prompt,
-            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk"
+            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
+            "--output-format", "json"
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
-        output = result.stdout.strip()
-        if not output:
-            raise ValueError(f"Empty response from {tier}")
+        
+        try:
+            # Parse JSON output from gemini-cli
+            data = json.loads(result.stdout)
+            output = data.get("response", "").strip()
             
-        logger.info(f"Gemini response received ({len(output)} chars) from {tier}")
-        return output
+            # Extract stats if available
+            stats = data.get("stats", {}).get("models", {})
+            model_stats = {}
+            for k, v in stats.items():
+                if model_id in k or k in model_id:
+                    model_stats = v.get("tokens", {})
+                    break
+            if not model_stats and stats:
+                model_stats = next(iter(stats.values())).get("tokens", {})
+
+            # Update usage metrics
+            self.usage_stats[tier]["calls"] += 1
+            in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
+            out_tokens = model_stats.get("candidates", 0)
+            
+            self.usage_stats[tier]["in_tokens"] += in_tokens
+            self.usage_stats[tier]["out_tokens"] += out_tokens
+            
+            self.usage_stats[tier]["in_chars"] += len(prompt)
+            self.usage_stats[tier]["out_chars"] += len(output)
+
+            if not output:
+                raise ValueError(f"Empty response from {tier}")
+                
+            logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
+            return output
+
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
+            output = result.stdout.strip()
+            self.usage_stats[tier]["calls"] += 1
+            self.usage_stats[tier]["in_chars"] += len(prompt)
+            self.usage_stats[tier]["out_chars"] += len(output)
+            return output
 
     def invoke(
         self,
@@ -147,9 +189,10 @@ class GeminiCLIClient:
                 return True
             if isinstance(exception, subprocess.CalledProcessError):
                 error_msg = (exception.stderr or str(exception)).lower()
-                # Stop retrying if we hit the daily hard quota
-                if "daily" in error_msg or "rpd" in error_msg:
-                    logger.warning(f"Hard daily quota reached for {tier}. Skipping retries.")
+                # Stop retrying if we hit the daily hard quota or exhausted capacity
+                hard_quota_keywords = ["daily", "rpd", "exhausted your capacity", "limit reached"]
+                if any(kw in error_msg for kw in hard_quota_keywords):
+                    logger.warning(f"Hard quota reached for {tier}. Skipping retries.")
                     return False
                 # Retry on typical transient errors
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500"]
@@ -172,7 +215,12 @@ class GeminiCLIClient:
             return retry_call()
 
         except Exception as e:
-            logger.error(f"All attempts for tier {tier} failed after {max_attempts-1} retries: {str(e)}")
+            # Capture more detail in the error log
+            error_detail = str(e)
+            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                error_detail += f" | stderr: {e.stderr.strip()}"
+            
+            logger.error(f"All attempts for tier {tier} failed after {max_attempts-1} retries: {error_detail}")
             
             # Recursive fallback for both timeout and other failures
             if allow_fallback:
@@ -186,3 +234,46 @@ class GeminiCLIClient:
                     )
 
         return None
+
+    def get_usage_summary(self) -> str:
+        """Generate a formatted markdown summary of Gemini API usage and estimated costs."""
+        # Cost constants (Gemini 1.5 Pay-as-you-go pricing)
+        # Pro: $1.25/1M in, $3.75/1M out
+        # Flash: $0.075/1M in, $0.30/1M out
+        PRICING = {
+            "heavy": {"in": 1.25 / 1_000_000, "out": 3.75 / 1_000_000},
+            "medium": {"in": 0.075 / 1_000_000, "out": 0.30 / 1_000_000},
+            "light": {"in": 0.075 / 1_000_000, "out": 0.30 / 1_000_000}, # Same as flash
+        }
+
+        total_cost = 0.0
+        lines = ["\n---\n\n## Gemini Usage Summary\n\n"]
+        lines.append("| Tier | Calls | Input (Tok/Char) | Output (Tok/Char) | Est. Cost |\n")
+        lines.append("| :--- | :---: | :--- | :--- | :--- |\n")
+
+        for tier in ["heavy", "medium", "light"]:
+            stats = self.usage_stats[tier]
+            if stats["calls"] == 0:
+                continue
+            
+            # Estimate tokens if they were missing (4 chars per token)
+            in_tok = stats["in_tokens"] or (stats["in_chars"] // 4)
+            out_tok = stats["out_tokens"] or (stats["out_chars"] // 4)
+            
+            cost = (in_tok * PRICING[tier]["in"]) + (out_tok * PRICING[tier]["out"])
+            total_cost += cost
+            
+            lines.append(
+                f"| {tier.capitalize()} | {stats['calls']} | "
+                f"{in_tok:,} / {stats['in_chars']:,} | "
+                f"{out_tok:,} / {stats['out_chars']:,} | "
+                f"${cost:.4f} |\n"
+            )
+
+        if total_cost == 0 and sum(s["calls"] for s in self.usage_stats.values()) == 0:
+            return ""
+
+        lines.append(f"| **Total** | **{sum(s['calls'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n")
+        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing.*\n")
+        
+        return "".join(lines)
