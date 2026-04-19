@@ -180,8 +180,8 @@ class GeminiCLIClient:
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         # Ultra-persistence for the Heavy (Pro) model to avoid falling back early
-        # 12 attempts gives it ~30-45 minutes of total retry time if needed
-        max_attempts = 12 if tier == "heavy" else 4
+        # 15 attempts gives it ~45-60 minutes of total retry time if needed
+        max_attempts = 15 if tier == "heavy" else 4
 
         def is_transient_error(exception):
             """Check if the error is worth retrying."""
@@ -189,22 +189,22 @@ class GeminiCLIClient:
                 return True
             if isinstance(exception, subprocess.CalledProcessError):
                 error_msg = (exception.stderr or str(exception)).lower()
-                # Stop retrying if we hit the daily hard quota or exhausted capacity
-                hard_quota_keywords = ["daily", "rpd", "exhausted your capacity", "limit reached"]
+                # Stop retrying if we hit the daily hard quota
+                hard_quota_keywords = ["daily", "rpd", "limit reached"]
                 if any(kw in error_msg for kw in hard_quota_keywords):
                     logger.warning(f"Hard quota reached for {tier}. Skipping retries.")
                     return False
                 # Retry on typical transient errors
-                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500"]
+                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted your capacity"]
                 return any(kw in error_msg for kw in quota_keywords)
             return False
 
         try:
             # Define retry logic with tenacity: exponential backoff with jitter
-            # Starts ~60s, scales exponentially with random jitter up to 240s
+            # Starts ~60s, scales exponentially with random jitter up to 300s
             @retry(
                 stop=stop_after_attempt(max_attempts),
-                wait=wait_random_exponential(multiplier=30, min=60, max=240),
+                wait=wait_random_exponential(multiplier=45 if tier == "heavy" else 30, min=60, max=300),
                 retry=retry_if_exception(is_transient_error),
                 before_sleep=before_sleep_log(logger, logging.INFO),
                 reraise=True
