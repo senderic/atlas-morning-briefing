@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.gemini_client import GeminiCLIClient
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +59,7 @@ class BriefingIntelligence:
         self.gemini = gemini
         self.config = config
         self.topics = config.get("arxiv_topics", [])
+        self.source_blurb_cache: Dict[str, str] = {}
 
     @property
     def available(self) -> bool:
@@ -354,6 +355,176 @@ class BriefingIntelligence:
             logger.info(f"Expanded topics with {len(additions)} suggestions: {additions}")
 
         return topics + additions
+
+    def generate_author_blurbs(
+        self, items: List[Dict[str, Any]], item_type: str = "item"
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate blurbs about authors or organizations for a list of items.
+
+        Uses the medium tier model to research and summarize author background,
+        past work, and trustworthiness.
+
+        Args:
+            items: List of item dictionaries (papers, news, or blogs).
+            item_type: String describing the type of items (e.g., "papers").
+
+        Returns:
+            Items with added 'author_blurb' key.
+        """
+        if not self.available or not items:
+            return items
+
+        # Attempt to extract missing authors using the light model first
+        items = self.extract_missing_authors(items, item_type)
+
+        # 1. Map each item to its source_info and check cache
+        item_source_infos = []
+        for item in items:
+            # Handle different ways authors/sources are stored
+            if item_type == "papers":
+                authors_list = item.get("authors", [])
+                if authors_list:
+                    # Clean each author name
+                    authors_list = [str(a).strip() for a in authors_list if str(a).strip()]
+                    authors = ", ".join(authors_list[:3])
+                    s_info = f"Authors: {authors}"
+                else:
+                    s_info = "Authors: Unknown"
+            elif item_type == "blogs":
+                author = str(item.get("author", "")).strip()
+                source = str(item.get("source", "")).strip()
+                if author:
+                    s_info = f"Author: {author}, Blog: {source}"
+                else:
+                    s_info = f"Blog: {source}"
+            else:  # news or generic
+                source = str(item.get("source", "")).strip()
+                s_info = f"Source/Organization: {source}"
+            
+            item_source_infos.append(s_info)
+
+        # 2. Identify missing blurbs (deduplicated by normalized source)
+        missing_sources = {}  # norm_source -> (original_s_info, sample_title)
+        for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
+            norm_source = s_info.strip().lower()
+            if norm_source in self.source_blurb_cache:
+                item["author_blurb"] = self.source_blurb_cache[norm_source]
+            elif norm_source not in missing_sources:
+                title = _sanitize_prompt_input(item.get("title", "Untitled"), max_length=200)
+                missing_sources[norm_source] = (s_info, title)
+
+        if not missing_sources:
+            return items
+
+        # 3. Prepare batch prompt for missing items only
+        fetch_list = list(missing_sources.items()) # list of (norm_source, (s_info, title))
+        item_texts = []
+        for i, (norm_source, (s_info, title)) in enumerate(fetch_list):
+            item_texts.append(f"[{i+1}] {title}\n{s_info}")
+
+        items_block = "\n\n".join(item_texts)
+        prompt = (
+            f"For each {item_type[:-1] if item_type.endswith('s') else item_type} below, "
+            "provide a concise blurb (2-3 sentences) about the author(s) or the organization. "
+            "Include who they are, their past work, what they are known for, and how trustworthy they seem. "
+            "Base your assessment of trustworthiness on reputable sources such as PBS, NPR, NYT, "
+            "or university publications. If the author is an organization or if an individual author "
+            "cannot be definitively determined, provide a blurb about the organization's reputation.\n\n"
+            f"<items>\n{items_block}\n</items>\n\n"
+            "Respond ONLY with a numbered list matching the input numbering. "
+            "Do not include any introductory text, thought process, or preamble. "
+            "Each item must start with [n] or n."
+        )
+
+        result = self.gemini.invoke(
+            prompt, tier="medium", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+        )
+        if not result:
+            return items
+
+        # Parse numbered blurbs and update cache
+        blurbs = _parse_numbered_list(result, len(fetch_list))
+        for i, blurb in enumerate(blurbs):
+            if i < len(fetch_list):
+                norm_source = fetch_list[i][0]
+                self.source_blurb_cache[norm_source] = blurb.strip()
+
+        # 4. Apply newly fetched blurbs to all items
+        for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
+            norm_source = s_info.strip().lower()
+            if norm_source in self.source_blurb_cache:
+                items[i]["author_blurb"] = self.source_blurb_cache[norm_source]
+
+        logger.info(f"Generated {len(blurbs)} new source blurbs for {item_type}")
+        return items
+
+    def extract_missing_authors(
+        self, items: List[Dict[str, Any]], item_type: str = "item"
+    ) -> List[Dict[str, Any]]:
+        """
+        Use the light tier model to extract missing author names from text.
+
+        Args:
+            items: List of item dictionaries.
+            item_type: Type of items.
+
+        Returns:
+            Items with updated 'author' or 'authors' keys where they were missing.
+        """
+        if not self.available:
+            return items
+
+        to_extract = []
+        indices = []
+        for i, item in enumerate(items):
+            if item_type == "papers":
+                if not item.get("authors"):
+                    to_extract.append(item)
+                    indices.append(i)
+            elif item_type == "blogs":
+                if not item.get("author"):
+                    to_extract.append(item)
+                    indices.append(i)
+            # News usually only has 'source' (organization), but might have an author in snippet
+            elif item_type == "news":
+                if "author" not in item:
+                    to_extract.append(item)
+                    indices.append(i)
+
+        if not to_extract:
+            return items
+
+        item_texts = []
+        for i, item in enumerate(to_extract):
+            title = _sanitize_prompt_input(item.get("title", ""), max_length=200)
+            summary = _sanitize_prompt_input(
+                item.get("summary", item.get("description", item.get("snippet", "")))[:300],
+                max_length=350
+            )
+            item_texts.append(f"[{i+1}] Title: {title}\nText: {summary}")
+
+        prompt = (
+            f"Extract the primary author(s) name from these {item_type}. "
+            "If no individual author is mentioned, identify the organization or source. "
+            "Be very concise. Return ONLY the name(s), one per line, matching input numbering.\n\n"
+            f"<items>\n" + "\n\n".join(item_texts) + "\n</items>"
+        )
+
+        result = self.gemini.invoke(prompt, tier="light", max_tokens=500)
+        if not result:
+            return items
+
+        extracted = _parse_numbered_list(result, len(to_extract))
+        for i, name in enumerate(extracted):
+            idx = indices[i]
+            if item_type == "papers":
+                items[idx]["authors"] = [name]
+            else:
+                items[idx]["author"] = name
+
+        logger.info(f"Extracted missing authors for {len(extracted)} {item_type}")
+        return items
 
     def summarize_papers(
         self, papers: List[Dict[str, Any]]
@@ -764,7 +935,7 @@ class BriefingIntelligence:
         """
         Correlate stock movements with news headlines.
 
-        Uses the heavy tier model for cross-domain reasoning.
+        Uses the medium tier model.
 
         Args:
             stocks: Stock data with price changes.
@@ -1404,6 +1575,7 @@ class BriefingIntelligence:
 def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
     """
     Parse a numbered list response from the model.
+    Ignores conversational preambles before the first numbered item.
 
     Args:
         text: Model response text.
@@ -1430,7 +1602,7 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                 stripped = stripped[bracket_end + 1:].strip()
             except (ValueError, IndexError):
                 pass
-        elif stripped[0].isdigit():
+        elif stripped and stripped[0].isdigit():
             for sep in [".", ")", ":"]:
                 if sep in stripped[:4]:
                     try:
@@ -1441,14 +1613,21 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                     break
 
         if new_num is not None and new_num != current_num:
-            if current_lines:
+            # Only append if we've already started a numbered section
+            if current_lines and current_num != -1:
                 items.append(" ".join(current_lines))
             current_num = new_num
             current_lines = [stripped] if stripped else []
         else:
             current_lines.append(stripped)
 
-    if current_lines:
+    # Append the last item if it exists and had a number
+    if current_lines and current_num != -1:
+        items.append(" ".join(current_lines))
+
+    # If we found no numbered items, we might have received one giant block.
+    # We'll allow it only if we were expecting exactly one item.
+    if not items and expected_count == 1 and current_lines:
         items.append(" ".join(current_lines))
 
     return items[:expected_count]

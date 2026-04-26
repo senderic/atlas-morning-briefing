@@ -225,7 +225,7 @@ pdf:
 ## Logging
 
 ```yaml
-log_level: "INFO"  # DEBUG | INFO | WARNING | ERROR
+log_level: "DEBUG"  # DEBUG | INFO | WARNING | ERROR
 ```
 
 **Levels**:
@@ -284,7 +284,7 @@ pdf:
   include_toc: true
   include_emoji: false
 
-log_level: "INFO"
+log_level: "DEBUG"
 ```
 
 ## Amazon Bedrock Configuration

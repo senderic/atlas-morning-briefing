@@ -90,3 +90,21 @@ class TestParseNumberedList:
         result = _parse_numbered_list(text, 2)
         assert len(result) == 2
         assert "Start of item. More of the item." == result[0]
+
+    def test_ignores_preamble(self):
+        text = "Sure, here are the blurbs:\n1. First blurb.\n2. Second blurb."
+        result = _parse_numbered_list(text, 2)
+        assert len(result) == 2
+        assert result[0] == "First blurb."
+        assert result[1] == "Second blurb."
+
+    def test_handles_no_numbers_single_expected(self):
+        text = "This is a single block of text."
+        result = _parse_numbered_list(text, 1)
+        assert len(result) == 1
+        assert result[0] == "This is a single block of text."
+
+    def test_handles_no_numbers_multiple_expected(self):
+        text = "This is a single block of text, but we expected more."
+        result = _parse_numbered_list(text, 2)
+        assert len(result) == 0  # Should skip as we can't reliably split it

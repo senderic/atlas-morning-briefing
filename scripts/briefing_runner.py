@@ -43,7 +43,7 @@ from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = ".atlas-state.json"
@@ -464,6 +464,10 @@ class BriefingRunner:
                 md.append(f"- {error}\n")
             md.append("\n")
 
+        # Gemini Usage Summary
+        if self.gemini:
+            md.append(self.gemini.get_usage_summary())
+
         return "".join(md)
 
     def _format_filename(self, now: datetime) -> str:
@@ -583,6 +587,11 @@ class BriefingRunner:
                 md.append(f"**{article_title}**\n")
             if summary:
                 md.append(f"{summary}\n")
+
+            author_blurb = article.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -620,6 +629,11 @@ class BriefingRunner:
                 if not article.get("brief_summary") and len(summary) > 300:
                     summary = summary[:297] + "..."
                 md.append(f"{summary}\n")
+
+            author_blurb = article.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -720,6 +734,10 @@ class BriefingRunner:
             elif relevance_reason:
                 md.append(f"{relevance_reason}\n\n")
 
+            author_blurb = paper.get("author_blurb")
+            if author_blurb:
+                md.append(f"#### Source Information\n{author_blurb}\n\n")
+
             # Show reproduction feasibility badge
             if repro_total is not None:
                 badge = "✅" if repro_total >= 18 else "🟡" if repro_total >= 12 else "🔴"
@@ -748,6 +766,11 @@ class BriefingRunner:
             md.append("\n")
             if brief_summary:
                 md.append(f"{brief_summary}\n")
+
+            author_blurb = paper.get("author_blurb")
+            if author_blurb:
+                md.append(f"\n#### Source Information\n{author_blurb}\n")
+
             md.append("\n")
         return "".join(md)
 
@@ -936,7 +959,7 @@ class BriefingRunner:
         # --- Run scanners in parallel (papers + blogs + stocks are independent) ---
         from concurrent.futures import ThreadPoolExecutor
         logger.info("=== Parallel data fetch (papers/blogs/stocks) ===")
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
             fut_papers = pool.submit(self.run_arxiv_scan, topics)
             fut_blogs = pool.submit(self.run_blog_scan)
             fut_stocks = pool.submit(self.run_stock_fetch)
@@ -981,7 +1004,7 @@ class BriefingRunner:
 
             # --- Parallel batch 1: papers, news, blogs are independent ---
             logger.info("=== Intelligence Layer: Parallel enrichment (papers/news/blogs) ===")
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_papers = pool.submit(self._enrich_papers, papers, topics)
                 fut_news = pool.submit(self.intelligence.rank_and_summarize_news, news, topics)
                 fut_blogs = pool.submit(self.intelligence.rank_and_summarize_blogs, blogs, topics)
@@ -991,7 +1014,7 @@ class BriefingRunner:
                 blogs = fut_blogs.result()
 
             # --- Parallel batch 2: stocks + themes (both depend on news) ---
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_stocks = pool.submit(self.intelligence.correlate_stocks_and_news, stocks, news)
                 fut_themes = pool.submit(self.intelligence.detect_emerging_themes, papers, blogs, news)
 
@@ -1017,6 +1040,20 @@ class BriefingRunner:
 
             # Ensure top 3 papers all have summaries (batched)
             top_papers = self._ensure_paper_summaries(top_papers[:3]) + top_papers[3:]
+
+            # --- Generate author blurbs for all sections ---
+            logger.info("=== Intelligence Layer: Generating Author Blurbs ===")
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
+                fut_news_blurbs = pool.submit(self.intelligence.generate_author_blurbs, news, "news")
+                fut_blogs_blurbs = pool.submit(self.intelligence.generate_author_blurbs, blogs, "blogs")
+                fut_top_papers_blurbs = pool.submit(self.intelligence.generate_author_blurbs, top_papers[:5], "papers")
+                fut_recent_papers_blurbs = pool.submit(self.intelligence.generate_author_blurbs, papers[:5], "papers")
+
+                # Lists are mutated in-place by generate_author_blurbs
+                fut_news_blurbs.result()
+                fut_blogs_blurbs.result()
+                fut_top_papers_blurbs.result()
+                fut_recent_papers_blurbs.result()
 
             synthesis = self.intelligence.synthesize_briefing(
                 papers, blogs[:5], stocks, news[:5], top_papers[:3],
@@ -1189,7 +1226,7 @@ def main() -> int:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )

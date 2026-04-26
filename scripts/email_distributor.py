@@ -25,7 +25,7 @@ try:
 except ImportError:
     HAS_NH3 = False
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -125,6 +125,21 @@ class EmailDistributor:
     font-size: 15px;
     margin-top: 20px;
     margin-bottom: 4px;
+  }}
+  h4 {{
+    color: #57606a;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 16px;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }}
+  h4 + p {{
+    font-size: 13px;
+    color: #57606a;
+    margin-top: 0;
+    line-height: 1.4;
   }}
   p {{
     margin: 8px 0;

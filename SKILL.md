@@ -147,9 +147,9 @@ sender_email: "YOUR_EMAIL@gmail.com"
 gemini:
   enabled: true
   models:
-    heavy: "gemini-3-pro-preview"
-    medium: "gemini-3-flash-preview"
-    light: "gemini-2.5-flash-lite"
+    heavy: "pro"
+    medium: "flash"
+    light: "flash-lite"
 ```
 
 See `references/config_guide.md` for full configuration options.

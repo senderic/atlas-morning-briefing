@@ -25,7 +25,7 @@ from reportlab.platypus import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -106,6 +106,15 @@ class PDFGenerator:
                 spaceAfter=2,
                 spaceBefore=4,
                 textColor=colors.HexColor("#3a3a3a"),
+            ),
+            "heading4": ParagraphStyle(
+                "CustomHeading4",
+                parent=base_styles["Heading4"],
+                fontSize=self.font_size - 1,
+                spaceAfter=1,
+                spaceBefore=4,
+                textColor=colors.HexColor("#57606a"),
+                textTransform="uppercase",
             ),
             "body": ParagraphStyle(
                 "CustomBody",
@@ -188,6 +197,8 @@ class PDFGenerator:
             return ("h2", self._strip_md_links(line[3:].strip()))
         elif line.startswith("### "):
             return ("h3", self._strip_md_links(line[4:].strip()))
+        elif line.startswith("#### "):
+            return ("h4", self._strip_md_links(line[5:].strip()))
 
         # Code blocks (simplified)
         if line.startswith("```"):
@@ -270,6 +281,8 @@ class PDFGenerator:
                 flowables.append(Paragraph(content, self.styles["heading2"]))
             elif line_type == "h3":
                 flowables.append(Paragraph(content, self.styles["heading3"]))
+            elif line_type == "h4":
+                flowables.append(Paragraph(content, self.styles["heading4"]))
             elif line_type == "body":
                 if content:
                     # Special handling for [RIGHT] alignment markers (usually for subtitles)
@@ -481,7 +494,7 @@ def main() -> int:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )
