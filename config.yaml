@@ -166,6 +166,8 @@ pdf:
 # Gemini CLI configuration
 gemini:
   enabled: true
+  ignore_hard_quota: true
+  internal_max_attempts: 1
   max_calls_per_run: 50
   retry_wait_seconds: 61
   models:

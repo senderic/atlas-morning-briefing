@@ -46,6 +46,8 @@ class GeminiCLIClient:
         """
         config = config or {}
         self.enabled = config.get("enabled", True)
+        self.ignore_hard_quota = config.get("ignore_hard_quota", False)
+        self.internal_max_attempts = config.get("internal_max_attempts", 1)
         
         # Model IDs per tier
         models_config = config.get("models", {})
@@ -87,64 +89,89 @@ class GeminiCLIClient:
         return self._available
 
     def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
-        """Execute the gemini command. Internal method for tenacity retries."""
-        process_env = os.environ.copy()
-        if "GEMINI_API_KEY" in process_env:
-            logger.info("Using GEMINI_API_KEY from environment for gemini-cli call (passed in thru env)")
+        """Execute the gemini command with a local config to force maxAttempts=1."""
+        import tempfile
+        import shutil
+        from pathlib import Path
 
-        # Add a small delay to avoid burst rate limits on Gemini Free Tier
-        time.sleep(2)
-        
-        logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
-        self._call_count += 1
-
-        cmd = [
-            "gemini", "--model", model_id, "--prompt", prompt,
-            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
-            "--output-format", "json"
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+        # Create a temporary directory for the gemini config
+        tmp_config_dir = tempfile.mkdtemp(prefix="atlas_gemini_config_")
         
         try:
-            # Parse JSON output from gemini-cli
-            data = json.loads(result.stdout)
-            output = data.get("response", "").strip()
+            # Create .gemini/settings.json in the temp dir
+            gemini_dir = Path(tmp_config_dir) / ".gemini"
+            gemini_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = gemini_dir / "settings.json"
             
-            # Extract stats if available
-            stats = data.get("stats", {}).get("models", {})
-            model_stats = {}
-            for k, v in stats.items():
-                if model_id in k or k in model_id:
-                    model_stats = v.get("tokens", {})
-                    break
-            if not model_stats and stats:
-                model_stats = next(iter(stats.values())).get("tokens", {})
+            # CRITICAL: Force maxAttempts to the configured value so Python Tenacity controls the retries
+            # Also set a shorter connection timeout to fail fast and retry at our level
+            with open(settings_path, "w") as f:
+                json.dump({
+                    "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
+                    "tools": {"autoAccept": True}
+                }, f)
 
-            # Update usage metrics
-            self.usage_stats[tier]["calls"] += 1
-            in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
-            out_tokens = model_stats.get("candidates", 0)
-            
-            self.usage_stats[tier]["in_tokens"] += in_tokens
-            self.usage_stats[tier]["out_tokens"] += out_tokens
-            
-            self.usage_stats[tier]["in_chars"] += len(prompt)
-            self.usage_stats[tier]["out_chars"] += len(output)
+            # Use standard environment but override the config directory
+            process_env = os.environ.copy()
+            process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
 
-            if not output:
-                raise ValueError(f"Empty response from {tier}")
+            # Add a small initial delay for the heavy tier to avoid hitting RPM limits
+            if tier == "heavy":
+                time.sleep(1)
+            
+            logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
+
+            cmd = [
+                "gemini", "--model", model_id, "--prompt", prompt,
+                "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
+                "--output-format", "json"
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+            
+            try:
+                # Parse JSON output from gemini-cli
+                data = json.loads(result.stdout)
+                output = data.get("response", "").strip()
                 
-            logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
-            return output
+                # Extract stats if available
+                stats = data.get("stats", {}).get("models", {})
+                model_stats = {}
+                for k, v in stats.items():
+                    if model_id in k or k in model_id:
+                        model_stats = v.get("tokens", {})
+                        break
+                if not model_stats and stats:
+                    model_stats = next(iter(stats.values())).get("tokens", {})
 
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
-            output = result.stdout.strip()
-            self.usage_stats[tier]["calls"] += 1
-            self.usage_stats[tier]["in_chars"] += len(prompt)
-            self.usage_stats[tier]["out_chars"] += len(output)
-            return output
+                # Update usage metrics
+                self.usage_stats[tier]["calls"] += 1
+                in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
+                out_tokens = model_stats.get("candidates", 0)
+                
+                self.usage_stats[tier]["in_tokens"] += in_tokens
+                self.usage_stats[tier]["out_tokens"] += out_tokens
+                
+                self.usage_stats[tier]["in_chars"] += len(prompt)
+                self.usage_stats[tier]["out_chars"] += len(output)
+
+                if not output:
+                    raise ValueError(f"Empty response from {tier}")
+                    
+                logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
+                return output
+
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
+                output = result.stdout.strip()
+                self.usage_stats[tier]["calls"] += 1
+                self.usage_stats[tier]["in_chars"] += len(prompt)
+                self.usage_stats[tier]["out_chars"] += len(output)
+                return output
+        
+        finally:
+            # Clean up the temporary config directory
+            shutil.rmtree(tmp_config_dir, ignore_errors=True)
 
     def invoke(
         self,
@@ -157,31 +184,21 @@ class GeminiCLIClient:
     ) -> Optional[str]:
         """
         Invoke a Gemini model via CLI with recursive tier fallback.
-
-        Args:
-            prompt: User prompt text.
-            tier: Model tier - "heavy", "medium", or "light".
-            max_tokens: Override default max tokens.
-            temperature: Override default temperature.
-            system_prompt: Optional system prompt.
-            allow_fallback: If True, recurse to lower tiers on failure.
-
-        Returns:
-            Model response text, or None if all attempts fail.
         """
         if not self.available:
             return None
 
+        # Check budget BEFORE incrementing (so retries don't burn it)
         if self._call_count >= self.max_calls:
-            logger.warning(f"LLM call budget exhausted. Skipping {tier}.")
+            logger.warning(f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}.")
             return None
 
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
-        # Ultra-persistence for the Heavy (Pro) model to avoid falling back early
-        # 15 attempts gives it ~45-60 minutes of total retry time if needed
-        max_attempts = 15 if tier == "heavy" else 4
+        # Ultra-persistence for the Heavy (Pro) model
+        # 12 attempts with longer wait can span ~1 hour
+        max_attempts = 12 if tier == "heavy" else 4
 
         def is_transient_error(exception):
             """Check if the error is worth retrying."""
@@ -189,22 +206,35 @@ class GeminiCLIClient:
                 return True
             if isinstance(exception, subprocess.CalledProcessError):
                 error_msg = (exception.stderr or str(exception)).lower()
-                # Stop retrying if we hit the daily hard quota
-                hard_quota_keywords = ["daily", "rpd", "limit reached"]
+                
+                # Keywords for typical transient errors
+                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted your capacity"]
+                # Keywords that usually mean a hard daily stop
+                hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
+                
                 if any(kw in error_msg for kw in hard_quota_keywords):
+                    if self.ignore_hard_quota:
+                        logger.info(f"Potential hard quota hit for {tier}, but ignore_hard_quota is enabled. Retrying...")
+                        return True
                     logger.warning(f"Hard quota reached for {tier}. Skipping retries.")
                     return False
-                # Retry on typical transient errors
-                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted your capacity"]
+                
                 return any(kw in error_msg for kw in quota_keywords)
             return False
 
         try:
-            # Define retry logic with tenacity: exponential backoff with jitter
-            # Starts ~60s, scales exponentially with random jitter up to 300s
+            # Smarter Wait Strategy:
+            # For Heavy tier, we start with a 90s floor to clear 60s RPM windows.
+            # Max wait of 450s (7.5m) to clear larger sliding windows.
+            wait_strategy = wait_random_exponential(
+                multiplier=60 if tier == "heavy" else 30, 
+                min=90 if tier == "heavy" else 60, 
+                max=450 if tier == "heavy" else 300
+            )
+
             @retry(
                 stop=stop_after_attempt(max_attempts),
-                wait=wait_random_exponential(multiplier=45 if tier == "heavy" else 30, min=60, max=300),
+                wait=wait_strategy,
                 retry=retry_if_exception(is_transient_error),
                 before_sleep=before_sleep_log(logger, logging.INFO),
                 reraise=True
@@ -212,7 +242,11 @@ class GeminiCLIClient:
             def retry_call():
                 return self._execute_command(model_id, full_prompt, tier)
 
-            return retry_call()
+            # Successful logical call - increment budget ONCE
+            result = retry_call()
+            if result:
+                self._call_count += 1
+            return result
 
         except Exception as e:
             # Capture more detail in the error log
