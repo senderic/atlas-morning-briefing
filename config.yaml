@@ -65,6 +65,18 @@ blog_feeds:
     url: "https://venturebeat.com/category/ai/feed/"
   - name: "MIT Technology Review"
     url: "https://www.technologyreview.com/feed/"
+  - name: "Ben Thompson (Stratechery)"
+    url: "https://stratechery.com/feed/"
+  - name: "Benedict Evans"
+    url: "https://www.ben-evans.com/benedictevans?format=rss"
+  - name: "Casey Newton (Platformer)"
+    url: "https://www.platformer.news/rss/"
+  - name: "Packy McCormick (Not Boring)"
+    url: "https://www.notboring.co/feed"
+  - name: "Zvi Mowshowitz"
+    url: "https://thezvi.substack.com/feed"
+  - name: "Eric Newcomer"
+    url: "https://www.newcomer.co/feed"
 
 # Interest profile for relevance filtering
 interest_profile:
@@ -80,6 +92,10 @@ interest_profile:
     weight: 0.6
   - topic: "Off-grid AI systems and local NVIDIA-based inference"
     weight: 0.8
+  - topic: "Tech strategy, business models, and market analysis"
+    weight: 0.8
+  - topic: "AI policy, regulation, and societal impact"
+    weight: 0.7
 
 # Stock watchlist (Finnhub API)
 stocks:

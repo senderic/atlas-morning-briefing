@@ -114,6 +114,28 @@ class GeminiCLIClient:
             # Use standard environment but override the config directory
             process_env = os.environ.copy()
             process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
+            
+            # Ensure compatibility by setting both common API key environment variables
+            if "GEMINI_API_KEY" in process_env:
+                api_key = process_env["GEMINI_API_KEY"]
+                process_env["GOOGLE_API_KEY"] = api_key
+                key_preview = api_key[:6] + "..." + api_key[-4:]
+                logger.debug(f"API Key found in environment: {key_preview} (Applied to GEMINI_API_KEY and GOOGLE_API_KEY)")
+            elif "GOOGLE_API_KEY" in process_env:
+                api_key = process_env["GOOGLE_API_KEY"]
+                process_env["GEMINI_API_KEY"] = api_key
+                key_preview = api_key[:6] + "..." + api_key[-4:]
+                logger.debug(f"API Key found in environment: {key_preview} (Applied to GEMINI_API_KEY and GOOGLE_API_KEY)")
+            else:
+                logger.warning("No Gemini/Google API key found in environment!")
+
+            # CRITICAL: Force the CLI to use the API key by masking system-wide auth
+            # This prevents fallback to local gcloud/ADC credentials
+            process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
+            process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
+            process_env["HOME"] = tmp_config_dir  # Prevent looking up ~/.config or ~/.gemini
+            process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true" # Ensure it runs in headless mode
+            logger.debug("Masked system-wide Google Cloud auth (ADC), redirected HOME, and forced workspace trust.")
 
             # Add a small initial delay for the heavy tier to avoid hitting RPM limits
             if tier == "heavy":
