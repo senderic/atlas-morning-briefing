@@ -112,6 +112,33 @@ class TestGeminiRotation:
 
     @patch("subprocess.run")
     @patch("time.sleep")
+    def test_tier_isolation_after_rotation(self, mock_sleep, mock_run, rotation_config):
+        """Test that non-heavy tiers use index 0 even after heavy tier has rotated the index."""
+        env = {"GEMINI_API_KEY": "key1,key2"}
+        with patch.dict(os.environ, env, clear=True):
+            client = GeminiCLIClient(rotation_config)
+            client._available = True
+            
+            # 1. Manually set index to 1 (simulating a previous heavy rotation)
+            client._current_key_index = 1
+            
+            # 2. Call medium tier
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "Success"}')
+            client.invoke("Prompt", tier="medium")
+            
+            # 3. Verify it used key1 (index 0) despite client._current_key_index being 1
+            last_env = mock_run.call_args[1]['env']
+            assert last_env["GEMINI_API_KEY"] == "key1"
+            
+            # 4. Call heavy tier
+            client.invoke("Prompt", tier="heavy")
+            
+            # 5. Verify heavy tier DID use key2 (index 1)
+            last_env = mock_run.call_args[1]['env']
+            assert last_env["GEMINI_API_KEY"] == "key2"
+
+    @patch("subprocess.run")
+    @patch("time.sleep")
     def test_rotation_exhausted(self, mock_sleep, mock_run, rotation_config):
         """Test behavior when ONLY one key exists and hits quota for heavy tier."""
         env = {"GEMINI_API_KEY": "key1"} # Only one key
