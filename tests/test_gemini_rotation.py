@@ -74,36 +74,46 @@ class TestGeminiRotation:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_invoke_with_rotation_on_quota(self, mock_sleep, mock_run, rotation_config):
-        """Test that invoke automatically rotates keys when hitting quota."""
+        """Test that invoke automatically rotates keys ONLY for heavy tier."""
         env = {"GEMINI_API_KEY": "key1,key2"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
             client._available = True
             
-            # Setup mock to fail with Quota error first time, succeed second time
-            # Using "quota" keyword which we just added to the client
+            # 1. Test heavy tier rotates
             quota_error = subprocess.CalledProcessError(
                 1, ["gemini"], stderr="Quota exceeded for this model."
             )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
-            
             mock_run.side_effect = [quota_error, success_result]
             
-            # Reduce tenacity retries for test speed if needed, but here 4 is fine with mocks
+            response = client.invoke("Prompt", tier="heavy")
+            assert response == "Success"
+            assert client._current_key_index == 1
+            assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
+            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key2"
+            
+            # 2. Test medium tier does NOT rotate and stays on key1
+            mock_run.reset_mock()
+            mock_run.side_effect = [quota_error, success_result]
+            
+            # Reset index for clean test
+            client._current_key_index = 0
+            
+            # Medium tier call - should hit quota error but NOT rotate
+            # It will retry with the SAME key (index 0) because tier != "heavy"
+            # Since mock_run.side_effect has 2 items, the retry will succeed on 2nd attempt
             response = client.invoke("Prompt", tier="medium")
             
             assert response == "Success"
-            assert client._current_key_index == 1 # Rotated to second key
-            assert mock_run.call_count == 2
-            
-            # Verify API keys used in order
+            assert client._current_key_index == 0 # Should still be 0
             assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
-            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key2"
+            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key1"
 
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_rotation_exhausted(self, mock_sleep, mock_run, rotation_config):
-        """Test behavior when ONLY one key exists and hits quota."""
+        """Test behavior when ONLY one key exists and hits quota for heavy tier."""
         env = {"GEMINI_API_KEY": "key1"} # Only one key
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
@@ -116,11 +126,9 @@ class TestGeminiRotation:
             
             # Capture the rotation attempt
             with patch.object(client, '_rotate_key', side_effect=client._rotate_key) as spy_rotate:
-                client.invoke("Prompt", tier="light", allow_fallback=False)
+                client.invoke("Prompt", tier="heavy", allow_fallback=False)
                 
                 # Should have tried to rotate
                 assert spy_rotate.called
-                # And since only one key, it should have returned False
-                assert spy_rotate.returned_value is None or spy_rotate.call_count > 0
-                # Final check: index stayed at 0
+                # Final check: index stayed at 0 because there were no other keys
                 assert client._current_key_index == 0

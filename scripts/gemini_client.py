@@ -187,14 +187,21 @@ class GeminiCLIClient:
             process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
             
             # Ensure compatibility by setting both common API key environment variables
-            api_key = self._get_current_key()
+            if tier == "heavy":
+                api_key = self._get_current_key()
+                key_index = self._current_key_index
+            else:
+                # For non-heavy tiers, always stick to the first API key
+                api_key = self._api_keys[0] if self._api_keys else None
+                key_index = 0
+
             if api_key:
                 process_env["GEMINI_API_KEY"] = api_key
                 process_env["GOOGLE_API_KEY"] = api_key
                 key_preview = api_key[:6] + "..." + api_key[-4:]
-                logger.debug(f"Using API Key index {self._current_key_index}: {key_preview}")
+                logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
             else:
-                logger.warning("No Gemini/Google API key available for this request!")
+                logger.warning(f"No Gemini/Google API key available for tier {tier}!")
 
             # CRITICAL: Force the CLI to use the API key by masking system-wide auth
             # This prevents fallback to local gcloud/ADC credentials
@@ -304,7 +311,7 @@ class GeminiCLIClient:
                 is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
                 
                 if is_quota:
-                    if self._rotate_key():
+                    if tier == "heavy" and self._rotate_key():
                         logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
                         return True
                     
