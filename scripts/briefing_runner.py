@@ -778,8 +778,12 @@ class BriefingRunner:
     def generate_pdf(self, markdown_content: str, output_path: str) -> bool:
         """Generate PDF from markdown."""
         try:
-            logger.info("=== Generating PDF ===")
             pdf_config = self.config.get("pdf", {})
+            if not pdf_config.get("enabled", True):
+                logger.info("PDF generation disabled in config, skipping")
+                return True
+
+            logger.info("=== Generating PDF ===")
             page_format = self.config.get("output_format", "kindle")
             font_size = pdf_config.get("font_size", 10)
             line_spacing = pdf_config.get("line_spacing", 1.5)
@@ -1128,14 +1132,16 @@ class BriefingRunner:
             logger.warning(f"Failed to save markdown: {e}")
 
         # --- Generate PDF ---
-        pdf_path = f"{filename}.pdf"
-        pdf_success = self.generate_pdf(markdown_content, pdf_path)
+        pdf_config = self.config.get("pdf", {})
+        pdf_enabled = pdf_config.get("enabled", True)
+        pdf_path = f"{filename}.pdf" if pdf_enabled else None
+        pdf_success = self.generate_pdf(markdown_content, pdf_path) if pdf_enabled else True
 
         # --- Generate EPUB (Reflowable for Kindle) ---
         epub_path = f"{filename}.epub"
         epub_success = self.generate_epub(markdown_content, epub_path)
 
-        if not pdf_success and not epub_success:
+        if pdf_enabled and not pdf_success and not epub_success:
             logger.error("Failed to generate both PDF and EPUB")
             self.status["elapsed_seconds"] = round(time.time() - start_time, 1)
             self.save_status()
