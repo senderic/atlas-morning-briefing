@@ -124,16 +124,18 @@ class GeminiCLIClient:
         if len(self._api_keys) <= 1:
             return False
         
-        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
-        new_key = self._get_current_key()
-        key_preview = new_key[:6] + "..." + new_key[-4:] if new_key else "None"
-        
         # Best practice: Use a base delay + random jitter to avoid synchronized retry storms
         jitter = random.uniform(0, 10)
         total_delay = self.key_swap_delay + jitter
         
-        logger.info(f"Rotating API key (new index: {self._current_key_index}, preview: {key_preview})...")
-        logger.debug(f"Waiting {total_delay:.2f}s for key swap cooldown (base: {self.key_swap_delay}s, jitter: {jitter:.2f}s)...")
+        logger.info(f"🔄 ROTATING API KEY: Moving from index {self._current_key_index} to {(self._current_key_index + 1) % len(self._api_keys)}")
+        
+        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        new_key = self._get_current_key()
+        key_preview = new_key[:6] + "..." + new_key[-4:] if new_key else "None"
+        
+        logger.info(f"✅ Now using key at index {self._current_key_index} (preview: {key_preview})")
+        logger.debug(f"⏳ Waiting {total_delay:.2f}s for key swap cooldown (base: {self.key_swap_delay}s, jitter: {jitter:.2f}s)...")
         time.sleep(total_delay)
             
         return True
