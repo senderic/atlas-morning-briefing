@@ -10,6 +10,7 @@ Uses subprocess to call the 'gemini' command.
 import json
 import logging
 import os
+import random
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
@@ -59,8 +60,11 @@ class GeminiCLIClient:
 
         self.max_calls = config.get("max_calls_per_run", 50)
         self.retry_wait_seconds = config.get("retry_wait_seconds", 61)
+        self.key_swap_delay = config.get("key_swap_delay", 5)
         self._call_count = 0
         self._available = None
+        self._api_keys = self._load_api_keys()
+        self._current_key_index = 0
 
         # Usage tracking
         self.usage_stats = {
@@ -68,6 +72,71 @@ class GeminiCLIClient:
             "medium": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
             "light": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
         }
+
+    def _load_api_keys(self) -> List[str]:
+        """
+        Load API keys from environment.
+        Supports:
+        - GEMINI_API_KEY or GOOGLE_API_KEY (can be comma-separated)
+        - GEMINI_API_KEY_*, GOOGLE_API_KEY_* (alphanumeric suffix, sorted)
+        """
+        keys = []
+        seen_values = set()
+        
+        def add_key(val):
+            if val and val not in seen_values:
+                keys.append(val)
+                seen_values.add(val)
+
+        # 1. Check for primary keys first (highest priority)
+        for var in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+            raw = os.environ.get(var, "")
+            if raw:
+                for k in raw.split(","):
+                    add_key(k.strip())
+            
+        # 2. Check for suffixed variants, sorted by environment variable name
+        suffixed_vars = []
+        for var_name in os.environ:
+            if var_name.startswith("GEMINI_API_KEY_") or var_name.startswith("GOOGLE_API_KEY_"):
+                # Skip the primary ones we already handled
+                if var_name not in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+                    suffixed_vars.append(var_name)
+        
+        for var_name in sorted(suffixed_vars):
+            add_key(os.environ[var_name].strip())
+
+        if not keys:
+            logger.warning("No Gemini/Google API key found in environment!")
+        elif len(keys) > 1:
+            logger.info(f"Loaded {len(keys)} API keys for rotation.")
+            
+        return keys
+
+    def _get_current_key(self) -> Optional[str]:
+        """Get the current API key from the rotation."""
+        if not self._api_keys:
+            return None
+        return self._api_keys[self._current_key_index]
+
+    def _rotate_key(self) -> bool:
+        """Rotate to the next API key. Returns True if a new key is available."""
+        if len(self._api_keys) <= 1:
+            return False
+        
+        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        new_key = self._get_current_key()
+        key_preview = new_key[:6] + "..." + new_key[-4:] if new_key else "None"
+        
+        # Best practice: Use a base delay + random jitter to avoid synchronized retry storms
+        jitter = random.uniform(0, 10)
+        total_delay = self.key_swap_delay + jitter
+        
+        logger.info(f"Rotating API key (new index: {self._current_key_index}, preview: {key_preview})...")
+        logger.debug(f"Waiting {total_delay:.2f}s for key swap cooldown (base: {self.key_swap_delay}s, jitter: {jitter:.2f}s)...")
+        time.sleep(total_delay)
+            
+        return True
 
     @property
     def available(self) -> bool:
@@ -116,18 +185,14 @@ class GeminiCLIClient:
             process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
             
             # Ensure compatibility by setting both common API key environment variables
-            if "GEMINI_API_KEY" in process_env:
-                api_key = process_env["GEMINI_API_KEY"]
+            api_key = self._get_current_key()
+            if api_key:
+                process_env["GEMINI_API_KEY"] = api_key
                 process_env["GOOGLE_API_KEY"] = api_key
                 key_preview = api_key[:6] + "..." + api_key[-4:]
-                logger.debug(f"API Key found in environment: {key_preview} (Applied to GEMINI_API_KEY and GOOGLE_API_KEY)")
-            elif "GOOGLE_API_KEY" in process_env:
-                api_key = process_env["GOOGLE_API_KEY"]
-                process_env["GEMINI_API_KEY"] = api_key
-                key_preview = api_key[:6] + "..." + api_key[-4:]
-                logger.debug(f"API Key found in environment: {key_preview} (Applied to GEMINI_API_KEY and GOOGLE_API_KEY)")
+                logger.debug(f"Using API Key index {self._current_key_index}: {key_preview}")
             else:
-                logger.warning("No Gemini/Google API key found in environment!")
+                logger.warning("No Gemini/Google API key available for this request!")
 
             # CRITICAL: Force the CLI to use the API key by masking system-wide auth
             # This prevents fallback to local gcloud/ADC credentials
@@ -223,23 +288,30 @@ class GeminiCLIClient:
         max_attempts = 12 if tier == "heavy" else 4
 
         def is_transient_error(exception):
-            """Check if the error is worth retrying."""
+            """Check if the error is worth retrying, and rotate key if quota hit."""
             if isinstance(exception, (subprocess.TimeoutExpired, ValueError)):
                 return True
             if isinstance(exception, subprocess.CalledProcessError):
                 error_msg = (exception.stderr or str(exception)).lower()
                 
                 # Keywords for typical transient errors
-                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted your capacity"]
+                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
                 # Keywords that usually mean a hard daily stop
                 hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
                 
-                if any(kw in error_msg for kw in hard_quota_keywords):
-                    if self.ignore_hard_quota:
-                        logger.info(f"Potential hard quota hit for {tier}, but ignore_hard_quota is enabled. Retrying...")
+                is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
+                
+                if is_quota:
+                    if self._rotate_key():
+                        logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
                         return True
-                    logger.warning(f"Hard quota reached for {tier}. Skipping retries.")
-                    return False
+                    
+                    if any(kw in error_msg for kw in hard_quota_keywords):
+                        if self.ignore_hard_quota:
+                            logger.info(f"Potential hard quota hit for {tier}, but ignore_hard_quota is enabled. Retrying with current key...")
+                            return True
+                        logger.warning(f"Hard quota reached for {tier} and no more keys to rotate. Skipping retries.")
+                        return False
                 
                 return any(kw in error_msg for kw in quota_keywords)
             return False
