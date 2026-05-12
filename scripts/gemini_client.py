@@ -68,17 +68,17 @@ class GeminiCLIClient:
 
         # Usage tracking
         self.usage_stats = {
-            "heavy": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
-            "medium": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
-            "light": {"calls": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "heavy": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "medium": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "light": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
         }
 
     def _load_api_keys(self) -> List[str]:
         """
         Load API keys from environment.
         Supports:
-        - GEMINI_API_KEY or GOOGLE_API_KEY (can be comma-separated)
-        - GEMINI_API_KEY_*, GOOGLE_API_KEY_* (alphanumeric suffix, sorted)
+        - GEMINI_API_KEY (can be comma-separated)
+        - GEMINI_API_KEY_* (alphanumeric suffix, sorted)
         """
         keys = []
         seen_values = set()
@@ -88,26 +88,25 @@ class GeminiCLIClient:
                 keys.append(val)
                 seen_values.add(val)
 
-        # 1. Check for primary keys first (highest priority)
-        for var in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
-            raw = os.environ.get(var, "")
-            if raw:
-                for k in raw.split(","):
-                    add_key(k.strip())
+        # 1. Check for primary GEMINI_API_KEY first (highest priority)
+        raw = os.environ.get("GEMINI_API_KEY", "")
+        if raw:
+            for k in raw.split(","):
+                add_key(k.strip())
             
         # 2. Check for suffixed variants, sorted by environment variable name
         suffixed_vars = []
         for var_name in os.environ:
-            if var_name.startswith("GEMINI_API_KEY_") or var_name.startswith("GOOGLE_API_KEY_"):
-                # Skip the primary ones we already handled
-                if var_name not in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+            if var_name.startswith("GEMINI_API_KEY_"):
+                # Skip the primary one we already handled
+                if var_name != "GEMINI_API_KEY":
                     suffixed_vars.append(var_name)
         
         for var_name in sorted(suffixed_vars):
             add_key(os.environ[var_name].strip())
 
         if not keys:
-            logger.warning("No Gemini/Google API key found in environment!")
+            logger.warning("No Gemini API key found in environment!")
         elif len(keys) > 1:
             logger.info(f"Loaded {len(keys)} API keys for rotation.")
             
@@ -197,19 +196,19 @@ class GeminiCLIClient:
 
             if api_key:
                 process_env["GEMINI_API_KEY"] = api_key
-                process_env["GOOGLE_API_KEY"] = api_key
                 key_preview = api_key[:6] + "..." + api_key[-4:]
                 logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
             else:
-                logger.warning(f"No Gemini/Google API key available for tier {tier}!")
+                logger.warning(f"No Gemini API key available for tier {tier}!")
 
             # CRITICAL: Force the CLI to use the API key by masking system-wide auth
-            # This prevents fallback to local gcloud/ADC credentials
+            # This prevents fallback to local gcloud/ADC credentials or OAuth
+            process_env["GOOGLE_API_KEY"] = ""  # Explicitly clear any inherited Google key
             process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
             process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
             process_env["HOME"] = tmp_config_dir  # Prevent looking up ~/.config or ~/.gemini
             process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true" # Ensure it runs in headless mode
-            logger.debug("Masked system-wide Google Cloud auth (ADC), redirected HOME, and forced workspace trust.")
+            logger.debug("Strict Auth: Masked system-wide Google Cloud auth (ADC/OAuth), redirected HOME, and cleared GOOGLE_API_KEY.")
 
             # Add a small initial delay for the heavy tier to avoid hitting RPM limits
             if tier == "heavy":
@@ -223,7 +222,11 @@ class GeminiCLIClient:
                 "--output-format", "json"
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+            except Exception as e:
+                self.usage_stats[tier]["failed_attempts"] += 1
+                raise e
             
             try:
                 # Parse JSON output from gemini-cli
@@ -301,7 +304,17 @@ class GeminiCLIClient:
             if isinstance(exception, (subprocess.TimeoutExpired, ValueError)):
                 return True
             if isinstance(exception, subprocess.CalledProcessError):
-                error_msg = (exception.stderr or str(exception)).lower()
+                # Check both stderr and stdout for error messages
+                error_msg = ""
+                if exception.stderr:
+                    error_msg += exception.stderr
+                if exception.stdout:
+                    error_msg += exception.stdout
+                
+                if not error_msg:
+                    error_msg = str(exception)
+                
+                error_msg = error_msg.lower()
                 
                 # Keywords for typical transient errors
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
@@ -311,7 +324,7 @@ class GeminiCLIClient:
                 is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
                 
                 if is_quota:
-                    if tier == "heavy" and self._rotate_key():
+                    if self._rotate_key():
                         logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
                         return True
                     
@@ -385,12 +398,12 @@ class GeminiCLIClient:
 
         total_cost = 0.0
         lines = ["\n---\n\n## Gemini Usage Summary\n\n"]
-        lines.append("| Tier | Calls | Input (Tok/Char) | Output (Tok/Char) | Est. Cost |\n")
-        lines.append("| :--- | :---: | :--- | :--- | :--- |\n")
+        lines.append("| Tier | Success | Failures | Input (Tok/Char) | Output (Tok/Char) | Est. Cost |\n")
+        lines.append("| :--- | :---: | :---: | :--- | :--- | :--- |\n")
 
         for tier in ["heavy", "medium", "light"]:
             stats = self.usage_stats[tier]
-            if stats["calls"] == 0:
+            if stats["calls"] == 0 and stats["failed_attempts"] == 0:
                 continue
             
             # Estimate tokens if they were missing (4 chars per token)
@@ -401,16 +414,19 @@ class GeminiCLIClient:
             total_cost += cost
             
             lines.append(
-                f"| {tier.capitalize()} | {stats['calls']} | "
+                f"| {tier.capitalize()} | {stats['calls']} | {stats['failed_attempts']} | "
                 f"{in_tok:,} / {stats['in_chars']:,} | "
                 f"{out_tok:,} / {stats['out_chars']:,} | "
                 f"${cost:.4f} |\n"
             )
 
-        if total_cost == 0 and sum(s["calls"] for s in self.usage_stats.values()) == 0:
+        if total_cost == 0 and sum(s["calls"] + s["failed_attempts"] for s in self.usage_stats.values()) == 0:
             return ""
 
-        lines.append(f"| **Total** | **{sum(s['calls'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n")
-        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing.*\n")
+        lines.append(
+            f"| **Total** | **{sum(s['calls'] for s in self.usage_stats.values())}** | "
+            f"**{sum(s['failed_attempts'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n"
+        )
+        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n")
         
         return "".join(lines)

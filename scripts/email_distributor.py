@@ -446,8 +446,8 @@ class EmailDistributor:
         email_recipients = list(email_recipients_set)
 
         if email_recipients:
-            # For regular email, PDF is usually preferred as an attachment
-            attachment = pdf_path if pdf_path else epub_path
+            # For regular email, PDF is preferred. Don't send EPUB to non-Kindle.
+            attachment = pdf_path
             html_results = self.send_html_email(
                 recipients=email_recipients,
                 markdown_content=markdown_content,

@@ -100,10 +100,58 @@ class TestGeminiCLIClient:
         mock_run.assert_not_called()
 
     @patch("subprocess.run")
-    def test_invoke_failure(self, mock_run, mock_config):
-        mock_run.side_effect = subprocess.CalledProcessError(1, ["gemini"], stderr="Error message")
+    def test_invoke_failure_tracking(self, mock_run, mock_config):
+        # Mock a non-retryable failure to keep test fast
+        mock_run.side_effect = subprocess.CalledProcessError(1, ["gemini"], stderr="Fatal error")
         client = GeminiCLIClient(mock_config)
         client._available = True
         
-        response = client.invoke("Prompt")
+        # Disable fallback for this test to focus on single tier failure
+        response = client.invoke("Prompt", tier="medium", allow_fallback=False)
+        
         assert response is None
+        # Should have 1 failed attempt (no retry because "Fatal error" isn't a quota keyword)
+        assert client.usage_stats["medium"]["failed_attempts"] == 1
+        assert client.usage_stats["medium"]["calls"] == 0
+
+    @patch("subprocess.run")
+    def test_invoke_retry_and_rotation_tracking(self, mock_run, mock_config):
+        # Mock 2 quota failures then 1 success
+        # "429" triggers retry/rotation
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
+            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
+            MagicMock(returncode=0, stdout='{"response": "Success after retries"}')
+        ]
+        
+        # Add multiple keys to allow rotation
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "key1,key2,key3"}):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            # Shorten delays for test
+            client.key_swap_delay = 0.01
+            
+            # Using patch to avoid long exponential waits in test
+            with patch("scripts.gemini_client.wait_random_exponential", return_value=lambda x: 0.01):
+                response = client.invoke("Prompt", tier="heavy")
+        
+        assert response == "Success after retries"
+        # 2 failures + 1 success
+        assert client.usage_stats["heavy"]["failed_attempts"] == 2
+        assert client.usage_stats["heavy"]["calls"] == 1
+
+    def test_get_usage_summary_with_failures(self, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client.usage_stats["heavy"]["failed_attempts"] = 5
+        client.usage_stats["medium"]["calls"] = 2
+        client.usage_stats["medium"]["failed_attempts"] = 1
+        client.usage_stats["medium"]["in_tokens"] = 1000
+        client.usage_stats["medium"]["out_tokens"] = 500
+        
+        summary = client.get_usage_summary()
+        
+        assert "## Gemini Usage Summary" in summary
+        assert "| Tier | Success | Failures |" in summary
+        assert "| Heavy | 0 | 5 |" in summary
+        assert "| Medium | 2 | 1 |" in summary
+        assert "Failed calls are not charged" in summary
