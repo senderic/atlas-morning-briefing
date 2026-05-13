@@ -215,7 +215,6 @@ class ArxivScanner:
         """Search ArXiv API for papers on a topic."""
         try:
             import requests
-            from xml.etree import ElementTree as ET
 
             end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=self.days_back)
@@ -233,8 +232,18 @@ class ArxivScanner:
             response = requests.get(self.ARXIV_API_URL, params=params, timeout=30)
             response.raise_for_status()
 
-            papers = []
-            root = ET.fromstring(response.text)
+            return self._parse_arxiv_response(response.text, start_date)
+
+        except Exception as e:
+            logger.error(f"Legacy ArXiv search failed for '{topic}': {e}")
+            return []
+
+    def _parse_arxiv_response(self, xml_content: str, start_date: datetime) -> list[dict[str, Any]]:
+        """Parse ArXiv API XML response."""
+        from xml.etree import ElementTree as ET
+        papers = []
+        try:
+            root = ET.fromstring(xml_content)
             namespace = {"atom": "http://www.w3.org/2005/Atom"}
 
             for entry in root.findall("atom:entry", namespace):
@@ -273,8 +282,8 @@ class ArxivScanner:
 
                 papers.append({
                     "id": paper_id.text.strip() if paper_id is not None else "",
-                    "title": title.text.strip() if title is not None else "",
-                    "summary": summary.text.strip() if summary is not None else "",
+                    "title": title.text.strip().replace("\n", " ") if title is not None else "",
+                    "summary": summary.text.strip().replace("\n", " ") if summary is not None else "",
                     "authors": authors,
                     "published": published.text if published is not None else "",
                     "updated": updated.text if updated is not None else "",
@@ -283,12 +292,9 @@ class ArxivScanner:
                     "arxiv_url": paper_id.text if paper_id is not None else "",
                     "source": "arxiv_api",
                 })
-
-            logger.info(f"Found {len(papers)} papers for: {topic}")
             return papers
-
         except Exception as e:
-            logger.error(f"Legacy ArXiv search failed for '{topic}': {e}")
+            logger.error(f"Failed to parse ArXiv XML: {e}")
             return []
 
     def scan_all_topics(self) -> list[dict[str, Any]]:
@@ -322,8 +328,10 @@ def create_scanner(topics: list[str], days_back: int = 7, max_results: int = 20)
 # (briefing_runner.py imports ArxivScanner directly)
 if HAS_DEEPXIV:
     # When DeepXiv is available, ArxivScanner points to DeepXiv
-    _OriginalArxivScanner = ArxivScanner
+    LegacyArxivScanner = ArxivScanner
     ArxivScanner = DeepXivScanner  # type: ignore[misc]
+else:
+    LegacyArxivScanner = ArxivScanner
 
 
 def load_config(config_path: str) -> dict[str, Any]:

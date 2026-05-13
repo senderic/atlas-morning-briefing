@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.bedrock_client import BedrockClient
+from scripts.gemini_client import GeminiCLIClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,22 +49,22 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, bedrock: BedrockClient, config: Dict[str, Any]):
+    def __init__(self, llm_client: Any, config: Dict[str, Any]):
         """
         Initialize BriefingIntelligence.
 
         Args:
-            bedrock: BedrockClient instance.
+            llm_client: LLM client instance (BedrockClient or GeminiCLIClient).
             config: Full config dictionary.
         """
-        self.bedrock = bedrock
+        self.llm = llm_client
         self.config = config
         self.topics = config.get("arxiv_topics", [])
 
     @property
     def available(self) -> bool:
         """Check if intelligence features are available."""
-        return self.bedrock.available
+        return self.llm.available if self.llm else False
 
     @staticmethod
     def extract_score(text: str) -> Tuple[int, str]:
@@ -196,7 +197,7 @@ class BriefingIntelligence:
             "Be selective. Only include papers that strongly match the profile."
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="heavy", max_tokens=2000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -286,7 +287,7 @@ class BriefingIntelligence:
             "- Multi-agent orchestration frameworks release"
         )
 
-        result = self.bedrock.invoke(prompt, tier="light", max_tokens=300)
+        result = self.llm.invoke(prompt, tier="light", max_tokens=300)
         if not result:
             logger.info("Dynamic query generation failed, using static queries only")
             return static_queries
@@ -333,7 +334,7 @@ class BriefingIntelligence:
             f"<topics>\n{topic_list}\n</topics>"
         )
 
-        result = self.bedrock.invoke(prompt, tier="light", max_tokens=256)
+        result = self.llm.invoke(prompt, tier="light", max_tokens=256)
         if not result:
             return topics
 
@@ -389,7 +390,7 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="medium", max_tokens=1500, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -439,7 +440,7 @@ class BriefingIntelligence:
             "Example: [1] 8 Directly addresses agent evaluation methodology"
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -524,7 +525,7 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -626,7 +627,7 @@ class BriefingIntelligence:
             "Rank by importance. Be factual. Do not invent details."
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -651,7 +652,7 @@ class BriefingIntelligence:
 
         # Retry once with simpler prompt
         logger.warning(f"News ranking parse failed (attempt 1). LLM response: {result[:300]}")
-        retry_result = self.bedrock.invoke(
+        retry_result = self.llm.invoke(
             f"From these articles, pick the 5 most important for an AI researcher. "
             f"Format EXACTLY as: [number] summary sentence.\n\n{articles_block}",
             tier="medium", max_tokens=800, system_prompt=SYSTEM_PROMPT
@@ -714,7 +715,7 @@ class BriefingIntelligence:
             "Rank by relevance. Be concise."
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="light", max_tokens=800, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -808,7 +809,7 @@ class BriefingIntelligence:
             "Every stock MUST have a driver. Never leave blank."
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="heavy", max_tokens=500, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -875,7 +876,7 @@ class BriefingIntelligence:
             "respond with NONE."
         )
 
-        result = self.bedrock.invoke(prompt, tier="light", max_tokens=300)
+        result = self.llm.invoke(prompt, tier="light", max_tokens=300)
         if not result or "NONE" in result.upper():
             return []
 
@@ -1023,7 +1024,7 @@ class BriefingIntelligence:
             f"{cross_source_note}"
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="heavy", max_tokens=1000, system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -1103,7 +1104,7 @@ class BriefingIntelligence:
             "[5] NEW claude-3.5-haiku\n"
         )
 
-        result = self.bedrock.invoke(prompt, tier="light", max_tokens=800, system_prompt=SYSTEM_PROMPT)
+        result = self.llm.invoke(prompt, tier="light", max_tokens=800, system_prompt=SYSTEM_PROMPT)
         if not result:
             logger.info("Trending tracking skipped (LLM unavailable)")
             return state, papers, blogs, news
@@ -1312,7 +1313,7 @@ class BriefingIntelligence:
             f"<week_items>\n{context_str}\n</week_items>"
         )
 
-        result = self.bedrock.invoke(
+        result = self.llm.invoke(
             prompt, tier="heavy", max_tokens=1500, system_prompt=SYSTEM_PROMPT
         )
 

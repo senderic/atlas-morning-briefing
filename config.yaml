@@ -1,0 +1,230 @@
+# Atlas Morning Briefing Configuration
+# Copy this file to config.yaml and customize for your needs:
+#   cp config.yaml.example config.yaml
+
+# Topics to scan on arxiv
+arxiv_topics:
+  - "Autonomous Weapon Systems"
+  - "AI in Electronic Warfare"
+  - "Computer Vision for ISR"
+  - "Multi-Agent Combat Simulations"
+  - "Edge AI for Battlefield Systems"
+  - "Secure LLM Deployment in Defense"
+  - "Formal Verification for Autonomous Systems"
+  - "Agentic AI"
+  - "Multi-Agent Systems"
+  - "On-device AI Inference"
+  - "Offline Machine Learning"
+  - "Embedded AI for Restricted Environments"
+
+# RSS feeds to monitor
+blog_feeds:
+  - name: "AWS ML Blog"
+    url: "https://aws.amazon.com/blogs/machine-learning/feed/"
+  - name: "Anthropic"
+    url: "https://www.anthropic.com/rss.xml"
+  - name: "Karpathy"
+    url: "https://karpathy.github.io/feed.xml"
+  - name: "OpenAI"
+    url: "https://openai.com/blog/rss.xml"
+  - name: "Eugene Yan"
+    url: "https://eugeneyan.com/rss/"
+  - name: "Chip Huyen"
+    url: "https://huyenchip.com/feed.xml"
+  - name: "Interconnects"
+    url: "https://www.interconnects.ai/feed"
+  - name: "Lilian Weng"
+    url: "https://lilianweng.github.io/index.xml"
+  - name: "Sebastian Raschka"
+    url: "https://magazine.sebastianraschka.com/feed"
+  - name: "The Gradient"
+    url: "https://thegradient.pub/rss/"
+  - name: "BAIR"
+    url: "https://bair.berkeley.edu/blog/feed.xml"
+  - name: "DeepMind"
+    url: "https://deepmind.google/blog/rss.xml"
+  - name: "Hugging Face"
+    url: "https://huggingface.co/blog/feed.xml"
+  - name: "Google AI Blog"
+    url: "https://blog.research.google/feeds/posts/default?alt=rss"
+  - name: "Meta AI"
+    url: "https://ai.meta.com/blog/rss/"
+  - name: "Microsoft Research"
+    url: "https://www.microsoft.com/en-us/research/feed/"
+  - name: "NVIDIA AI"
+    url: "https://blogs.nvidia.com/feed/"
+  - name: "MIT News AI"
+    url: "https://news.mit.edu/topic/artificial-intelligence2-rss.xml"
+  - name: "The Verge AI"
+    url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+  - name: "TechCrunch AI"
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+  - name: "Ars Technica AI"
+    url: "https://feeds.arstechnica.com/arstechnica/technology-lab"
+  - name: "VentureBeat AI"
+    url: "https://venturebeat.com/category/ai/feed/"
+  - name: "MIT Technology Review"
+    url: "https://www.technologyreview.com/feed/"
+  - name: "Ben Thompson (Stratechery)"
+    url: "https://stratechery.com/feed/"
+  - name: "Benedict Evans"
+    url: "https://www.ben-evans.com/benedictevans?format=rss"
+  - name: "Casey Newton (Platformer)"
+    url: "https://www.platformer.news/rss/"
+  - name: "Packy McCormick (Not Boring)"
+    url: "https://www.notboring.co/feed"
+  - name: "Zvi Mowshowitz"
+    url: "https://thezvi.substack.com/feed"
+  - name: "Eric Newcomer"
+    url: "https://www.newcomer.co/feed"
+
+# Interest profile for relevance filtering
+interest_profile:
+  - topic: "AI in Defense and Electronic Warfare"
+    weight: 1.0
+  - topic: "Defense Contractor AI integration and development practices"
+    weight: 0.9
+  - topic: "AI foundation model market share shifts (Claude vs Gemini vs GPT)"
+    weight: 0.8
+  - topic: "Battlefield Edge Computing"
+    weight: 0.7
+  - topic: "Autonomous Driving End-to-End"
+    weight: 0.6
+  - topic: "Off-grid AI systems and local NVIDIA-based inference"
+    weight: 0.8
+  - topic: "Tech strategy, business models, and market analysis"
+    weight: 0.8
+  - topic: "AI policy, regulation, and societal impact"
+    weight: 0.7
+
+# Stock watchlist (Finnhub API)
+stocks:
+  - NVDA
+  - MSFT
+  - PLTR
+  - GOOGL
+  - AMZN
+  - META
+  - VRT
+  - ANET
+  - EQIX
+  - LMT
+  - RTX
+  - NOC
+  - GD
+  - SPY
+  - VGT
+  - QQQ
+
+# News search queries (Brave Search API)
+news_queries:
+  - "Department of Defense AI contracts and prototypes"
+  - "Defense tech startup AI innovation SBIR"
+  - "DIU Defense Innovation Unit AI projects"
+  - "AI model benchmarks Claude vs Gemini vs GPT-4"
+  - "AI foundation model market share shifts"
+  - "Palantir AIP defense implementation"
+  - "Anduril Lattice AI updates"
+  - "Lockheed Martin AI development practices"
+  - "Northrop Grumman AI systems"
+  - "DARPA AI research breakthroughs"
+  - "Shield AI autonomous flight updates"
+  - "Epirus AI electronic warfare"
+  - "NVIDIA GPU based AI systems for off-grid operations"
+  - "Local LLM deployment on single-node workstations for specialized tasks"
+  - "tactical edge AI hardware and offline model execution"
+
+# Paper scoring weights
+paper_scoring:
+  has_code: 7
+  topic_match: 3
+  recency: 2
+  citation_count: 1
+
+# Reproduction feasibility gate (applied by intelligence layer)
+# Papers scoring below repro_min_score/25 are dropped from top picks
+repro_min_score: 12
+
+# Delivery settings
+kindle_email: "${KINDLE_EMAIL:-YOUR_NAME@kindle.com}"
+sender_email: "${SENDER_EMAIL:-your-sender@gmail.com}"
+output_format: "kindle"
+
+# Email distribution list (receives rich HTML briefing)
+# Can be a list or a comma-separated string in environment variables
+email_recipients:
+  - "${RECIPIENT_EMAIL:-your-email@example.com}"
+
+# File naming pattern
+file_naming: "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+
+# Paper recommendations
+num_paper_picks: 3
+
+# Date range for arxiv search (days)
+arxiv_days_back: 3
+
+# Maximum items per section
+max_papers: 30
+max_blogs: 12
+max_news: 15
+
+# Concurrency settings
+max_workers: 1
+
+# PDF settings
+pdf:
+  enabled: false
+  font_size: 10
+  line_spacing: 1.5
+  include_toc: true
+  include_emoji: false
+
+# Gemini CLI configuration
+gemini:
+  enabled: true
+  ignore_hard_quota: true
+  internal_max_attempts: 1
+  max_calls_per_run: 50
+  retry_wait_seconds: 61
+  key_swap_delay: 5
+  models:
+    heavy: "pro"
+    medium: "flash"
+    light: "flash-lite"
+
+# Amazon Bedrock configuration
+# Set enabled: false to run in deterministic mode (no LLM, zero cost)
+bedrock:
+  enabled: false
+  max_calls_per_run: 25
+
+# Logging
+log_level: "DEBUG"
+
+# Tracked entities for competitive intelligence
+tracked_entities:
+  - name: "Palantir"
+    type: "company"
+  - name: "Anduril"
+    type: "company"
+  - name: "Lockheed Martin"
+    type: "company"
+  - name: "Northrop Grumman"
+    type: "company"
+  - name: "Raytheon"
+    type: "company"
+  - name: "Shield AI"
+    type: "company"
+  - name: "Anthropic"
+    type: "company"
+  - name: "Google DeepMind"
+    type: "company"
+  - name: "OpenAI"
+    type: "company"
+  - name: "Department of Defense"
+    type: "agency"
+  - name: "DARPA"
+    type: "agency"
+  - name: "DIU"
+    type: "agency"

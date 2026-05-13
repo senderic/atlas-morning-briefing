@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.arxiv_scanner import ArxivScanner
 from scripts.paper_scorer import PaperScorer
 from scripts.bedrock_client import BedrockClient
+from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
@@ -73,8 +74,13 @@ class PapersWorker(BaseWorker):
                 )
 
             # Step 2: Initialize intelligence layer for enrichment
-            bedrock = BedrockClient(self.config)
-            intelligence = BriefingIntelligence(bedrock, self.config)
+            gemini_config = self.config.get("gemini", {})
+            if gemini_config.get("enabled", False):
+                llm = GeminiCLIClient(gemini_config)
+            else:
+                llm = BedrockClient(self.config.get("bedrock", {}))
+                
+            intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:
                 logger.warning(f"[{self.worker_name}] Intelligence layer unavailable, skipping enrichment")

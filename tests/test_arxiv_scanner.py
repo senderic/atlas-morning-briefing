@@ -1,19 +1,22 @@
 # Copyright (c) 2026 Junjie Tang. MIT License. See LICENSE file for details.
 """Tests for arxiv_scanner module."""
 
+from datetime import datetime, timezone
 import pytest
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import LegacyArxivScanner
 
+# Use a recent date so tests don't become stale
+RECENT_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
-SAMPLE_ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
+SAMPLE_ARXIV_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <title>ArXiv Query</title>
   <entry>
     <id>http://arxiv.org/abs/2401.00001v1</id>
     <title>Evaluating Multi-Agent Systems</title>
     <summary>We propose a benchmark for agent evaluation.</summary>
-    <published>2026-03-05T00:00:00Z</published>
-    <updated>2026-03-05T00:00:00Z</updated>
+    <published>{RECENT_DATE}</published>
+    <updated>{RECENT_DATE}</updated>
     <author><name>Alice Smith</name></author>
     <author><name>Bob Jones</name></author>
     <category term="cs.AI"/>
@@ -40,7 +43,7 @@ SAMPLE_ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 @pytest.fixture
 def scanner():
-    return ArxivScanner(topics=["Agent Evaluation"], days_back=7, max_results=10)
+    return LegacyArxivScanner(topics=["Agent Evaluation"], days_back=7, max_results=10)
 
 
 class TestParseArxivResponse:

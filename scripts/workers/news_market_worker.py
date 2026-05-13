@@ -9,6 +9,7 @@ Self-contained worker that does NOT delegate back to coordinator.
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.news_aggregator import NewsAggregator
 from scripts.stock_fetcher import StockFetcher
 from scripts.bedrock_client import BedrockClient
+from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
@@ -54,21 +56,30 @@ class NewsMarketWorker(BaseWorker):
         try:
             logger.info(f"[{self.worker_name}] Starting news and market data fetch")
 
+            # Get API keys from environment
+            brave_api_key = os.environ.get("BRAVE_API_KEY", "")
+            finnhub_api_key = os.environ.get("FINNHUB_API_KEY", "")
+
             # Step 1: Fetch news articles
-            news_aggregator = NewsAggregator(self.news_queries, self.config)
+            news_aggregator = NewsAggregator(brave_api_key, self.news_queries, self.max_news)
             news = news_aggregator.aggregate_all_queries()
             news_found = len(news)
             logger.info(f"[{self.worker_name}] Fetched {news_found} news articles")
 
             # Step 2: Fetch stock data
-            stock_fetcher = StockFetcher(self.stocks, self.config)
+            stock_fetcher = StockFetcher(finnhub_api_key, self.stocks)
             stocks = stock_fetcher.fetch_all_stocks()
             stocks_found = len(stocks)
             logger.info(f"[{self.worker_name}] Fetched {stocks_found} stock prices")
 
             # Step 3: Initialize intelligence layer for enrichment
-            bedrock = BedrockClient(self.config)
-            intelligence = BriefingIntelligence(bedrock, self.config)
+            gemini_config = self.config.get("gemini", {})
+            if gemini_config.get("enabled", False):
+                llm = GeminiCLIClient(gemini_config)
+            else:
+                llm = BedrockClient(self.config.get("bedrock", {}))
+                
+            intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:
                 logger.warning(f"[{self.worker_name}] Intelligence layer unavailable, returning raw data")

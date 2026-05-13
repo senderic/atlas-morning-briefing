@@ -134,6 +134,24 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                                 "(expected: heavy, medium, light)"
                             )
 
+    # --- Gemini config ---
+    gemini = config.get("gemini")
+    if gemini is not None:
+        if not isinstance(gemini, dict):
+            errors.append("'gemini' must be a dictionary")
+        else:
+            models = gemini.get("models")
+            if models is not None:
+                if not isinstance(models, dict):
+                    errors.append("gemini.models must be a dictionary")
+                else:
+                    for tier in models:
+                        if tier not in ("heavy", "medium", "light"):
+                            warnings.append(
+                                f"gemini.models.{tier} is not a recognized tier "
+                                "(expected: heavy, medium, light)"
+                            )
+
     # --- Log results ---
     for w in warnings:
         logger.warning(f"Config warning: {w}")
@@ -179,6 +197,19 @@ def check_environment(config: Dict[str, Any], dry_run: bool = False) -> List[str
             warnings.append(
                 "GMAIL_APP_PASSWORD not set -- Kindle delivery will be skipped"
             )
+
+    # Gemini requires API key and CLI
+    gemini_config = config.get("gemini", {})
+    if gemini_config.get("enabled", False):
+        if not os.environ.get("GEMINI_API_KEY") and not any(k.startswith("GEMINI_API_KEY_") for k in os.environ):
+            warnings.append("Gemini is enabled but no GEMINI_API_KEY found in environment")
+        
+        # Check for 'gemini' command
+        import subprocess
+        try:
+            subprocess.run(["which", "gemini"], capture_output=True, check=True)
+        except subprocess.CalledProcessError:
+            warnings.append("Gemini is enabled but 'gemini' CLI command not found in PATH")
 
     for w in warnings:
         logger.warning(w)
