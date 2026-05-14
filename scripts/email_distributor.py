@@ -4,7 +4,7 @@
 Email distribution module.
 
 Sends briefings via multiple channels:
-- Kindle: PDF attachment (Kindle only supports PDF/MOBI)
+- Kindle: PDF/EPUB attachment
 - Email list: Rich HTML format for regular email clients
 """
 
@@ -74,7 +74,6 @@ class EmailDistributor:
         )
 
         # Sanitize HTML to prevent XSS from untrusted content
-        # (LLM outputs, news titles, blog titles may contain malicious markup)
         if HAS_NH3:
             html_body = nh3.clean(html_body)
         else:
@@ -122,70 +121,9 @@ class EmailDistributor:
     margin-top: 20px;
     margin-bottom: 4px;
   }}
-  p {{
-    margin: 8px 0;
-    font-size: 14px;
-  }}
-  em {{
-    color: #57606a;
-  }}
-  strong {{
-    color: #0d1117;
-  }}
-  a {{
-    color: #1f6feb;
-    text-decoration: none;
-  }}
-  a:hover {{
-    text-decoration: underline;
-  }}
-  ul, ol {{
-    padding-left: 24px;
-    font-size: 14px;
-  }}
-  li {{
-    margin: 4px 0;
-  }}
-  code {{
-    background-color: #f0f3f6;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 13px;
-    font-family: 'SFMono-Regular', Consolas, monospace;
-  }}
-  pre {{
-    background-color: #0d1117;
-    color: #e6edf3;
-    padding: 16px;
-    border-radius: 6px;
-    overflow-x: auto;
-    font-size: 13px;
-  }}
-  pre code {{
-    background: none;
-    padding: 0;
-    color: inherit;
-  }}
-  table {{
-    border-collapse: collapse;
-    width: 100%;
-    margin: 12px 0;
-    font-size: 13px;
-  }}
-  th, td {{
-    border: 1px solid #d0d7de;
-    padding: 8px 12px;
-    text-align: left;
-  }}
-  th {{
-    background-color: #f0f3f6;
-    font-weight: 600;
-  }}
-  hr {{
-    border: none;
-    border-top: 1px solid #e1e4e8;
-    margin: 20px 0;
-  }}
+  p {{ margin: 8px 0; font-size: 14px; }}
+  a {{ color: #1f6feb; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
   .footer {{
     margin-top: 32px;
     padding-top: 16px;
@@ -194,9 +132,6 @@ class EmailDistributor:
     color: #8b949e;
     text-align: center;
   }}
-  /* Stock colors */
-  .stock-up {{ color: #1a7f37; font-weight: 600; }}
-  .stock-down {{ color: #cf222e; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -204,7 +139,7 @@ class EmailDistributor:
 {html_body}
 <div class="footer">
   Atlas Morning Briefing<br>
-  <a href="https://github.com/your-org/atlas-morning-briefing">GitHub</a>
+  <a href="https://github.com/senderic/atlas-morning-briefing">GitHub</a>
 </div>
 </div>
 </body>
@@ -214,34 +149,37 @@ class EmailDistributor:
     def send_kindle(
         self,
         kindle_email: str,
-        pdf_path: str,
+        file_path: str,
         subject: Optional[str] = None,
     ) -> bool:
         """
-        Send PDF to Kindle via email.
-
-        Kindle only supports PDF/MOBI attachments.
+        Send document (PDF/EPUB) to Kindle via email.
 
         Args:
             kindle_email: Kindle email address.
-            pdf_path: Path to PDF file.
-            subject: Email subject (defaults to filename).
+            file_path: Path to the file.
+            subject: Email subject.
 
         Returns:
             True if sent successfully.
         """
-        pdf_file = Path(pdf_path)
-        if not pdf_file.exists():
-            logger.error(f"PDF file not found: {pdf_path}")
+        doc_file = Path(file_path)
+        if not doc_file.exists():
+            logger.error(f"File not found: {file_path}")
             return False
 
         if not subject:
-            subject = pdf_file.stem
+            subject = doc_file.stem
+        
+        # Use "Convert" subject line for EPUBs
+        if doc_file.suffix.lower() == ".epub":
+            subject = "Convert"
+            
         subject = subject.replace("\n", " ").replace("\r", " ")
 
         try:
             masked = kindle_email[:3] + "***" + kindle_email[kindle_email.index("@"):] if "@" in kindle_email else "***"
-            logger.info(f"Sending PDF to Kindle: {masked}")
+            logger.info(f"Sending {doc_file.suffix[1:].upper()} to Kindle: {masked}")
 
             msg = MIMEMultipart()
             msg["From"] = self.sender_email
@@ -250,17 +188,19 @@ class EmailDistributor:
 
             msg.attach(MIMEText("Morning Briefing", "plain"))
 
-            with open(pdf_file, "rb") as f:
-                attachment = MIMEApplication(f.read(), _subtype="pdf")
+            with open(doc_file, "rb") as f:
+                ext = doc_file.suffix.lower()
+                subtype = "pdf" if ext == ".pdf" else "epub+zip" if ext == ".epub" else "octet-stream"
+                attachment = MIMEApplication(f.read(), _subtype=subtype)
                 attachment.add_header(
-                    "Content-Disposition", "attachment", filename=pdf_file.name
+                    "Content-Disposition", "attachment", filename=doc_file.name
                 )
                 msg.attach(attachment)
 
             with self._connect_smtp() as server:
                 server.send_message(msg)
 
-            logger.info(f"PDF sent to Kindle: {masked}")
+            logger.info(f"{doc_file.suffix[1:].upper()} sent to Kindle: {masked}")
             return True
 
         except Exception as e:
@@ -272,22 +212,21 @@ class EmailDistributor:
         recipients: List[str],
         markdown_content: str,
         subject: Optional[str] = None,
-        pdf_path: Optional[str] = None,
+        attachment_path: Optional[str] = None,
     ) -> Dict[str, bool]:
         """
         Send rich HTML briefing to a list of email addresses.
 
         Args:
             recipients: List of email addresses.
-            markdown_content: Markdown briefing content.
+            markdown_content: Markdown content.
             subject: Email subject.
-            pdf_path: Optional PDF to attach alongside HTML.
+            attachment_path: Optional file to attach.
 
         Returns:
             Dictionary mapping email -> success boolean.
         """
         if not recipients:
-            logger.warning("No email recipients configured")
             return {}
 
         if not subject:
@@ -306,53 +245,37 @@ class EmailDistributor:
                         msg["To"] = recipient
                         msg["Subject"] = subject
 
-                        # Plain text fallback (stripped markdown)
+                        # Plain text fallback
                         plain_text = re.sub(r"[#*\[\]()]", "", markdown_content)
                         msg.attach(MIMEText(plain_text, "plain", "utf-8"))
-
-                        # Rich HTML version
                         msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-                        # Optional PDF attachment
-                        if pdf_path:
-                            pdf_file = Path(pdf_path)
-                            if pdf_file.exists():
-                                with open(pdf_file, "rb") as f:
-                                    attachment = MIMEApplication(
-                                        f.read(), _subtype="pdf"
-                                    )
+                        # Optional attachment
+                        if attachment_path:
+                            doc_file = Path(attachment_path)
+                            if doc_file.exists():
+                                with open(doc_file, "rb") as f:
+                                    ext = doc_file.suffix.lower()
+                                    subtype = "pdf" if ext == ".pdf" else "epub+zip" if ext == ".epub" else "octet-stream"
+                                    attachment = MIMEApplication(f.read(), _subtype=subtype)
                                     attachment.add_header(
-                                        "Content-Disposition",
-                                        "attachment",
-                                        filename=pdf_file.name,
+                                        "Content-Disposition", "attachment", filename=doc_file.name
                                     )
-                                    # Switch to mixed for attachment support
-                                    msg_with_attach = MIMEMultipart("mixed")
-                                    msg_with_attach["From"] = msg["From"]
-                                    msg_with_attach["To"] = msg["To"]
-                                    msg_with_attach["Subject"] = msg["Subject"]
-                                    msg_with_attach.attach(msg)
-                                    msg_with_attach.attach(attachment)
-                                    msg = msg_with_attach
+                                    msg_mixed = MIMEMultipart("mixed")
+                                    msg_mixed["From"] = msg["From"]; msg_mixed["To"] = msg["To"]; msg_mixed["Subject"] = msg["Subject"]
+                                    msg_mixed.attach(msg); msg_mixed.attach(attachment)
+                                    msg = msg_mixed
 
                         server.send_message(msg)
-                        masked_r = recipient[:3] + "***" + recipient[recipient.index("@"):] if "@" in recipient else "***"
-                        logger.info(f"HTML briefing sent to: {masked_r}")
                         results[recipient] = True
-
                     except Exception as e:
-                        masked_r = recipient[:3] + "***" + recipient[recipient.index("@"):] if "@" in recipient else "***"
-                        logger.error(f"Failed to send to {masked_r}: {e}")
+                        logger.error(f"Failed to send to {recipient}: {e}")
                         results[recipient] = False
-
         except Exception as e:
             logger.error(f"SMTP connection failed: {e}")
             for r in recipients:
-                if r not in results:
-                    results[r] = False
+                if r not in results: results[r] = False
 
-        sent = sum(1 for v in results.values() if v)
-        logger.info(f"Email distribution: {sent}/{len(recipients)} sent successfully")
         return results
 
     def distribute(
@@ -360,44 +283,25 @@ class EmailDistributor:
         config: Dict,
         markdown_content: str,
         pdf_path: Optional[str] = None,
+        epub_path: Optional[str] = None,
         subject: Optional[str] = None,
         dry_run: bool = False,
     ) -> Dict[str, bool]:
-        """
-        Distribute briefing to all configured channels.
-
-        Args:
-            config: Distribution config with 'kindle_email' and 'email_recipients'.
-            markdown_content: Markdown briefing content.
-            pdf_path: Path to generated PDF.
-            subject: Email subject.
-            dry_run: If True, skip actual sending.
-
-        Returns:
-            Dictionary mapping channel/email -> success boolean.
-        """
+        """Distribute briefing to all configured channels."""
         results = {}
+        if dry_run: return results
 
-        if dry_run:
-            logger.info("Dry run: skipping all email distribution")
-            return results
-
-        # Kindle (PDF)
+        # Kindle (Prefer EPUB)
         kindle_email = config.get("kindle_email")
-        if kindle_email and pdf_path:
-            results[f"kindle:{kindle_email}"] = self.send_kindle(
-                kindle_email, pdf_path, subject
-            )
+        if kindle_email:
+            path = epub_path or pdf_path
+            if path:
+                results[f"kindle:{kindle_email}"] = self.send_kindle(kindle_email, path, subject)
 
-        # Email list (HTML)
+        # Email list
         email_recipients = config.get("email_recipients", [])
         if email_recipients:
-            html_results = self.send_html_email(
-                recipients=email_recipients,
-                markdown_content=markdown_content,
-                subject=subject,
-                pdf_path=pdf_path,
-            )
-            results.update(html_results)
+            res = self.send_html_email(email_recipients, markdown_content, subject, pdf_path)
+            results.update(res)
 
         return results

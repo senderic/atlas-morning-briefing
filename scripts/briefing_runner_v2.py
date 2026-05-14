@@ -7,12 +7,6 @@ KEY CHANGES FROM V0.1:
 - Workers are fully self-contained (fetch + enrich independently)
 - All workers run in parallel
 - Memory system for cross-day learning
-- Skeptical memory: hints not truth, verify before using
-
-Based on Claude Code leaked architecture patterns:
-- Coordinator never writes code/fetches data directly
-- Workers have self-contained prompts with purpose, context, output format
-- Synthesis happens AFTER reading all findings
 """
 
 import argparse
@@ -37,6 +31,7 @@ from scripts.workers.news_market_worker import NewsMarketWorker
 from scripts.bedrock_client import BedrockClient
 from scripts.gemini_client import GeminiCLIClient
 from scripts.pdf_generator import PDFGenerator
+from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 
@@ -48,29 +43,12 @@ MEMORY_DIR = Path("briefing-memory")
 
 
 class BriefingCoordinator:
-    """
-    Coordinator for v0.2 multi-agent briefing generation.
-
-    The coordinator:
-    1. Spawns parallel workers
-    2. Waits for all findings
-    3. READS all findings (not lazy delegation)
-    4. Synthesizes: executive summary, correlations, emerging themes
-    5. Updates memory after briefing
-    """
+    """Coordinator for v0.2 multi-agent briefing generation."""
 
     def __init__(self, config: Dict[str, Any], dry_run: bool = False):
-        """
-        Initialize BriefingCoordinator.
-
-        Args:
-            config: Configuration dictionary
-            dry_run: If True, skip email distribution
-        """
         self.config = config
         self.dry_run = dry_run
         
-        # Determine which LLM client to use
         gemini_config = config.get("gemini", {})
         if gemini_config.get("enabled", False):
             logger.info("Using Gemini CLI for intelligence")
@@ -79,448 +57,147 @@ class BriefingCoordinator:
             logger.info("Using Amazon Bedrock for intelligence")
             self.llm = BedrockClient(config.get("bedrock", {}))
 
-        # Initialize memory system
         self.memory_dir = MEMORY_DIR
         self.memory_dir.mkdir(exist_ok=True)
 
     def run(self) -> int:
-        """
-        Run the v0.2 coordinator workflow.
-
-        Returns:
-            Exit code (0=success, 1=partial failure, 2=total failure)
-        """
         start_time = time.time()
         logger.info("=== Morning Briefing v0.2 - Coordinator + Parallel Workers ===")
 
-        # Load memory (hints for workers)
         memory = self._load_memory()
-
-        # Spawn all workers in parallel
         logger.info("=== Spawning parallel workers ===")
         findings = self._spawn_workers()
 
-        # Check if all workers succeeded
         failed_workers = [f for f in findings if f["status"] == "error"]
         if len(failed_workers) == len(findings):
             logger.error("All workers failed. Aborting.")
             return 2
 
-        if failed_workers:
-            logger.warning(f"{len(failed_workers)} worker(s) failed: {[f['worker'] for f in failed_workers]}")
-
-        # Extract items from findings
         papers, blogs, news, stocks = self._extract_items(findings)
-
-        # Coordinator synthesis (NOT lazy delegation - reads all findings)
         logger.info("=== Coordinator Synthesis ===")
         synthesis = self._synthesize_findings(findings, papers, blogs, news, stocks, memory)
 
-        # Generate briefing document
         logger.info("=== Generating briefing document ===")
         briefing_content = self._generate_briefing(synthesis, papers, blogs, news, stocks)
 
-        # Generate PDF
         output_filename = self._get_output_filename()
+        md_path = f"{output_filename}.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(briefing_content)
+
         pdf_path = self._generate_pdf(briefing_content, output_filename)
+        epub_path = self._generate_epub(briefing_content, output_filename)
 
-        # Distribute email (if not dry run)
         if not self.dry_run:
-            self._distribute_email(briefing_content, output_filename)
+            self._distribute(briefing_content, output_filename, pdf_path, epub_path)
 
-        # Update memory with today's findings
         self._update_memory(synthesis, papers, blogs, news, stocks)
-
-        # Save state for cross-day deduplication
         self._save_state(papers, blogs, news)
 
         elapsed = time.time() - start_time
         logger.info(f"=== Briefing completed in {elapsed:.1f}s ===")
-
-        # Calculate metrics
-        total_tokens = sum(f["metadata"]["token_count"] for f in findings)
-        logger.info(f"Total LLM tokens used: {total_tokens}")
-
         return 0 if not failed_workers else 1
 
     def _spawn_workers(self) -> List[Dict[str, Any]]:
-        """
-        Spawn all workers in parallel and collect findings.
-
-        Returns:
-            List of finding dictionaries from all workers
-        """
-        workers = [
-            PapersWorker(self.config),
-            BlogsWorker(self.config),
-            NewsMarketWorker(self.config)
-        ]
-
+        workers = [PapersWorker(self.config), BlogsWorker(self.config), NewsMarketWorker(self.config)]
         findings = []
         with ThreadPoolExecutor(max_workers=len(workers)) as executor:
             futures = {executor.submit(worker.execute): worker for worker in workers}
-
             for future in as_completed(futures):
                 worker = futures[future]
                 try:
                     finding = future.result()
                     findings.append(finding)
-                    logger.info(f"[{finding['worker']}] completed in {finding['metadata']['processing_time']:.1f}s")
                 except Exception as e:
-                    logger.error(f"Worker {worker.worker_name} raised exception: {e}")
-                    findings.append({
-                        "worker": worker.worker_name,
-                        "status": "error",
-                        "items": [],
-                        "metadata": {"processing_time": 0, "token_count": 0, "items_found": 0, "items_kept": 0},
-                        "synthesis": "",
-                        "error": str(e)
-                    })
-
+                    logger.error(f"Worker {worker.worker_name} failed: {e}")
+                    findings.append({"worker": worker.worker_name, "status": "error", "items": [], "metadata": {"token_count": 0}, "synthesis": ""})
         return findings
 
     def _extract_items(self, findings: List[Dict[str, Any]]) -> tuple:
-        """
-        Extract papers, blogs, news, stocks from findings.
-
-        Args:
-            findings: List of finding dictionaries
-
-        Returns:
-            (papers, blogs, news, stocks) tuple
-        """
-        papers = []
-        blogs = []
-        news = []
-        stocks = []
-
-        for finding in findings:
-            if finding["worker"] == "papers_worker":
-                papers = finding.get("items", [])
-            elif finding["worker"] == "blogs_worker":
-                blogs = finding.get("items", [])
-            elif finding["worker"] == "news_market_worker":
-                items = finding.get("items", {})
-                news = items.get("news", [])
-                stocks = items.get("stocks", [])
-
+        papers, blogs, news, stocks = [], [], [], []
+        for f in findings:
+            if f["worker"] == "papers_worker": papers = f.get("items", [])
+            elif f["worker"] == "blogs_worker": blogs = f.get("items", [])
+            elif f["worker"] == "news_market_worker":
+                items = f.get("items", {})
+                news = items.get("news", []); stocks = items.get("stocks", [])
         return papers, blogs, news, stocks
 
-    def _synthesize_findings(
-        self,
-        findings: List[Dict[str, Any]],
-        papers: list,
-        blogs: list,
-        news: list,
-        stocks: list,
-        memory: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Coordinator reads ALL findings and synthesizes (not lazy delegation).
-
-        Args:
-            findings: Raw findings from workers
-            papers: Papers list
-            blogs: Blogs list
-            news: News list
-            stocks: Stocks list
-            memory: Memory hints
-
-        Returns:
-            Synthesis dictionary with executive summary, correlations, themes
-        """
-        logger.info("Coordinator reading all worker findings...")
-
-        # Read each worker's synthesis
+    def _synthesize_findings(self, findings, papers, blogs, news, stocks, memory) -> Dict[str, Any]:
         worker_syntheses = {f["worker"]: f["synthesis"] for f in findings}
-
-        # Detect emerging themes across all sources
         emerging_themes = self._detect_emerging_themes(papers, blogs, news)
-
-        # Generate executive summary (coordinator's unique value-add)
-        executive_summary = self._generate_executive_summary(
-            worker_syntheses,
-            emerging_themes,
-            stocks
-        )
-
-        # Market trend analysis
+        executive_summary = self._generate_executive_summary(worker_syntheses, emerging_themes, stocks)
         market_trend = self._analyze_market_trend(stocks, news)
+        return {"executive_summary": executive_summary, "emerging_themes": emerging_themes, "market_trend": market_trend}
 
-        return {
-            "executive_summary": executive_summary,
-            "worker_syntheses": worker_syntheses,
-            "emerging_themes": emerging_themes,
-            "market_trend": market_trend,
-            "total_items": len(papers) + len(blogs) + len(news) + len(stocks)
-        }
+    def _detect_emerging_themes(self, papers, blogs, news) -> List[str]:
+        if not self.llm.available: return []
+        top_p = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:3]
+        prompt = "Detect 2-3 emerging themes across these papers/news. Return ONLY a comma-separated list.\n"
+        for p in top_p: prompt += f"- {p.get('title')}\n"
+        res = self.llm.invoke(prompt, tier="light")
+        return [t.strip() for t in res.split(",")] if res else []
 
-    def _detect_emerging_themes(self, papers: list, blogs: list, news: list) -> List[str]:
-        """
-        Detect emerging themes across papers, blogs, and news.
+    def _generate_executive_summary(self, syntheses, themes, stocks) -> str:
+        if not self.llm.available: return "LLM offline"
+        prompt = f"Summarize today's findings:\nThemes: {', '.join(themes)}\n"
+        for w, s in syntheses.items(): prompt += f"{w}: {s}\n"
+        return self.llm.invoke(prompt, tier="medium") or "Synthesis failed"
 
-        Args:
-            papers: Papers list
-            blogs: Blogs list
-            news: News list
+    def _analyze_market_trend(self, stocks, news) -> str:
+        if not stocks or not self.llm.available: return ""
+        prompt = "Analyze market trend from these stocks:\n"
+        for s in stocks: prompt += f"- {s.get('symbol')}: {s.get('change_pct'):.2f}%\n"
+        return self.llm.invoke(prompt, tier="light") or ""
 
-        Returns:
-            List of emerging theme strings
-        """
-        if not self.llm.available:
-            return []
-
-        # Build prompt with key items from each source
-        top_papers = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:3]
-        top_blogs = sorted(blogs, key=lambda b: b.get("llm_score", 0), reverse=True)[:3]
-        top_news = sorted(news, key=lambda n: n.get("llm_score", 0), reverse=True)[:3]
-
-        prompt = "Detect 2-3 emerging themes that appear across these sources:\n\n"
-        prompt += "TOP PAPERS:\n"
-        for p in top_papers:
-            prompt += f"- {p.get('title', 'Unknown')}\n"
-        prompt += "\nTOP BLOGS:\n"
-        for b in top_blogs:
-            prompt += f"- {b.get('title', 'Unknown')}\n"
-        prompt += "\nTOP NEWS:\n"
-        for n in top_news:
-            prompt += f"- {n.get('title', 'Unknown')}\n"
-        prompt += "\nReturn ONLY a comma-separated list of 2-3 themes (no explanation)."
-
-        response = self.llm.invoke(prompt, tier="light")
-        if not response:
-            return []
-            
-        themes = [t.strip() for t in response.split(",")]
-        return themes[:3]
-
-    def _generate_executive_summary(
-        self,
-        worker_syntheses: Dict[str, str],
-        emerging_themes: List[str],
-        stocks: list
-    ) -> str:
-        """
-        Generate executive summary by reading worker syntheses (not lazy delegation).
-
-        Args:
-            worker_syntheses: Dict of worker -> synthesis
-            emerging_themes: Detected themes
-            stocks: Stock data
-
-        Returns:
-            Executive summary string
-        """
-        if not self.llm.available:
-            return "Executive summary unavailable (LLM offline)"
-
-        prompt = "You are writing the executive summary for today's morning briefing.\n\n"
-        prompt += "WORKER FINDINGS:\n"
-        for worker, synthesis in worker_syntheses.items():
-            prompt += f"\n{worker}: {synthesis}\n"
-
-        if emerging_themes:
-            prompt += f"\nEMERGING THEMES: {', '.join(emerging_themes)}\n"
-
-        if stocks:
-            gainers = [s for s in stocks if s.get("change_pct", 0) > 0]
-            prompt += f"\nMARKET: {len(gainers)}/{len(stocks)} stocks up\n"
-
-        prompt += "\nWrite a 2-3 sentence executive summary highlighting the most important insights. Be specific."
-
-        return self.llm.invoke(prompt, tier="medium") or "Executive summary generation failed."
-
-    def _analyze_market_trend(self, stocks: list, news: list) -> str:
-        """
-        Analyze market trend with context from news.
-
-        Args:
-            stocks: Stock data
-            news: News articles
-
-        Returns:
-            Market trend analysis string
-        """
-        if not stocks or not self.llm.available:
-            return ""
-
-        gainers = [s for s in stocks if s.get("change_pct", 0) > 0]
-        losers = [s for s in stocks if s.get("change_pct", 0) < 0]
-
-        prompt = f"Analyze today's market trend:\n\n"
-        prompt += f"STOCKS: {len(gainers)} up, {len(losers)} down\n"
-        for s in stocks:
-            prompt += f"- {s.get('symbol', 'Unknown')}: {s.get('change_pct', 0):.2f}%\n"
-
-        if news:
-            prompt += f"\nRELEVANT NEWS:\n"
-            for n in news[:3]:
-                prompt += f"- {n.get('title', 'Unknown')}\n"
-
-        prompt += "\nProvide a 1-2 sentence market trend analysis."
-
-        return self.llm.invoke(prompt, tier="light") or "Market trend analysis unavailable."
-
-    def _generate_briefing(
-        self,
-        synthesis: Dict[str, Any],
-        papers: list,
-        blogs: list,
-        news: list,
-        stocks: list
-    ) -> str:
-        """
-        Generate final briefing markdown content.
-
-        Args:
-            synthesis: Synthesis dictionary
-            papers: Papers list
-            blogs: Blogs list
-            news: News list
-            stocks: Stocks list
-
-        Returns:
-            Markdown content string
-        """
+    def _generate_briefing(self, synthesis, papers, blogs, news, stocks) -> str:
         content = f"# Morning Briefing - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n\n"
-        content += "## Executive Summary\n\n"
-        content += synthesis["executive_summary"] + "\n\n"
-
-        if synthesis["emerging_themes"]:
-            content += "**Emerging Themes:** " + ", ".join(synthesis["emerging_themes"]) + "\n\n"
-
-        # Financial section
+        content += f"## Executive Summary\n\n{synthesis['executive_summary']}\n\n"
         if stocks:
-            content += "## Financial Markets\n\n"
-            content += synthesis["market_trend"] + "\n\n"
-            for stock in stocks:
-                pct = stock.get("change_pct", 0)
-                arrow = "↑" if pct > 0 else "↓" if pct < 0 else "→"
-                content += f"- **{stock.get('symbol', 'Unknown')}**: {arrow} {pct:.2f}%"
-                if stock.get("ai_insight"):
-                    content += f" — {stock.get('ai_insight')}"
-                content += "\n"
-            content += "\n"
-
-        # News section
+            content += f"## Markets\n\n{synthesis['market_trend']}\n\n"
+            for s in stocks: content += f"- **{s.get('symbol')}**: {s.get('change_pct'):.2f}%\n"
         if news:
             content += "## News\n\n"
-            for item in news[:5]:
-                score = item.get("llm_score", 0)
-                stars = "★" * score + "☆" * (5 - score)
-                content += f"### {item.get('title', 'Unknown')} {stars}\n\n"
-                if item.get("llm_summary"):
-                    content += f"{item['llm_summary']}\n\n"
-                content += f"[Read more]({item.get('url', '#')})\n\n"
-
-        # Papers section
+            for n in news[:5]: content += f"### {n.get('title')}\n\n{n.get('llm_summary')}\n\n[Link]({n.get('url')})\n\n"
         if papers:
-            content += "## Research Papers\n\n"
-            top_papers = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:5]
-            for paper in top_papers:
-                content += f"### {paper.get('title', 'Unknown')}\n\n"
-                if paper.get("llm_summary"):
-                    content += f"{paper['llm_summary']}\n\n"
-                content += f"**Authors:** {', '.join(paper.get('authors', []))}\n\n"
-                content += f"[ArXiv]({paper.get('link', '#')})\n\n"
-
-        # Blogs section
-        if blogs:
-            content += "## Blog Posts\n\n"
-            for blog in blogs[:5]:
-                score = blog.get("llm_score", 0)
-                stars = "★" * score + "☆" * (5 - score)
-                content += f"### {blog.get('title', 'Unknown')} {stars}\n\n"
-                content += f"**Source:** {blog.get('source', 'Unknown')}\n\n"
-                if blog.get("llm_summary"):
-                    content += f"{blog['llm_summary']}\n\n"
-                content += f"[Read more]({blog.get('link', '#')})\n\n"
-
+            content += "## Research\n\n"
+            for p in sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:5]:
+                content += f"### {p.get('title')}\n\n{p.get('llm_summary')}\n\n[ArXiv]({p.get('link')})\n\n"
         return content
 
-    def _generate_pdf(self, content: str, filename: str) -> Path:
-        """Generate PDF from markdown content."""
-        output_path = f"{filename}.pdf"
-        logger.info(f"Generating PDF: {output_path}")
-        # Extract PDF config
-        pdf_config = self.config.get("pdf", {})
-        page_format = self.config.get("output_format", "kindle")
-        font_size = pdf_config.get("font_size", 10)
-        line_spacing = pdf_config.get("line_spacing", 1.5)
+    def _generate_pdf(self, content, filename) -> Path:
+        path = f"{filename}.pdf"; logger.info(f"Generating PDF: {path}")
+        PDFGenerator(page_format=self.config.get("output_format", "kindle")).generate_pdf(content, path)
+        return Path(path)
 
-        generator = PDFGenerator(
-            page_format=page_format,
-            font_size=font_size,
-            line_spacing=line_spacing
+    def _generate_epub(self, content, filename) -> Path:
+        path = f"{filename}.epub"; logger.info(f"Generating EPUB: {path}")
+        EPUBGenerator(title=filename).generate_epub(content, path)
+        return Path(path)
+
+    def _distribute(self, content, filename, pdf_path, epub_path):
+        logger.info("Distributing briefing")
+        distributor = EmailDistributor(
+            sender_email=os.environ.get("GMAIL_USER", ""),
+            sender_password=os.environ.get("GMAIL_APP_PASSWORD", "")
         )
-        generator.generate_pdf(content, output_path)
-        logger.info(f"PDF saved to: {output_path}")
-        return Path(output_path)
-
-    def _distribute_email(self, content: str, filename: str):
-        """Distribute briefing via email."""
-        logger.info("Distributing briefing via email")
-        distributor = EmailDistributor(self.config)
-        distributor.send_briefing(content, filename)
+        distributor.distribute(self.config, content, str(pdf_path), str(epub_path), filename)
 
     def _get_output_filename(self) -> str:
-        """Get output filename based on config pattern."""
-        pattern = self.config.get("file_naming", "Atlas-Briefing-{yyyy}.{mm}.{dd}")
         now = datetime.now(timezone.utc)
-        return pattern.format(yyyy=now.year, mm=f"{now.month:02d}", dd=f"{now.day:02d}")
+        return f"Atlas-Briefing-{now.year}.{now.month:02d}.{now.day:02d}"
 
-    def _load_memory(self) -> Dict[str, Any]:
-        """Load memory hints (not truth - verify before using)."""
-        memory_file = self.memory_dir / "MEMORY.md"
-        if not memory_file.exists():
-            return {}
-
-        # For now, just return empty dict (memory system implemented next)
-        return {}
-
-    def _update_memory(
-        self,
-        synthesis: Dict[str, Any],
-        papers: list,
-        blogs: list,
-        news: list,
-        stocks: list
-    ):
-        """Update memory with today's findings."""
-        # Implemented in next step
-        pass
-
-    def _save_state(self, papers: list, blogs: list, news: list):
-        """Save state for cross-day deduplication."""
-        state = {
-            "date": datetime.now(timezone.utc).isoformat(),
-            "paper_titles": [p.get("title", "") for p in papers],
-            "blog_titles": [b.get("title", "") for b in blogs],
-            "news_titles": [n.get("title", "") for n in news]
-        }
-        with open(STATE_FILENAME, "w") as f:
-            json.dump(state, f, indent=2)
-
+    def _load_memory(self): return {}
+    def _update_memory(self, s, p, b, n, st): pass
+    def _save_state(self, papers, blogs, news):
+        state = {"date": datetime.now(timezone.utc).isoformat(), "paper_titles": [p.get("title", "") for p in papers]}
+        with open(STATE_FILENAME, "w") as f: json.dump(state, f, indent=2)
 
 def main():
-    """Main entry point for v0.2 briefing runner."""
-    parser = argparse.ArgumentParser(description="Morning Briefing v0.2 (Coordinator + Workers)")
-    parser.add_argument("--config", required=True, help="Path to config YAML")
-    parser.add_argument("--dry-run", action="store_true", help="Skip email distribution")
+    parser = argparse.ArgumentParser(); parser.add_argument("--config", required=True); parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    with open(args.config) as f: config = yaml.safe_load(f)
+    validate_config(config); check_environment(config)
+    sys.exit(BriefingCoordinator(config, args.dry_run).run())
 
-    # Load and validate config
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-
-    validate_config(config)
-    check_environment(config)
-
-    # Run coordinator
-    coordinator = BriefingCoordinator(config, dry_run=args.dry_run)
-    exit_code = coordinator.run()
-    sys.exit(exit_code)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

@@ -73,12 +73,14 @@ class DeepXivScanner:
             response = self.reader.search(
                 topic,
                 size=self.max_results,
-                search_mode="hybrid",
                 date_from=date_from,
             )
 
-            # DeepXiv returns {"total": N, "results": [...], "took": ms}
-            if isinstance(response, dict) and "results" in response:
+            # DeepXiv returns {"status": "success", "total_count": N, "result": [...]}
+            if isinstance(response, dict) and "result" in response:
+                raw_papers = response["result"]
+            elif isinstance(response, dict) and "results" in response:
+                # Fallback for older SDK versions
                 raw_papers = response["results"]
             elif isinstance(response, list):
                 raw_papers = response
@@ -107,9 +109,9 @@ class DeepXivScanner:
                 arxiv_id = arxiv_id.split("/")[-1]
 
             title = data.get("title", "").strip()
-            summary = data.get("abstract", data.get("summary", "")).strip()
+            summary = data.get("abstract", data.get("summary", data.get("tldr", ""))).strip()
 
-            # Authors: DeepXiv 'authors' = list[str], 'author_names' = space-joined string (unreliable)
+            # Authors: DeepXiv 'authors' = list[dict] with 'name' key
             raw_authors = data.get("authors", [])
             if isinstance(raw_authors, list) and raw_authors:
                 authors = [
@@ -123,12 +125,12 @@ class DeepXivScanner:
                 an = data.get("author_names", "")
                 authors = [a.strip() for a in an.split(",")] if "," in an else []
 
-            published = data.get("publish_at", data.get("published", data.get("created_at", "")))
+            published = data.get("date", data.get("publish_at", data.get("published", data.get("created_at", ""))))
             categories = data.get("categories", [])
             if isinstance(categories, str):
                 categories = [c.strip() for c in categories.split(",") if c.strip()]
 
-            citations = data.get("citation", data.get("citations", 0)) or 0
+            citations = data.get("citation_count", data.get("citation", data.get("citations", 0))) or 0
             score = data.get("score", 0)
 
             return {
