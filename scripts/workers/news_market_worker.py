@@ -24,7 +24,7 @@ from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s)")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -141,8 +141,8 @@ class NewsMarketWorker(BaseWorker):
         stocks_summary = f"{len(stocks)} stocks tracked"
 
         # Calculate market trend
-        gainers = [s for s in stocks if s.get("change_pct", 0) > 0]
-        losers = [s for s in stocks if s.get("change_pct", 0) < 0]
+        gainers = [s for s in stocks if s.get("percent_change", 0) > 0]
+        losers = [s for s in stocks if s.get("percent_change", 0) < 0]
 
         if gainers and losers:
             trend = f"{len(gainers)} up, {len(losers)} down"

@@ -316,11 +316,17 @@ class GeminiCLIClient:
                 
                 error_msg = error_msg.lower()
                 
-                # Keywords for typical transient errors
+                # Keywords for typical transient errors (network + quota)
+                network_keywords = ["fetch failed", "connection", "econnrefused", "econnreset", "etimedout", "enetunreach", "socket hang up"]
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
                 # Keywords that usually mean a hard daily stop
                 hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
-                
+
+                # Network errors are always transient and worth retrying
+                if any(kw in error_msg for kw in network_keywords):
+                    logger.info(f"Network error detected for tier {tier}. Retrying...")
+                    return True
+
                 is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
                 
                 if is_quota:

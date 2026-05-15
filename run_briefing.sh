@@ -15,7 +15,9 @@ fi
 
 # Load environment variables
 if [ -f ".env" ]; then
+    set -a
     source .env
+    set +a
 fi
 
 # Clean up old files
@@ -23,5 +25,6 @@ rm -f Atlas-Briefing-*.md Atlas-Briefing-*.pdf status.json
 
 # Run the briefing
 # Upstream v0.2 introduces briefing_runner_v2.py for parallel execution
+# PYTHONUNBUFFERED ensures log lines flush immediately through the pipe
 # Redirect output to logger so it shows up in journalctl
-python3 scripts/briefing_runner_v2.py --config config.yaml 2>&1 | logger -t atlas-briefing
+PYTHONUNBUFFERED=1 python3 scripts/briefing_runner_v2.py --config config.yaml 2>&1 | logger -t atlas-briefing

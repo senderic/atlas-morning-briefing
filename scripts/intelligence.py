@@ -783,7 +783,8 @@ class BriefingIntelligence:
                 continue
             symbol = s.get("symbol", "")
             name = s.get("name", symbol)
-            pct = s.get("percent_change", 0)
+            pct = s.get("percent_change")
+            if pct is None: pct = 0.0
             sign = "+" if pct >= 0 else ""
             stock_lines.append(f"{name} ({symbol}): {sign}{pct:.1f}%")
 
@@ -942,7 +943,8 @@ class BriefingIntelligence:
             stock_items = []
             for s in stocks:
                 if "error" not in s:
-                    pct = s.get("percent_change", 0)
+                    pct = s.get("percent_change")
+                    if pct is None: pct = 0.0
                     sign = "+" if pct >= 0 else ""
                     corr = s.get("news_correlation", "")
                     line = f"- {s.get('symbol', '')}: {sign}{pct:.1f}%"
@@ -986,7 +988,7 @@ class BriefingIntelligence:
                     sym = s.get("symbol", "")
                     if sym in prev_stocks and "error" not in s:
                         prev_price = prev_stocks[sym]
-                        curr_price = s.get("current_price", 0)
+                        curr_price = s.get("current_price") or 0.0
                         if prev_price and prev_price > 0:
                             multi_day_pct = ((curr_price - prev_price) / prev_price) * 100
                             trend_lines.append(f"{sym}: {multi_day_pct:+.1f}% over 2 days")

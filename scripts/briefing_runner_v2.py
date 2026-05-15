@@ -35,7 +35,7 @@ from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s)")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 STATE_FILENAME = ".atlas-state.json"
@@ -147,7 +147,7 @@ class BriefingCoordinator:
     def _analyze_market_trend(self, stocks, news) -> str:
         if not stocks or not self.llm.available: return ""
         prompt = "Analyze market trend from these stocks:\n"
-        for s in stocks: prompt += f"- {s.get('symbol')}: {s.get('change_pct'):.2f}%\n"
+        for s in stocks: prompt += f"- {s.get('symbol')}: {s.get('percent_change', 0.0):.2f}%\n"
         return self.llm.invoke(prompt, tier="light") or ""
 
     def _generate_briefing(self, synthesis, papers, blogs, news, stocks) -> str:
@@ -155,7 +155,7 @@ class BriefingCoordinator:
         content += f"## Executive Summary\n\n{synthesis['executive_summary']}\n\n"
         if stocks:
             content += f"## Markets\n\n{synthesis['market_trend']}\n\n"
-            for s in stocks: content += f"- **{s.get('symbol')}**: {s.get('change_pct'):.2f}%\n"
+            for s in stocks: content += f"- **{s.get('symbol')}**: {s.get('percent_change', 0.0):.2f}%\n"
         if news:
             content += "## News\n\n"
             for n in news[:5]: content += f"### {n.get('title')}\n\n{n.get('llm_summary')}\n\n[Link]({n.get('url')})\n\n"
