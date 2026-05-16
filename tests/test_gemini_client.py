@@ -527,6 +527,62 @@ class TestHardQuotaGate:
         assert mock_run.call_count == 1
 
 
+class TestTimeoutAndValueErrorRetries:
+    """Verify timeout + ValueError retry caps don't burn the heavy budget."""
+
+    @patch("subprocess.run")
+    def test_timeout_capped_separately_from_quota_retries(self, mock_run, mock_config):
+        """Persistent subprocess hangs should NOT consume the full 20-attempt budget."""
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        client.heavy_max_attempts = 20
+        # Every call hangs.
+        mock_run.side_effect = subprocess.TimeoutExpired(["gemini"], 900)
+        with patch("scripts.gemini_client.wait_random_exponential",
+                   return_value=lambda x: 0.001):
+            result = client.invoke("p", tier="heavy", allow_fallback=False)
+        assert result is None
+        # 4 attempts total: initial + 3 retries (max_timeout_retries=3).
+        assert mock_run.call_count == 4
+
+    @patch("subprocess.run")
+    def test_empty_response_value_error_is_transient(self, mock_run, mock_config):
+        """Empty model response retries (often safety-filter false-trip)."""
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        client.heavy_max_attempts = 3
+        # First call returns empty response, second returns content.
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout='{"response": ""}'),
+            MagicMock(returncode=0, stdout='{"response": "real answer"}'),
+        ]
+        with patch("scripts.gemini_client.wait_random_exponential",
+                   return_value=lambda x: 0.001):
+            result = client.invoke("p", tier="heavy", allow_fallback=False)
+        assert result == "real answer"
+        assert mock_run.call_count == 2
+
+    def test_unrelated_value_error_is_not_transient(self, mock_config):
+        """Non-empty-response ValueError shouldn't loop forever."""
+        client = GeminiCLIClient(mock_config)
+        # Build the is_transient_error closure by entering invoke just enough
+        # to access it, but easier: directly check that a generic ValueError
+        # raised inside _execute_command would NOT trigger a retry. We simulate
+        # via mocking _execute_command to raise a programming-bug ValueError.
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        with patch.object(client, "_execute_command",
+                          side_effect=ValueError("bad config: missing key")):
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="medium", allow_fallback=False)
+        # The non-transient ValueError should propagate, then invoke catches
+        # at the outer try/except and returns None without retrying.
+        assert result is None
+
+
 class TestEnvVarHandling:
     """Verify GOOGLE_API_KEY etc. are unset (popped), not blanked, and that
     --skip-trust is in the cmd args, not the env."""

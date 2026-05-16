@@ -380,10 +380,34 @@ class GeminiCLIClient:
             int(self.heavy_max_attempts) if tier == "heavy" else 4
         )
 
+        # Cap retries on subprocess hangs separately. Each TimeoutExpired
+        # already cost the full 900s subprocess timeout — letting it consume
+        # the full heavy_max_attempts budget would mean up to 20*15min=5h on
+        # network black-holing alone, with no chance of recovery. The
+        # _timeout_retries counter is consumed inside is_transient_error.
+        max_timeout_retries = 3
+        timeout_retry_state = {"count": 0}
+
         def is_transient_error(exception):
-            """Check if the error is worth retrying, and rotate key if quota hit."""
-            if isinstance(exception, (subprocess.TimeoutExpired, ValueError)):
+            """Decide whether to retry; rotate key on quota when appropriate."""
+            if isinstance(exception, subprocess.TimeoutExpired):
+                if timeout_retry_state["count"] >= max_timeout_retries:
+                    logger.warning(
+                        f"TimeoutExpired retry budget ({max_timeout_retries}) exhausted; aborting."
+                    )
+                    return False
+                timeout_retry_state["count"] += 1
+                logger.info(
+                    f"Subprocess timeout {timeout_retry_state['count']}/{max_timeout_retries}; will retry."
+                )
                 return True
+            if isinstance(exception, ValueError):
+                # Only the explicit "Empty response from <tier>" ValueError is
+                # treated as transient (model occasionally returns empty under
+                # safety filtering or spurious cutoffs). Any other ValueError
+                # is a programming bug and should surface, not loop.
+                msg = str(exception).lower()
+                return msg.startswith("empty response from")
             if isinstance(exception, subprocess.CalledProcessError):
                 # Check both stderr and stdout for error messages
                 error_msg = ""
