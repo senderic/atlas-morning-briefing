@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.bedrock_client import BedrockClient
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s)")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
