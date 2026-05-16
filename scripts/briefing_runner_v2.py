@@ -97,7 +97,7 @@ class BriefingCoordinator:
             )
 
         self._update_memory(synthesis, papers, blogs, news, stocks)
-        self._save_state(papers, blogs, news)
+        self._save_state(papers, blogs, news, stocks=stocks, synthesis=synthesis)
 
         elapsed = time.time() - start_time
         logger.info(f"=== Briefing completed in {elapsed:.1f}s ===")
@@ -228,11 +228,54 @@ class BriefingCoordinator:
         now = datetime.now(timezone.utc)
         return f"Atlas-Briefing-{now.year}.{now.month:02d}.{now.day:02d}"
 
-    def _load_memory(self): return {}
-    def _update_memory(self, s, p, b, n, st): pass
-    def _save_state(self, papers, blogs, news):
-        state = {"date": datetime.now(timezone.utc).isoformat(), "paper_titles": [p.get("title", "") for p in papers]}
-        with open(STATE_FILENAME, "w") as f: json.dump(state, f, indent=2)
+    def _load_memory(self) -> Dict[str, Any]:
+        """Load previous run state. Falls back to empty dict on first run."""
+        state_path = Path(STATE_FILENAME)
+        if not state_path.exists():
+            return {}
+        try:
+            with state_path.open() as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to load previous state from {STATE_FILENAME}: {e}")
+            return {}
+
+    def _update_memory(self, synthesis, papers, blogs, news, stocks):
+        """Hook for future cross-day memory updates; intentionally minimal."""
+        return
+
+    def _save_state(self, papers, blogs, news, stocks=None, synthesis=None):
+        """Persist run state for cross-day trend tracking.
+
+        Preserves the keys that BriefingIntelligence.track_trending and
+        synthesize_briefing read on subsequent days: top_paper_titles,
+        top_blog_titles, top_news_titles, emerging_themes, stock_closes,
+        and trending_topics (carried over verbatim from the previous run
+        because trending bookkeeping happens inside the intelligence
+        layer, which v0.2 doesn't yet invoke).
+        """
+        previous = self._load_memory()
+        stocks = stocks or []
+        synthesis = synthesis or {}
+
+        stock_closes = {}
+        for s in stocks:
+            symbol = s.get("symbol")
+            price = s.get("current_price")
+            if symbol and price is not None:
+                stock_closes[symbol] = price
+
+        state = {
+            "date": datetime.now(timezone.utc).isoformat(),
+            "top_paper_titles": [p.get("title", "") for p in papers[:10]],
+            "top_blog_titles": [b.get("title", "") for b in blogs[:10]],
+            "top_news_titles": [n.get("title", "") for n in news[:10]],
+            "emerging_themes": synthesis.get("emerging_themes", []),
+            "stock_closes": stock_closes,
+            "trending_topics": previous.get("trending_topics", {}),
+        }
+        with open(STATE_FILENAME, "w") as f:
+            json.dump(state, f, indent=2)
 
 def main():
     parser = argparse.ArgumentParser()
