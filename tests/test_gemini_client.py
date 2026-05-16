@@ -260,10 +260,14 @@ class TestPerTierPacing:
             "secondary thread should have acquired _call_lock during pace sleep"
 
 
-class TestRoundRobinHeavy:
-    """Verify per-call round-robin key selection on heavy tier."""
+class TestStickyHeavyKey:
+    """Verify sticky-key behavior: successful heavy calls stay on the same
+    key (no per-call round-robin), and the key only rotates after enough
+    consecutive strikes within ONE invoke()."""
 
-    def test_round_robin_advances_per_call(self, mock_config):
+    def test_successful_heavy_calls_stay_on_same_key(self, mock_config):
+        """Successful heavy calls don't rotate — they're sticky on the
+        current key so the next call lands on a known-working key."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2,k3"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
@@ -276,32 +280,53 @@ class TestRoundRobinHeavy:
                 return MagicMock(returncode=0, stdout='{"response": "ok"}')
 
             with patch("subprocess.run", side_effect=capture_env):
-                client.invoke("p", tier="heavy", allow_fallback=False)
-                client.invoke("p", tier="heavy", allow_fallback=False)
-                client.invoke("p", tier="heavy", allow_fallback=False)
-                client.invoke("p", tier="heavy", allow_fallback=False)
-            # 3 keys, 4 calls -> k1, k2, k3, k1
-            assert envs_used == ["k1", "k2", "k3", "k1"]
+                for _ in range(4):
+                    client.invoke("p", tier="heavy", allow_fallback=False)
+            # All 4 calls stick to k1 since none failed.
+            assert envs_used == ["k1", "k1", "k1", "k1"]
+            assert client._next_heavy_key == 0
 
-    def test_round_robin_inactive_with_single_key(self, mock_config):
-        # With one key, every heavy call uses it; _next_heavy_key shouldn't
-        # silently advance and confuse later state inspection.
+    def test_single_key_stays_put(self, mock_config):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
-
             envs_used = []
-
             def capture_env(*args, **kwargs):
                 envs_used.append(kwargs["env"]["GEMINI_API_KEY"])
                 return MagicMock(returncode=0, stdout='{"response": "ok"}')
-
             with patch("subprocess.run", side_effect=capture_env):
                 client.invoke("p", tier="heavy", allow_fallback=False)
                 client.invoke("p", tier="heavy", allow_fallback=False)
             assert envs_used == ["only_key", "only_key"]
-            assert client._next_heavy_key == 0  # untouched
+
+    def test_heavy_key_rotates_after_max_strikes(self, mock_config):
+        """N consecutive strikes on the same key trigger a rotation."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 10
+            client.max_strikes_per_key = 3
+            client.ignore_hard_quota = False
+
+            # 3 strikes on k1, then success on k2 (after rotation).
+            mock_run = MagicMock()
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 capacity"),
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 capacity"),
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 capacity"),
+                MagicMock(returncode=0, stdout='{"response": "ok"}'),
+            ]
+            with patch("subprocess.run", mock_run), \
+                 patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result == "ok"
+            assert mock_run.call_count == 4
+            keys = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
+            # 3 strikes on k1, rotation, 1 success on k2.
+            assert keys == ["k1", "k1", "k1", "k2"]
 
 
 class TestConfigDirCaching:
@@ -490,14 +515,14 @@ class TestHardQuotaGate:
 
     @patch("subprocess.run")
     def test_hard_quota_tries_all_heavy_keys_before_aborting(self, mock_run, mock_config):
-        """Each key has its own RPD on free tier, so we try every loaded key
-        once before declaring the tier done. After N strikes (where N is the
-        number of configured keys), abort."""
+        """3 keys with persistent hard quota: each key gets max_strikes_per_key
+        attempts (default 3) before rotating; 3 keys * 3 strikes = 9 calls total."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2,k3"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
-            client.heavy_max_attempts = 20  # plenty of headroom
+            client.heavy_max_attempts = 20
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
 
             mock_run.side_effect = subprocess.CalledProcessError(
@@ -507,16 +532,19 @@ class TestHardQuotaGate:
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="heavy", allow_fallback=False)
             assert result is None
-            # 3 keys → 3 attempts → abort.
-            assert mock_run.call_count == 3
+            assert mock_run.call_count == 9
+            keys = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
+            assert keys == ["k1", "k1", "k1", "k2", "k2", "k2", "k3", "k3", "k3"]
 
     @patch("subprocess.run")
-    def test_hard_quota_aborts_single_key_heavy_immediately(self, mock_run, mock_config):
-        """Only one key configured: no sibling to try, so one strike = abort."""
+    def test_hard_quota_single_key_burns_max_strikes(self, mock_run, mock_config):
+        """One key + persistent hard quota: max_strikes_per_key attempts,
+        then give up on the model."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
 
             mock_run.side_effect = subprocess.CalledProcessError(
@@ -526,57 +554,63 @@ class TestHardQuotaGate:
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="heavy", allow_fallback=False)
             assert result is None
-            assert mock_run.call_count == 1
+            assert mock_run.call_count == 3
 
     @patch("subprocess.run")
-    def test_hard_quota_succeeds_when_second_key_has_headroom(self, mock_run, mock_config):
-        """If key 1 is RPD'd but key 2 still has quota, we succeed on retry."""
+    def test_hard_quota_succeeds_after_rotation_to_fresh_key(self, mock_run, mock_config):
+        """3 strikes on k1, rotate to k2, success."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "exhausted,fresh"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
 
+            err = subprocess.CalledProcessError(
+                1, ["gemini"], stderr="terminalquotaerror: daily limit"
+            )
             mock_run.side_effect = [
-                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror: daily limit"),
+                err, err, err,
                 MagicMock(returncode=0, stdout='{"response": "from fresh key"}'),
             ]
             with patch("scripts.gemini_client.wait_random_exponential",
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="heavy", allow_fallback=False)
             assert result == "from fresh key"
-            assert mock_run.call_count == 2
-            # First attempt used k1, retry used k2 (round-robin advanced).
-            assert mock_run.call_args_list[0][1]["env"]["GEMINI_API_KEY"] == "exhausted"
-            assert mock_run.call_args_list[1][1]["env"]["GEMINI_API_KEY"] == "fresh"
+            assert mock_run.call_count == 4
+            keys = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
+            assert keys == ["exhausted", "exhausted", "exhausted", "fresh"]
 
     @patch("subprocess.run")
-    def test_hard_quota_terminalquotaerror_keyword_matched(self, mock_run, mock_config):
-        """The exact production log keyword 'TerminalQuotaError' is recognized."""
+    def test_terminalquotaerror_keyword_triggers_strike_path(self, mock_run, mock_config):
+        """Production log wording 'TerminalQuotaError' is matched and triggers
+        the standard strike-and-rotate path (not an immediate abort)."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.max_strikes_per_key = 2
             client.ignore_hard_quota = False
 
             mock_run.side_effect = subprocess.CalledProcessError(
                 1, ["gemini"],
-                # Real wording observed in production logs.
                 stderr="warning: 256-color support not detected\nTerminalQuotaError: You have exhausted your daily quota on this model.",
             )
             with patch("scripts.gemini_client.wait_random_exponential",
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="heavy", allow_fallback=False)
             assert result is None
-            assert mock_run.call_count == 1
+            assert mock_run.call_count == 2
 
     @patch("subprocess.run")
-    def test_hard_quota_aborts_non_heavy(self, mock_run, mock_config):
-        """Non-heavy (medium/light) tiers also need to honor the hard-quota gate."""
+    def test_hard_quota_non_heavy_burns_max_strikes(self, mock_run, mock_config):
+        """Non-heavy tiers stick to one key (no rotation); strike out at
+        max_strikes_per_key then give up on the model."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
 
             mock_run.side_effect = subprocess.CalledProcessError(
@@ -586,7 +620,7 @@ class TestHardQuotaGate:
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="medium", allow_fallback=False)
             assert result is None
-            assert mock_run.call_count == 1
+            assert mock_run.call_count == 3
 
     @patch("subprocess.run")
     def test_hard_quota_overridden_by_ignore_flag(self, mock_run, mock_config):
@@ -847,61 +881,67 @@ class TestFallbackModelChain:
         assert models_called == ["test-heavy", "gemini-2.5-pro", "test-medium"]
 
 
-class TestExhaustedKeyMemory:
-    """Verify exhausted keys are remembered across invoke() calls in the run."""
+class TestCrossCallKeyState:
+    """Sticky-key state carries across invoke() calls in the same run.
+
+    No permanent blacklist — the SAME key is freely tried again by every
+    new invoke(). Rotation cursor (_next_heavy_key) persists so the next
+    call picks up where the last one rotated to."""
 
     @patch("subprocess.run")
-    def test_exhausted_key_skipped_on_second_invoke(self, mock_run, mock_config):
-        """First invoke exhausts key 0; the second invoke should jump
-        straight to key 1 without wasting a strike on key 0."""
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "exhausted,fresh"}, clear=True):
+    def test_rotation_persists_across_invoke_calls(self, mock_run, mock_config):
+        """Strikes on k1 → rotate to k2 → success. Next invoke STARTS on k2."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
-            # Need at least 2 attempts so the retry actually rotates to key B
-            # after the hard-quota strike on key A.
-            client.heavy_max_attempts = 3
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
-
-            # First call: key 'exhausted' hits hard quota, key 'fresh' succeeds.
-            # Second call: 'exhausted' is blacklisted, only 'fresh' is used.
+            err = subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror")
             mock_run.side_effect = [
-                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror"),
-                MagicMock(returncode=0, stdout='{"response": "first ok"}'),
-                MagicMock(returncode=0, stdout='{"response": "second ok"}'),
+                err, err, err,  # 3 strikes on k1
+                MagicMock(returncode=0, stdout='{"response": "ok1"}'),  # k2 wins
+                MagicMock(returncode=0, stdout='{"response": "ok2"}'),  # second invoke stays on k2
             ]
             with patch("scripts.gemini_client.wait_random_exponential",
                        return_value=lambda x: 0.001):
                 r1 = client.invoke("p1", tier="heavy", allow_fallback=False)
                 r2 = client.invoke("p2", tier="heavy", allow_fallback=False)
-        assert r1 == "first ok"
-        assert r2 == "second ok"
-        assert mock_run.call_count == 3
-        keys_used = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
-        assert keys_used == ["exhausted", "fresh", "fresh"]
-        assert 0 in client._exhausted_heavy_keys
+        assert r1 == "ok1"
+        assert r2 == "ok2"
+        keys = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
+        assert keys == ["k1", "k1", "k1", "k2", "k2"]
 
     @patch("subprocess.run")
-    def test_all_keys_exhausted_triggers_tier_fallback(self, mock_run, mock_config):
-        """When every loaded key is blacklisted, heavy aborts and the next
-        tier picks up immediately — no wasted backoff waits."""
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "a,b"}, clear=True):
+    def test_same_key_freely_tried_on_next_invoke(self, mock_run, mock_config):
+        """No permanent blacklist: even after the strike threshold was hit on
+        k1 in one invoke, a future invoke that lands on k1 again may succeed."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
-            client.heavy_max_attempts = 3
+            client.max_strikes_per_key = 3
             client.ignore_hard_quota = False
-            client._exhausted_heavy_keys = {0, 1}  # both pre-blacklisted
-
-            mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "from medium"}')
+            err = subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror")
+            # First invoke: 3 strikes on k1, 3 strikes on k2 → abort heavy.
+            # We disable fallback so the call returns None.
+            # Then manually rewind _next_heavy_key to k1 (simulating a future
+            # call that starts there) and verify another attempt happens.
+            mock_run.side_effect = (
+                [err] * 6  # first invoke burns both keys
+                + [MagicMock(returncode=0, stdout='{"response": "fresh ok"}')]
+            )
             with patch("scripts.gemini_client.wait_random_exponential",
                        return_value=lambda x: 0.001):
-                result = client.invoke("p", tier="heavy")
-        assert result == "from medium"
-        # Heavy didn't even try a subprocess (RuntimeError raised inside
-        # _execute_command before subprocess.run was called).
-        models_called = [c[0][0][2] for c in mock_run.call_args_list]
-        assert all(m == "test-medium" for m in models_called)
+                client.invoke("p1", tier="heavy", allow_fallback=False)
+                # Manually reset cursor as if quota window rolled over.
+                client._next_heavy_key = 0
+                r2 = client.invoke("p2", tier="heavy", allow_fallback=False)
+        assert r2 == "fresh ok"
+        # The client doesn't have an "exhausted keys" set — the same k1 is
+        # available to invoke again on subsequent calls.
+        assert not hasattr(client, "_exhausted_heavy_keys") or \
+               not client.__dict__.get("_exhausted_heavy_keys")
 
 
 class TestApiKeyLoading:

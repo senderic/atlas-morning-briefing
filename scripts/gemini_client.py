@@ -95,10 +95,12 @@ class GeminiCLIClient:
         }
         self._tier_last_call: Dict[str, float] = {"heavy": 0.0, "medium": 0.0, "light": 0.0}
         self._call_lock = threading.Lock()
-        # Per-run memory of keys that hit hard-quota on heavy tier. Subsequent
-        # heavy calls in the same run skip these instead of repeating the same
-        # mistake (and burning the per-key wait budget). Reset by cleanup().
-        self._exhausted_heavy_keys: set = set()
+        # How many consecutive quota strikes we'll absorb on the SAME heavy
+        # key before rotating to the next one in the pool. Tenacity's
+        # random_exponential wait already spaces these attempts out
+        # (90-450s on heavy), so 3 strikes ≈ 5-22 min of patient retries on
+        # a single key before we move on. Override via gemini.max_strikes_per_key.
+        self.max_strikes_per_key = int(config.get("max_strikes_per_key", 3))
 
         # Heavy-tier retry budget. 20 attempts × ~90-450s backoff ≈ 2-3 hours
         # of patient retrying — appropriate for an unattended cron run.
@@ -255,39 +257,24 @@ class GeminiCLIClient:
         process_env = os.environ.copy()
         process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
 
-        # Pick the API key. Heavy tier round-robins across all NON-EXHAUSTED
-        # keys — keys that hit hard-quota earlier in the same run stay
-        # blacklisted in self._exhausted_heavy_keys so we don't waste another
-        # attempt on them. Non-heavy tiers stick to key 0 (Flash RPD is huge).
+        # Pick the API key. For heavy with multiple keys, _next_heavy_key is
+        # the "currently sticky" key — it does NOT auto-advance on every
+        # call. invoke()'s tenacity loop is responsible for deciding when to
+        # rotate (after max_strikes_per_key consecutive quota errors), which
+        # gives the same key several chances to recover through backoff
+        # before we move on. Non-heavy tiers stay on key 0 (Flash RPD is huge).
         if tier == "heavy" and len(self._api_keys) > 1:
             with self._call_lock:
-                n = len(self._api_keys)
-                api_key = None
-                key_index = None
-                for offset in range(n):
-                    candidate = (self._next_heavy_key + offset) % n
-                    if candidate not in self._exhausted_heavy_keys:
-                        api_key = self._api_keys[candidate]
-                        key_index = candidate
-                        self._next_heavy_key = (candidate + 1) % n
-                        break
-                if api_key is None:
-                    # Every loaded key has been exhausted earlier in this run.
-                    # Bail out of THIS subprocess immediately so the caller
-                    # can fall through to alternate models / next tier
-                    # without waiting through tenacity backoff.
-                    raise RuntimeError(
-                        f"All {n} Gemini keys exhausted on heavy tier this run; "
-                        "give up on heavy and let tier fallback take over."
-                    )
+                key_index = self._next_heavy_key
+                api_key = self._api_keys[key_index]
         elif tier == "heavy":
             api_key = self._get_current_key()
             key_index = self._current_key_index
         else:
             api_key = self._api_keys[0] if self._api_keys else None
             key_index = 0
-        # Remember which key this attempt used so is_transient_error can
-        # blacklist it on a hard-quota response.
+        # Remember which key this attempt used (for diagnostic logging in
+        # is_transient_error).
         self._last_used_key_idx = key_index
 
         if api_key:
@@ -471,14 +458,15 @@ class GeminiCLIClient:
         # network black-holing alone, with no chance of recovery.
         max_timeout_retries = 3
         timeout_retry_state = {"count": 0}
-        # Track hard-quota strikes for this logical call so a single key's
-        # RPD wall doesn't abort the whole call when other keys may still
-        # have headroom. Each strike advances round-robin to the next key.
-        hard_quota_state = {"count": 0}
-        # Per-tier siblings to try before giving up. For heavy with multiple
-        # keys, every key gets a chance against its own per-key RPD. For
-        # non-heavy (always key 0) and single-key heavy, one strike = abort.
-        max_hard_quota_attempts = (
+        # Sticky-key persistence: we stay on the same heavy key for up to
+        # max_strikes_per_key consecutive quota errors before rotating to
+        # the next one. After we've rotated through every loaded key
+        # (key_rotations >= len(api_keys)), the model is considered done
+        # for this call and we fall through to alternate models / next
+        # tier. No permanent blacklist — same key is freely tried again
+        # by future invoke() calls.
+        strike_state = {"strikes_on_current_key": 0, "key_rotations": 0}
+        max_key_rotations = (
             len(self._api_keys) if (tier == "heavy" and len(self._api_keys) > 1) else 1
         )
 
@@ -547,69 +535,78 @@ class GeminiCLIClient:
                 if not is_quota:
                     return False
 
-                # Hard-quota gate. RPD is per-key per-model on the Gemini
-                # free tier, so one key hitting the daily wall doesn't mean
-                # siblings are exhausted. For multi-key heavy, blacklist the
-                # offending key for the rest of the run and try the next one.
-                # For single-key heavy or non-heavy, one strike = abort
-                # (let alternate-model / next-tier fallback take over).
-                if is_hard_quota and not self.ignore_hard_quota:
-                    last_idx = getattr(self, "_last_used_key_idx", None)
-                    if tier == "heavy" and last_idx is not None:
-                        with self._call_lock:
-                            self._exhausted_heavy_keys.add(last_idx)
-                    hard_quota_state["count"] += 1
-                    if hard_quota_state["count"] < max_hard_quota_attempts:
-                        logger.info(
-                            f"Hard quota on tier {tier} key idx={last_idx} "
-                            f"(strike {hard_quota_state['count']}/"
-                            f"{max_hard_quota_attempts}); blacklisting key for "
-                            "this run and rotating to the next. msg: "
-                            f"{_trim_error(error_msg)}"
-                        )
-                        return True
-                    logger.warning(
-                        f"Hard quota reached on tier {tier} after trying "
-                        f"{hard_quota_state['count']}/{max_hard_quota_attempts} "
-                        f"key(s). msg: {_trim_error(error_msg)}. "
-                        "Aborting retries on this model; will try alternate "
-                        "models / next tier."
+                # Quota response (soft 429/capacity or hard daily). Same
+                # logic for both: stay on this key for up to
+                # max_strikes_per_key consecutive strikes (tenacity's
+                # exponential backoff between them gives the key a chance
+                # to recover — could be a transient RPM burst, RPM window
+                # rolling over, or even a Google-side service blip
+                # masquerading as 'quota'). Once we've struck out enough
+                # times on the same key, rotate to the next one.
+                #
+                # `ignore_hard_quota=true` would also fall into this path
+                # since hard-quota responses are treated as a strike, not
+                # a hard abort. The only way to give up is to exhaust all
+                # max_key_rotations (= number of keys for multi-key heavy,
+                # else 1) — meaning we tried every key max_strikes_per_key
+                # times and still nothing worked.
+                last_idx = getattr(self, "_last_used_key_idx", None)
+                strike_state["strikes_on_current_key"] += 1
+                quota_label = "hard quota" if is_hard_quota else "soft quota"
+
+                if strike_state["strikes_on_current_key"] < self.max_strikes_per_key:
+                    logger.info(
+                        f"{quota_label.capitalize()} on tier {tier} key idx={last_idx} "
+                        f"(strike {strike_state['strikes_on_current_key']}/"
+                        f"{self.max_strikes_per_key} on this key; rotation "
+                        f"{strike_state['key_rotations'] + 1}/"
+                        f"{max_key_rotations}); will retry after backoff. msg: "
+                        f"{_trim_error(error_msg)}"
                     )
-                    return False
+                    return True
 
-                # Soft quota / 5xx / generic rate-limit response: retry path.
-                if tier == "heavy":
-                    if len(self._api_keys) > 1:
-                        # Round-robin already lined up the next key for the
-                        # retry; skip the explicit rotation sleep.
-                        logger.info(
-                            f"Quota error on heavy tier; round-robin will pick the next key on retry."
+                # Strikes-on-current-key exhausted. Rotate to next key (if
+                # we have one) and reset the per-key strike counter.
+                if tier == "heavy" and len(self._api_keys) > 1:
+                    with self._call_lock:
+                        self._next_heavy_key = (self._next_heavy_key + 1) % len(self._api_keys)
+                    strike_state["key_rotations"] += 1
+                    strike_state["strikes_on_current_key"] = 0
+                    if strike_state["key_rotations"] >= max_key_rotations:
+                        logger.warning(
+                            f"Tier {tier}: rotated through all "
+                            f"{max_key_rotations} keys, each took "
+                            f"{self.max_strikes_per_key} strikes. "
+                            f"Giving up on this model. msg: {_trim_error(error_msg)}"
                         )
-                        return True
-                    if self._rotate_key():
-                        logger.info(
-                            f"Quota error detected for tier {tier}. "
-                            "Rotated API key and retrying..."
-                        )
-                        return True
-                    # Single key, nothing to rotate to — fall through to
-                    # backoff-and-retry below.
+                        return False
+                    logger.info(
+                        f"Tier {tier}: {quota_label} strikes on key idx={last_idx} "
+                        f"reached {self.max_strikes_per_key}; rotating to next key "
+                        f"(rotation {strike_state['key_rotations']}/{max_key_rotations})."
+                    )
+                    return True
 
-                # Non-heavy tiers stick to key 0 and just wait through backoff.
+                # Single-key heavy or non-heavy: no other key to rotate to.
+                # We've already given the one key max_strikes_per_key chances
+                # spread across tenacity backoff. Give up on this model.
                 logger.warning(
-                    f"Quota error detected for tier {tier}. Retrying after backoff..."
+                    f"Tier {tier}: {quota_label} strikes on single key "
+                    f"reached {self.max_strikes_per_key}. Giving up on this "
+                    f"model. msg: {_trim_error(error_msg)}"
                 )
-                return True
+                return False
             return False
 
         # Walk the same-tier candidate models. Each model gets its own retry
-        # budget (timeout + hard-quota + soft-quota). Reset the per-call
-        # counters between candidates so a quota-exhausted gemini-2.5-pro
-        # doesn't poison the budget for gemini-2.0-pro.
+        # budget (timeout + strike state). Reset the per-call counters
+        # between candidates so a quota-exhausted gemini-2.5-pro doesn't
+        # poison the budget for gemini-2.0-pro.
         last_exception: Optional[Exception] = None
         for model_id in candidates:
             timeout_retry_state["count"] = 0
-            hard_quota_state["count"] = 0
+            strike_state["strikes_on_current_key"] = 0
+            strike_state["key_rotations"] = 0
             if model_id != primary_model:
                 logger.info(
                     f"--- Trying alternate {tier}-tier model: {model_id} ---"

@@ -202,21 +202,21 @@ gemini:
     light: "flash-lite"
   # Alternate models tried IN ORDER when the primary model for a tier
   # exhausts its retries before falling to the next tier. Each model has
-  # its own per-day RPD on Gemini free tier, so when gemini-2.5-pro is
-  # RPD'd you still get a shot at gemini-2.0-pro / gemini-1.5-pro before
-  # downgrading to Flash. Leave empty to use only the primary model.
+  # its own per-day RPD on Gemini free tier, so listing a couple of
+  # known-good variants here can dramatically extend daily headroom.
+  # Empty by default — only fill in with model IDs you've verified exist
+  # in your installed gemini-cli (run `gemini --model <id> --prompt hi`
+  # to confirm). Otherwise pro/flash/flash-lite aliases above are used.
   fallback_models:
-    heavy:
-      - "gemini-2.5-pro"
-      - "gemini-2.0-pro-exp"
-      - "gemini-1.5-pro"
-    medium:
-      - "gemini-2.5-flash"
-      - "gemini-2.0-flash"
-      - "gemini-1.5-flash"
-    light:
-      - "gemini-2.5-flash-lite"
-      - "gemini-2.0-flash-lite"
+    heavy: []
+    medium: []
+    light: []
+  # Strikes-per-key on quota errors before rotating to the next key. With
+  # tenacity's 90-450s exponential backoff between strikes, 3 strikes ≈
+  # 5-22 min of patient retries on the same key before we move on. After
+  # rotating through every key max_strikes_per_key times, we give up on
+  # the current model and try the next one in fallback_models (then tier).
+  max_strikes_per_key: 3
   # Minimum seconds between successive calls per tier. Defaults are sized for
   # Pro free tier (~2 RPM heavy, looser on Flash). Lower if you have paid
   # quota or multiple keys; raise if you're seeing 429s. Set to 0 to disable.
