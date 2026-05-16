@@ -101,9 +101,10 @@ class NewsMarketWorker(BaseWorker):
             stocks = intelligence.correlate_stocks_and_news(stocks, news)
             token_count += len(stocks) * 300  # ~300 tokens per stock correlation
 
-            # Step 6: Filter to top news
-            news = [n for n in news if n.get("llm_score", 0) >= 3]
-            news = sorted(news, key=lambda n: n.get("llm_score", 0), reverse=True)[:self.max_news]
+            # Step 6: Trim to top news. rank_and_summarize_news already returns the
+            # LLM's top picks in ranked order and does not assign a numeric score,
+            # so we trust that ordering and just cap the count.
+            news = news[:self.max_news]
 
             # Step 7: Generate synthesis
             synthesis = self._generate_synthesis(news, stocks)

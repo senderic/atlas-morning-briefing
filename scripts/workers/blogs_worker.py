@@ -98,9 +98,12 @@ class BlogsWorker(BaseWorker):
             # Estimate token usage: ~400 tokens per blog for ranking/summarization
             token_count = len(blogs) * 400
 
-            # Step 4: Filter to top blogs
-            blogs = [b for b in blogs if b.get("llm_score", 0) >= 3]
-            blogs = sorted(blogs, key=lambda b: b.get("llm_score", 0), reverse=True)[:self.max_blogs]
+            # Step 4: Filter to top blogs. Only apply the score gate when scores
+            # are present (intelligence layer sets score_combined on ranked items);
+            # otherwise fall back to the LLM's own ordering.
+            if any(b.get("score_combined") for b in blogs):
+                blogs = [b for b in blogs if b.get("score_combined", 0) >= 3]
+            blogs = sorted(blogs, key=lambda b: b.get("score_combined", 0), reverse=True)[:self.max_blogs]
 
             # Step 5: Generate synthesis
             synthesis = self._generate_synthesis(blogs)
@@ -136,7 +139,7 @@ class BlogsWorker(BaseWorker):
         if not blogs:
             return "No high-scoring blogs found"
 
-        avg_score = sum(b.get("llm_score", 0) for b in blogs) / len(blogs)
+        avg_score = sum(b.get("score_combined", 0) for b in blogs) / len(blogs)
         sources = set(b.get("source", "Unknown") for b in blogs)
 
         synthesis = f"Found {len(blogs)} high-quality blog posts (avg score: {avg_score:.1f}/5). "

@@ -158,11 +158,16 @@ class BriefingCoordinator:
             for s in stocks: content += f"- **{s.get('symbol')}**: {s.get('percent_change', 0.0):.2f}%\n"
         if news:
             content += "## News\n\n"
-            for n in news[:5]: content += f"### {n.get('title')}\n\n{n.get('llm_summary')}\n\n[Link]({n.get('url')})\n\n"
+            for n in news[:5]:
+                summary = n.get("brief_summary", "") or n.get("description", "") or n.get("snippet", "")
+                url = n.get("url", "")
+                content += f"### {n.get('title', '')}\n\n{summary}\n\n[Link]({url})\n\n"
         if papers:
             content += "## Research\n\n"
             for p in sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:5]:
-                content += f"### {p.get('title')}\n\n{p.get('llm_summary')}\n\n[ArXiv]({p.get('link')})\n\n"
+                summary = p.get("brief_summary", "") or p.get("summary", "")[:400]
+                link = p.get("arxiv_url") or p.get("pdf_link") or p.get("id", "")
+                content += f"### {p.get('title', '')}\n\n{summary}\n\n[ArXiv]({link})\n\n"
         return content
 
     def _generate_pdf(self, content, filename) -> Path:
