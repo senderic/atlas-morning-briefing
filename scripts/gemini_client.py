@@ -184,20 +184,28 @@ class GeminiCLIClient:
     def _pace_tier(self, tier: str) -> None:
         """Sleep so successive calls to `tier` honor its minimum interval.
 
-        Records the call's intended start time (under a lock so concurrent
-        callers also serialize), then sleeps if the previous call was too
-        recent. Set tier_min_interval_seconds.<tier>=0 in config to disable.
+        Computes the wait under a short lock (and reserves the next slot by
+        writing _tier_last_call to the future intent time), then sleeps
+        outside the lock so concurrent callers on other tiers aren't blocked
+        by this tier's wait. Set tier_min_interval_seconds.<tier>=0 in
+        config to disable.
         """
         min_interval = self.tier_min_interval.get(tier, 0.0)
         if min_interval <= 0:
             return
         with self._call_lock:
-            elapsed = time.time() - self._tier_last_call[tier]
-            wait = min_interval - elapsed
-            if wait > 0:
-                logger.info(f"Pacing {tier} tier: sleeping {wait:.1f}s to honor {min_interval:.0f}s min interval")
-                time.sleep(wait)
-            self._tier_last_call[tier] = time.time()
+            now = time.time()
+            elapsed = now - self._tier_last_call[tier]
+            wait = max(0.0, min_interval - elapsed)
+            # Reserve the slot at intent time before releasing the lock so
+            # any other caller racing into this tier sees us as the most
+            # recent and waits behind us.
+            self._tier_last_call[tier] = now + wait
+        if wait > 0:
+            logger.info(
+                f"Pacing {tier} tier: sleeping {wait:.1f}s to honor {min_interval:.0f}s min interval"
+            )
+            time.sleep(wait)
 
     def _ensure_config_dir(self) -> str:
         """Build (once) and return a config dir holding .gemini/settings.json."""
@@ -376,9 +384,13 @@ class GeminiCLIClient:
         if not self.available:
             return None
 
-        # Check budget BEFORE incrementing (so retries don't burn it)
+        # Cheap fast-path budget check (no lock). The cap is for cost control,
+        # so a small slop on the boundary under heavy concurrency is fine —
+        # the precise increment under the lock is on the success path below.
         if self._call_count >= self.max_calls:
-            logger.warning(f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}.")
+            logger.warning(
+                f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}."
+            )
             return None
 
         model_id = self.models.get(tier, self.models["medium"])
@@ -511,10 +523,11 @@ class GeminiCLIClient:
             def retry_call():
                 return self._execute_command(model_id, full_prompt, tier)
 
-            # Successful logical call - increment budget ONCE
+            # Successful logical call — increment budget once, atomically.
             result = retry_call()
             if result:
-                self._call_count += 1
+                with self._call_lock:
+                    self._call_count += 1
             return result
 
         except Exception as e:

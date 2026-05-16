@@ -220,9 +220,44 @@ class TestPerTierPacing:
         with patch("time.time", return_value=1000.0):
             with patch("time.sleep"):
                 client._pace_tier("heavy")
+        # Reservation stamp = now + wait. First call wait=0, so stamp=now.
         assert client._tier_last_call["heavy"] == 1000.0
         assert client._tier_last_call["medium"] == 0.0
         assert client._tier_last_call["light"] == 0.0
+
+    def test_pace_releases_lock_before_sleeping(self, mock_config):
+        """The pace sleep must NOT hold _call_lock or other tiers stall.
+
+        Verifies by checking that during a heavy-tier sleep, a separate
+        thread can still acquire _call_lock for any other operation.
+        """
+        import threading
+        import time as _time
+        real_sleep = _time.sleep  # capture before patching
+        client = GeminiCLIClient(mock_config)
+        client.tier_min_interval = {"heavy": 30, "medium": 5, "light": 2}
+        client._tier_last_call["heavy"] = _time.time()  # force a wait
+
+        lock_acquired = threading.Event()
+        sleep_started = threading.Event()
+
+        def secondary_grabs_lock():
+            sleep_started.wait(timeout=1.0)
+            with client._call_lock:
+                lock_acquired.set()
+
+        t = threading.Thread(target=secondary_grabs_lock)
+        t.start()
+
+        def fake_sleep(seconds):
+            sleep_started.set()
+            real_sleep(0.05)  # let secondary thread acquire
+
+        with patch("scripts.gemini_client.time.sleep", side_effect=fake_sleep):
+            client._pace_tier("heavy")
+        t.join(timeout=1.0)
+        assert lock_acquired.is_set(), \
+            "secondary thread should have acquired _call_lock during pace sleep"
 
 
 class TestRoundRobinHeavy:
