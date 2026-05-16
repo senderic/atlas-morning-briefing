@@ -297,11 +297,22 @@ class GeminiCLIClient:
             raise e
 
         try:
-            # Parse JSON output from gemini-cli
+            # Parse JSON output from gemini-cli. The current schema is:
+            # {
+            #   "response": str,
+            #   "stats": {"models": {"<model-id>": {
+            #     "api": {...},
+            #     "tokens": {"prompt": int, "candidates": int, "total": int,
+            #                "cached": int, "thoughts": int, "tool": int}
+            #   }}}
+            # }
             data = json.loads(result.stdout)
             output = data.get("response", "").strip()
 
-            # Extract stats if available
+            # Find the per-model stats block. The model_id we passed in
+            # ("pro", "flash", "flash-lite") is normalized by gemini-cli to
+            # the full id like "gemini-2.5-pro" — so substring-match either
+            # direction.
             stats = data.get("stats", {}).get("models", {})
             model_stats = {}
             for k, v in stats.items():
@@ -311,9 +322,11 @@ class GeminiCLIClient:
             if not model_stats and stats:
                 model_stats = next(iter(stats.values())).get("tokens", {})
 
-            # Update usage metrics
+            # Update usage metrics. Use the documented "prompt" / "candidates"
+            # fields. Fall back to "input" only as a defensive measure for
+            # older gemini-cli versions.
             self.usage_stats[tier]["calls"] += 1
-            in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
+            in_tokens = model_stats.get("prompt", 0) or model_stats.get("input", 0)
             out_tokens = model_stats.get("candidates", 0)
 
             self.usage_stats[tier]["in_tokens"] += in_tokens

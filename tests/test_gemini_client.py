@@ -403,18 +403,38 @@ class TestUsageStatsParsing:
     """Verify that parsed JSON output updates token counters correctly."""
 
     @patch("subprocess.run")
-    def test_parses_input_and_candidates_tokens(self, mock_run, mock_config):
+    def test_parses_prompt_and_candidates_tokens(self, mock_run, mock_config):
+        """Current gemini-cli schema uses 'prompt' (not 'input') for input tokens."""
         client = GeminiCLIClient(mock_config)
         client._available = True
         client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout='{"response": "hello", "stats": {"models": {"test-medium": {"tokens": {"input": 100, "candidates": 50}}}}}',
+            stdout=(
+                '{"response": "hello", "stats": {"models": {"test-medium": '
+                '{"tokens": {"prompt": 100, "candidates": 50, "total": 150}}}}}'
+            ),
         )
         client.invoke("prompt", tier="medium")
         assert client.usage_stats["medium"]["in_tokens"] == 100
         assert client.usage_stats["medium"]["out_tokens"] == 50
         assert client.usage_stats["medium"]["calls"] == 1
+
+    @patch("subprocess.run")
+    def test_falls_back_to_input_field_for_older_cli(self, mock_run, mock_config):
+        """Older gemini-cli versions used 'input' instead of 'prompt'."""
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=(
+                '{"response": "hello", "stats": {"models": {"test-medium": '
+                '{"tokens": {"input": 75, "candidates": 25}}}}}'
+            ),
+        )
+        client.invoke("prompt", tier="medium")
+        assert client.usage_stats["medium"]["in_tokens"] == 75
 
     @patch("subprocess.run")
     def test_handles_unparseable_json_gracefully(self, mock_run, mock_config):

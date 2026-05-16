@@ -183,7 +183,11 @@ pdf:
 # Gemini CLI configuration
 gemini:
   enabled: true
-  ignore_hard_quota: true
+  # When false (recommended), retries STOP on hard daily-quota errors
+  # (RPD reached). When true, the client keeps retrying past the daily
+  # cap — useful only if your error wording produces false positives,
+  # since real RPD won't recover until midnight PT.
+  ignore_hard_quota: false
   internal_max_attempts: 1
   max_calls_per_run: 50
   retry_wait_seconds: 61
