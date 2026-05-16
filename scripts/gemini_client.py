@@ -65,6 +65,8 @@ class GeminiCLIClient:
         self._available = None
         self._api_keys = self._load_api_keys()
         self._current_key_index = 0
+        # Cached per-instance config dir (written once, reused across calls).
+        self._config_dir: Optional[str] = None
 
         # Usage tracking
         self.usage_stats = {
@@ -158,119 +160,126 @@ class GeminiCLIClient:
         
         return self._available
 
-    def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
-        """Execute the gemini command with a local config to force maxAttempts=1."""
+    def _ensure_config_dir(self) -> str:
+        """Build (once) and return a config dir holding .gemini/settings.json."""
         import tempfile
-        import shutil
         from pathlib import Path
 
-        # Create a temporary directory for the gemini config
+        if self._config_dir is not None and os.path.isdir(self._config_dir):
+            return self._config_dir
+
         tmp_config_dir = tempfile.mkdtemp(prefix="atlas_gemini_config_")
-        
+        gemini_dir = Path(tmp_config_dir) / ".gemini"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = gemini_dir / "settings.json"
+        # Force maxAttempts to the configured value so Tenacity owns retries,
+        # and shorten connection timeout so we fail fast and retry at our level.
+        with open(settings_path, "w") as f:
+            json.dump({
+                "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
+                "tools": {"autoAccept": True},
+            }, f)
+        self._config_dir = tmp_config_dir
+        return tmp_config_dir
+
+    def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
+        """Execute the gemini command with a cached local config."""
+        tmp_config_dir = self._ensure_config_dir()
+
+        # Use standard environment but override the config directory
+        process_env = os.environ.copy()
+        process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
+
+        # Ensure compatibility by setting both common API key environment variables
+        if tier == "heavy":
+            api_key = self._get_current_key()
+            key_index = self._current_key_index
+        else:
+            # For non-heavy tiers, always stick to the first API key
+            api_key = self._api_keys[0] if self._api_keys else None
+            key_index = 0
+
+        if api_key:
+            process_env["GEMINI_API_KEY"] = api_key
+            key_preview = api_key[:6] + "..." + api_key[-4:]
+            logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
+        else:
+            logger.warning(f"No Gemini API key available for tier {tier}!")
+
+        # CRITICAL: Force the CLI to use the API key by masking system-wide auth.
+        # This prevents fallback to local gcloud/ADC credentials or OAuth.
+        process_env["GOOGLE_API_KEY"] = ""
+        process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
+        process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
+        process_env["HOME"] = tmp_config_dir
+        process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+        logger.debug("Strict Auth: Masked system-wide Google Cloud auth, redirected HOME.")
+
+        logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
+
+        cmd = [
+            "gemini", "--model", model_id, "--prompt", prompt,
+            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
+            "--output-format", "json"
+        ]
+
         try:
-            # Create .gemini/settings.json in the temp dir
-            gemini_dir = Path(tmp_config_dir) / ".gemini"
-            gemini_dir.mkdir(parents=True, exist_ok=True)
-            settings_path = gemini_dir / "settings.json"
-            
-            # CRITICAL: Force maxAttempts to the configured value so Python Tenacity controls the retries
-            # Also set a shorter connection timeout to fail fast and retry at our level
-            with open(settings_path, "w") as f:
-                json.dump({
-                    "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
-                    "tools": {"autoAccept": True}
-                }, f)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+        except Exception as e:
+            self.usage_stats[tier]["failed_attempts"] += 1
+            raise e
 
-            # Use standard environment but override the config directory
-            process_env = os.environ.copy()
-            process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
-            
-            # Ensure compatibility by setting both common API key environment variables
-            if tier == "heavy":
-                api_key = self._get_current_key()
-                key_index = self._current_key_index
-            else:
-                # For non-heavy tiers, always stick to the first API key
-                api_key = self._api_keys[0] if self._api_keys else None
-                key_index = 0
+        try:
+            # Parse JSON output from gemini-cli
+            data = json.loads(result.stdout)
+            output = data.get("response", "").strip()
 
-            if api_key:
-                process_env["GEMINI_API_KEY"] = api_key
-                key_preview = api_key[:6] + "..." + api_key[-4:]
-                logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
-            else:
-                logger.warning(f"No Gemini API key available for tier {tier}!")
+            # Extract stats if available
+            stats = data.get("stats", {}).get("models", {})
+            model_stats = {}
+            for k, v in stats.items():
+                if model_id in k or k in model_id:
+                    model_stats = v.get("tokens", {})
+                    break
+            if not model_stats and stats:
+                model_stats = next(iter(stats.values())).get("tokens", {})
 
-            # CRITICAL: Force the CLI to use the API key by masking system-wide auth
-            # This prevents fallback to local gcloud/ADC credentials or OAuth
-            process_env["GOOGLE_API_KEY"] = ""  # Explicitly clear any inherited Google key
-            process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
-            process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
-            process_env["HOME"] = tmp_config_dir  # Prevent looking up ~/.config or ~/.gemini
-            process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true" # Ensure it runs in headless mode
-            logger.debug("Strict Auth: Masked system-wide Google Cloud auth (ADC/OAuth), redirected HOME, and cleared GOOGLE_API_KEY.")
+            # Update usage metrics
+            self.usage_stats[tier]["calls"] += 1
+            in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
+            out_tokens = model_stats.get("candidates", 0)
 
-            # Add a small initial delay for the heavy tier to avoid hitting RPM limits
-            if tier == "heavy":
-                time.sleep(1)
-            
-            logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
+            self.usage_stats[tier]["in_tokens"] += in_tokens
+            self.usage_stats[tier]["out_tokens"] += out_tokens
+            self.usage_stats[tier]["in_chars"] += len(prompt)
+            self.usage_stats[tier]["out_chars"] += len(output)
 
-            cmd = [
-                "gemini", "--model", model_id, "--prompt", prompt,
-                "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
-                "--output-format", "json"
-            ]
+            if not output:
+                raise ValueError(f"Empty response from {tier}")
 
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
-            except Exception as e:
-                self.usage_stats[tier]["failed_attempts"] += 1
-                raise e
-            
-            try:
-                # Parse JSON output from gemini-cli
-                data = json.loads(result.stdout)
-                output = data.get("response", "").strip()
-                
-                # Extract stats if available
-                stats = data.get("stats", {}).get("models", {})
-                model_stats = {}
-                for k, v in stats.items():
-                    if model_id in k or k in model_id:
-                        model_stats = v.get("tokens", {})
-                        break
-                if not model_stats and stats:
-                    model_stats = next(iter(stats.values())).get("tokens", {})
+            logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
+            return output
 
-                # Update usage metrics
-                self.usage_stats[tier]["calls"] += 1
-                in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
-                out_tokens = model_stats.get("candidates", 0)
-                
-                self.usage_stats[tier]["in_tokens"] += in_tokens
-                self.usage_stats[tier]["out_tokens"] += out_tokens
-                
-                self.usage_stats[tier]["in_chars"] += len(prompt)
-                self.usage_stats[tier]["out_chars"] += len(output)
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
+            output = result.stdout.strip()
+            self.usage_stats[tier]["calls"] += 1
+            self.usage_stats[tier]["in_chars"] += len(prompt)
+            self.usage_stats[tier]["out_chars"] += len(output)
+            return output
 
-                if not output:
-                    raise ValueError(f"Empty response from {tier}")
-                    
-                logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
-                return output
+    def cleanup(self) -> None:
+        """Remove the cached config directory. Safe to call multiple times."""
+        import shutil
+        if self._config_dir and os.path.isdir(self._config_dir):
+            shutil.rmtree(self._config_dir, ignore_errors=True)
+        self._config_dir = None
 
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
-                output = result.stdout.strip()
-                self.usage_stats[tier]["calls"] += 1
-                self.usage_stats[tier]["in_chars"] += len(prompt)
-                self.usage_stats[tier]["out_chars"] += len(output)
-                return output
-        
-        finally:
-            # Clean up the temporary config directory
-            shutil.rmtree(tmp_config_dir, ignore_errors=True)
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
     def invoke(
         self,
