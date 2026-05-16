@@ -140,12 +140,26 @@ class BriefingCoordinator:
         return {"executive_summary": executive_summary, "emerging_themes": emerging_themes, "market_trend": market_trend}
 
     def _detect_emerging_themes(self, papers, blogs, news) -> List[str]:
-        if not self.llm.available: return []
-        top_p = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:3]
-        prompt = "Detect 2-3 emerging themes across these papers/news. Return ONLY a comma-separated list.\n"
-        for p in top_p: prompt += f"- {p.get('title')}\n"
-        res = self.llm.invoke(prompt, tier="light")
-        return [t.strip() for t in res.split(",")] if res else []
+        if not self.llm.available:
+            return []
+        top_papers = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)[:3]
+        top_blogs = blogs[:3]
+        top_news = news[:3]
+        if not (top_papers or top_blogs or top_news):
+            return []
+
+        lines = ["Detect 2-3 emerging themes across today's papers, blogs, and news.",
+                 "Return ONLY a comma-separated list of short theme phrases."]
+        for p in top_papers:
+            lines.append(f"- [paper] {p.get('title', '')}")
+        for b in top_blogs:
+            lines.append(f"- [blog] {b.get('title', '')}")
+        for n in top_news:
+            lines.append(f"- [news] {n.get('title', '')}")
+        res = self.llm.invoke("\n".join(lines), tier="light")
+        if not res:
+            return []
+        return [t.strip() for t in res.split(",") if t.strip()]
 
     def _generate_executive_summary(self, syntheses, themes, stocks) -> str:
         if not self.llm.available: return "LLM offline"
