@@ -24,7 +24,6 @@ from typing import Any
 
 import yaml
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # Try DeepXiv SDK first, fall back to legacy ArXiv API
@@ -358,7 +357,7 @@ def main() -> int:
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
-    logger.setLevel(getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
 
     config = load_config(args.config)
     topics = config.get("arxiv_topics", [])

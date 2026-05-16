@@ -22,7 +22,6 @@ from tenacity import (
     before_sleep_log
 )
 
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 

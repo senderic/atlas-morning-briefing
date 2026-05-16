@@ -19,7 +19,6 @@ try:
 except ImportError:
     HAS_BOTO3 = False
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 

@@ -18,7 +18,6 @@ import feedparser
 import yaml
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -178,8 +177,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Set log level
-    logger.setLevel(getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
 
     # Load config
     config = load_config(args.config)

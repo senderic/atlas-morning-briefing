@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from scripts.bedrock_client import BedrockClient
 from scripts.gemini_client import GeminiCLIClient
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 

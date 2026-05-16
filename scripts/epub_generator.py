@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 
 import markdown
 
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -188,6 +187,8 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="Output EPUB path")
     parser.add_argument("--title", default="Morning Briefing", help="Book title")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     try:
         with open(args.input, "r", encoding="utf-8") as f:
