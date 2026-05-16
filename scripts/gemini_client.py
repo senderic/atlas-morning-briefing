@@ -104,9 +104,11 @@ class GeminiCLIClient:
 
         # When True, query the live Gemini models.list endpoint at first
         # use and auto-populate fallback_models for any tier the user
-        # didn't fill in. Default True because the endpoint is fast and
-        # quota-free; flip to False if you'd rather pin model IDs by hand.
-        self.auto_discover_models = bool(config.get("auto_discover_models", True))
+        # didn't fill in. Default False — stick with just the primary
+        # model per tier and let tenacity's exponential backoff (90-450s
+        # for heavy) ride out 429s. Flip to True only if you want the
+        # client to also try alternate model variants on quota walls.
+        self.auto_discover_models = bool(config.get("auto_discover_models", False))
         self._discovery_attempted = False
 
         # Heavy-tier retry budget. 20 attempts × ~90-450s backoff ≈ 2-3 hours

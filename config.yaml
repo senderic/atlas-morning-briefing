@@ -200,17 +200,17 @@ gemini:
     heavy: "pro"
     medium: "flash"
     light: "flash-lite"
-  # On first use, the client queries the Gemini models.list endpoint
-  # (GET v1beta/models?key=...) with the first loaded API key and
-  # auto-populates fallback_models for any tier you didn't manually
-  # fill in. The endpoint is fast and uses no quota. Set to false if
-  # you'd rather pin model IDs by hand below.
-  auto_discover_models: true
+  # When true, queries the Gemini models.list endpoint
+  # (GET v1beta/models?key=...) on first use and auto-populates
+  # fallback_models for any tier you didn't manually fill in. Default
+  # false — stick with just pro/flash/flash-lite and let tenacity's
+  # exponential backoff ride out 429s. Flip to true if you want the
+  # client to also walk alternate model variants on persistent quota.
+  auto_discover_models: false
   # Alternate models tried IN ORDER when the primary model for a tier
-  # exhausts its retries before falling to the next tier. Each model has
-  # its own per-day RPD on Gemini free tier, so listing variants here
-  # dramatically extends daily headroom. Leave a tier empty to let
-  # auto-discovery populate it; fill it in to override.
+  # exhausts its retries, before falling to the next tier. Empty by
+  # default — only fill in with verified model IDs (or set
+  # auto_discover_models: true above to fill them in automatically).
   fallback_models:
     heavy: []
     medium: []

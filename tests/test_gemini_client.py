@@ -1071,9 +1071,11 @@ class TestModelDiscovery:
         assert "test-heavy" not in client.fallback_models["heavy"]
         assert client.fallback_models["heavy"] == ["gemini-2.5-pro"]
 
-    def test_auto_discover_happens_once_per_client(self, mock_config):
+    def test_auto_discover_happens_once_per_client_when_enabled(self, mock_config):
         """populate_fallback_models_from_discovery is invoked at most once
-        across many invoke() calls (cheap, but no need to repeat)."""
+        across many invoke() calls (cheap, but no need to repeat).
+        Requires explicit opt-in since auto-discover is off by default."""
+        mock_config["auto_discover_models"] = True
         client = GeminiCLIClient(mock_config)
         client._available = True
         client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
@@ -1085,8 +1087,14 @@ class TestModelDiscovery:
             client.invoke("p3", tier="medium")
         pop_mock.assert_called_once()
 
-    def test_auto_discover_can_be_disabled(self, mock_config):
-        """auto_discover_models=False suppresses the HTTP call entirely."""
+    def test_auto_discover_disabled_by_default(self, mock_config):
+        """Out-of-the-box, no HTTP call to v1beta/models is made."""
+        # mock_config doesn't set auto_discover_models -> default False.
+        client = GeminiCLIClient(mock_config)
+        assert client.auto_discover_models is False
+
+    def test_auto_discover_can_be_disabled_explicitly(self, mock_config):
+        """Setting auto_discover_models=False also suppresses the call."""
         mock_config["auto_discover_models"] = False
         client = GeminiCLIClient(mock_config)
         client._available = True
