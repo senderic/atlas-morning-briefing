@@ -188,6 +188,10 @@ gemini:
   max_calls_per_run: 50
   retry_wait_seconds: 61
   key_swap_delay: 5
+  # Heavy-tier retry budget. With 90-450s backoff, 20 attempts ≈ up to 2-3h
+  # of patient retrying — appropriate for unattended 4am cron runs that
+  # prefer eventual success over fast failure.
+  heavy_max_attempts: 20
   models:
     heavy: "pro"
     medium: "flash"

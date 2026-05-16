@@ -85,6 +85,10 @@ class GeminiCLIClient:
         self._tier_last_call: Dict[str, float] = {"heavy": 0.0, "medium": 0.0, "light": 0.0}
         self._call_lock = threading.Lock()
 
+        # Heavy-tier retry budget. 20 attempts × ~90-450s backoff ≈ 2-3 hours
+        # of patient retrying — appropriate for an unattended cron run.
+        self.heavy_max_attempts = int(config.get("heavy_max_attempts", 20))
+
         # Usage tracking
         self.usage_stats = {
             "heavy": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
@@ -349,9 +353,14 @@ class GeminiCLIClient:
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
-        # Ultra-persistence for the Heavy (Pro) model
-        # 12 attempts with longer wait can span ~1 hour
-        max_attempts = 12 if tier == "heavy" else 4
+        # Ultra-persistence for the Heavy (Pro) model. With min=90s and
+        # max=450s exponential backoff, 20 attempts can span ~2-3 hours of
+        # patient retries — well-suited for an unattended early-morning run
+        # that prefers eventual success over fast failure. Override via
+        # gemini.heavy_max_attempts in config.
+        max_attempts = (
+            int(self.heavy_max_attempts) if tier == "heavy" else 4
+        )
 
         def is_transient_error(exception):
             """Check if the error is worth retrying, and rotate key if quota hit."""
