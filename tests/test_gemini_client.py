@@ -944,6 +944,160 @@ class TestCrossCallKeyState:
                not client.__dict__.get("_exhausted_heavy_keys")
 
 
+class TestModelDiscovery:
+    """Verify the models.list integration: live model discovery, bucketing,
+    fallback population, and graceful failure modes."""
+
+    def _mock_models_response(self, base_ids):
+        """Build a fake v1beta/models payload from a list of base ids."""
+        return MagicMock(
+            status_code=200,
+            json=lambda: {
+                "models": [
+                    {
+                        "name": f"models/{bid}",
+                        "baseModelId": bid,
+                        "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    }
+                    for bid in base_ids
+                ]
+            },
+            raise_for_status=lambda: None,
+        )
+
+    def test_discover_models_buckets_by_substring(self, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["any_key"]
+        ids = [
+            "gemini-2.5-pro",
+            "gemini-2.0-pro-exp",
+            "gemini-1.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-1.5-flash-lite",
+            "text-embedding-004",  # no generateContent normally; we include it as gen here so test verifies bucket placement
+        ]
+        with patch("requests.get", return_value=self._mock_models_response(ids)):
+            buckets = client.discover_models()
+        assert "gemini-2.5-pro" in buckets["heavy"]
+        assert "gemini-2.0-pro-exp" in buckets["heavy"]
+        assert "gemini-1.5-pro" in buckets["heavy"]
+        assert "gemini-2.5-flash" in buckets["medium"]
+        assert "gemini-2.0-flash" in buckets["medium"]
+        # flash-lite must NOT be in the medium bucket — too specific.
+        assert "gemini-2.5-flash-lite" not in buckets["medium"]
+        assert "gemini-2.5-flash-lite" in buckets["light"]
+        assert "gemini-1.5-flash-lite" in buckets["light"]
+
+    def test_discover_models_filters_unsupported_methods(self, mock_config):
+        """Models without generateContent support must not be returned."""
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["k"]
+        payload = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "models": [
+                    {"baseModelId": "gemini-2.5-pro",
+                     "supportedGenerationMethods": ["generateContent"]},
+                    {"baseModelId": "text-embedding-004",
+                     "supportedGenerationMethods": ["embedContent"]},
+                ]
+            },
+            raise_for_status=lambda: None,
+        )
+        with patch("requests.get", return_value=payload):
+            buckets = client.discover_models()
+        assert buckets["heavy"] == ["gemini-2.5-pro"]
+        assert buckets["medium"] == []
+
+    def test_discover_models_returns_empty_on_network_failure(self, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["k"]
+        with patch("requests.get", side_effect=ConnectionError("no network")):
+            assert client.discover_models() == {}
+
+    def test_discover_models_returns_empty_on_http_error(self, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["k"]
+        def _raise():
+            raise RuntimeError("403 forbidden")
+        bad = MagicMock(raise_for_status=_raise)
+        with patch("requests.get", return_value=bad):
+            assert client.discover_models() == {}
+
+    def test_discover_models_returns_empty_when_no_api_key(self, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = []
+        with patch("requests.get") as get_mock:
+            result = client.discover_models()
+        assert result == {}
+        get_mock.assert_not_called()  # no HTTP call attempted
+
+    def test_populate_fallback_skips_user_filled_tiers(self, mock_config):
+        """Tiers the user filled in by hand must not be overwritten."""
+        mock_config["fallback_models"] = {
+            "heavy": ["gemini-2.5-pro-001"],  # user-set
+            "medium": [],
+            "light": [],
+        }
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["k"]
+        with patch.object(client, "discover_models",
+                          return_value={
+                              "heavy": ["gemini-2.5-pro", "gemini-1.5-pro"],
+                              "medium": ["gemini-2.5-flash"],
+                              "light": ["gemini-2.5-flash-lite"],
+                          }):
+            client.populate_fallback_models_from_discovery()
+        # Heavy was user-set — left as-is.
+        assert client.fallback_models["heavy"] == ["gemini-2.5-pro-001"]
+        # Medium and light were empty — filled in.
+        assert client.fallback_models["medium"] == ["gemini-2.5-flash"]
+        assert client.fallback_models["light"] == ["gemini-2.5-flash-lite"]
+
+    def test_populate_fallback_strips_primary_from_discovery(self, mock_config):
+        """The primary model id shouldn't appear in its own fallback list."""
+        client = GeminiCLIClient(mock_config)
+        client._api_keys = ["k"]
+        with patch.object(client, "discover_models",
+                          return_value={
+                              "heavy": ["test-heavy", "gemini-2.5-pro"],  # primary included
+                              "medium": [],
+                              "light": [],
+                          }):
+            client.populate_fallback_models_from_discovery()
+        # Primary "test-heavy" must be skipped.
+        assert "test-heavy" not in client.fallback_models["heavy"]
+        assert client.fallback_models["heavy"] == ["gemini-2.5-pro"]
+
+    def test_auto_discover_happens_once_per_client(self, mock_config):
+        """populate_fallback_models_from_discovery is invoked at most once
+        across many invoke() calls (cheap, but no need to repeat)."""
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        with patch.object(client, "populate_fallback_models_from_discovery") as pop_mock, \
+             patch("subprocess.run", return_value=MagicMock(
+                 returncode=0, stdout='{"response": "ok"}')):
+            client.invoke("p1", tier="medium")
+            client.invoke("p2", tier="medium")
+            client.invoke("p3", tier="medium")
+        pop_mock.assert_called_once()
+
+    def test_auto_discover_can_be_disabled(self, mock_config):
+        """auto_discover_models=False suppresses the HTTP call entirely."""
+        mock_config["auto_discover_models"] = False
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        with patch.object(client, "populate_fallback_models_from_discovery") as pop_mock, \
+             patch("subprocess.run", return_value=MagicMock(
+                 returncode=0, stdout='{"response": "ok"}')):
+            client.invoke("p", tier="medium")
+        pop_mock.assert_not_called()
+
+
 class TestApiKeyLoading:
     """Cover the env-var key loader paths."""
 

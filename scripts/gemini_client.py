@@ -102,6 +102,13 @@ class GeminiCLIClient:
         # a single key before we move on. Override via gemini.max_strikes_per_key.
         self.max_strikes_per_key = int(config.get("max_strikes_per_key", 3))
 
+        # When True, query the live Gemini models.list endpoint at first
+        # use and auto-populate fallback_models for any tier the user
+        # didn't fill in. Default True because the endpoint is fast and
+        # quota-free; flip to False if you'd rather pin model IDs by hand.
+        self.auto_discover_models = bool(config.get("auto_discover_models", True))
+        self._discovery_attempted = False
+
         # Heavy-tier retry budget. 20 attempts × ~90-450s backoff ≈ 2-3 hours
         # of patient retrying — appropriate for an unattended cron run.
         self.heavy_max_attempts = int(config.get("heavy_max_attempts", 20))
@@ -384,6 +391,96 @@ class GeminiCLIClient:
             self.usage_stats[tier]["out_chars"] += len(output)
             return output
 
+    # Google AI Studio model-listing endpoint. Same auth as gemini-cli's
+    # GEMINI_API_KEY; returns a `models` array with each entry's
+    # `baseModelId` (what we pass to --model) and supportedGenerationMethods.
+    _LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def discover_models(self, timeout: float = 10.0) -> Dict[str, List[str]]:
+        """List available Gemini models and bucket them by tier.
+
+        Uses GET v1beta/models with the first loaded API key. Returns a dict
+        with keys 'heavy' / 'medium' / 'light' mapped to lists of base model
+        ids in preference order (newest version first when discoverable).
+        Returns {} on any failure (network, auth, malformed response) — the
+        caller stays on its configured primary models.
+
+        This call is rate-limited cheaply (no quota cost), so it's safe to
+        run at client startup or on-demand before falling back. The result
+        is NOT cached on the instance; call once and store yourself if you
+        want to reuse.
+        """
+        if not self._api_keys:
+            logger.warning("discover_models: no API key available")
+            return {}
+        try:
+            import requests  # local import so unit tests don't need it
+            resp = requests.get(
+                self._LIST_MODELS_URL,
+                params={"key": self._api_keys[0]},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.warning(f"discover_models failed: {type(e).__name__}: {e}")
+            return {}
+
+        models = payload.get("models", []) or []
+        # Only keep models that actually support text generation.
+        usable: List[str] = []
+        for m in models:
+            methods = m.get("supportedGenerationMethods") or []
+            if "generateContent" not in methods:
+                continue
+            base = m.get("baseModelId") or m.get("name", "").rsplit("/", 1)[-1]
+            if base:
+                usable.append(base)
+        # Dedupe while keeping order, then bucket. flash-lite is more
+        # specific than flash, so check it first.
+        seen = set()
+        ordered = [b for b in usable if not (b in seen or seen.add(b))]
+        heavy = sorted(
+            (b for b in ordered if "pro" in b.lower()),
+            key=lambda s: s,
+            reverse=True,
+        )
+        flash_lite = sorted(
+            (b for b in ordered if "flash-lite" in b.lower() or "flash_lite" in b.lower()),
+            reverse=True,
+        )
+        flash = sorted(
+            (b for b in ordered if "flash" in b.lower() and b not in flash_lite),
+            reverse=True,
+        )
+        result = {"heavy": heavy, "medium": flash, "light": flash_lite}
+        logger.info(
+            f"discover_models: heavy={len(heavy)} medium={len(flash)} light={len(flash_lite)}"
+        )
+        return result
+
+    def populate_fallback_models_from_discovery(self) -> None:
+        """If fallback_models is empty for any tier, fill it from
+        discover_models(). Idempotent: tiers with user-configured lists are
+        left untouched. Safe to call from briefing setup so the run uses
+        every model the project actually has access to."""
+        discovered = self.discover_models()
+        if not discovered:
+            return
+        for tier in ("heavy", "medium", "light"):
+            if not self.fallback_models.get(tier):
+                # Skip the primary in the fallback list (we'll dedupe later
+                # too, but cleaner not to repeat ourselves).
+                primary = self.models.get(tier)
+                self.fallback_models[tier] = [
+                    m for m in discovered.get(tier, []) if m != primary
+                ]
+                if self.fallback_models[tier]:
+                    logger.info(
+                        f"Auto-discovered {tier} fallback models: "
+                        f"{', '.join(self.fallback_models[tier])}"
+                    )
+
     def cleanup(self) -> None:
         """Remove the cached config directory. Safe to call multiple times."""
         import shutil
@@ -429,6 +526,15 @@ class GeminiCLIClient:
                 f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}."
             )
             return None
+
+        # Lazily auto-discover available models on the first invoke(). Done
+        # once per client instance — the endpoint is fast and uses no quota.
+        if self.auto_discover_models and not self._discovery_attempted:
+            self._discovery_attempted = True
+            try:
+                self.populate_fallback_models_from_discovery()
+            except Exception as e:
+                logger.warning(f"Model auto-discovery skipped: {e}")
 
         # Build the candidate-model list for this tier: primary first, then any
         # configured fallback_models[tier] (de-duplicated, primary not repeated).
