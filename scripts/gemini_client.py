@@ -65,6 +65,10 @@ class GeminiCLIClient:
         self._available = None
         self._api_keys = self._load_api_keys()
         self._current_key_index = 0
+        # Cursor for per-call round-robin key selection on the heavy tier when
+        # multiple keys are loaded. Distinct from _current_key_index (which
+        # tracks the most recent rotation in response to an observed 429).
+        self._next_heavy_key = 0
         # Cached per-instance config dir (written once, reused across calls).
         self._config_dir: Optional[str] = None
 
@@ -221,12 +225,19 @@ class GeminiCLIClient:
         process_env = os.environ.copy()
         process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
 
-        # Ensure compatibility by setting both common API key environment variables
-        if tier == "heavy":
+        # Pick the API key. Heavy tier round-robins across all configured keys
+        # when there are multiple, so successive heavy calls naturally land on
+        # different keys instead of slamming one. Non-heavy tiers stick to key
+        # 0 (the original behavior — Flash quotas are looser).
+        if tier == "heavy" and len(self._api_keys) > 1:
+            with self._call_lock:
+                key_index = self._next_heavy_key
+                api_key = self._api_keys[key_index]
+                self._next_heavy_key = (self._next_heavy_key + 1) % len(self._api_keys)
+        elif tier == "heavy":
             api_key = self._get_current_key()
             key_index = self._current_key_index
         else:
-            # For non-heavy tiers, always stick to the first API key
             api_key = self._api_keys[0] if self._api_keys else None
             key_index = 0
 
@@ -374,6 +385,11 @@ class GeminiCLIClient:
                 
                 if is_quota:
                     if tier == "heavy":
+                        if len(self._api_keys) > 1:
+                            # Round-robin already lined up the next key for the
+                            # retry; skip the explicit rotation sleep.
+                            logger.info(f"Quota error on heavy tier; round-robin will pick the next key on retry.")
+                            return True
                         if self._rotate_key():
                             logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
                             return True
