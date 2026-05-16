@@ -114,8 +114,16 @@ class BriefingCoordinator:
             BlogsWorker(self.config, llm_client=self.llm),
             NewsMarketWorker(self.config, llm_client=self.llm),
         ]
+        # Honor config.max_workers (default 1). Serial execution avoids stacking
+        # concurrent gemini subprocess calls against the same per-key RPM cap;
+        # set higher only if you have plenty of API quota headroom.
+        max_workers = max(1, int(self.config.get("max_workers", 1)))
+        if max_workers == 1:
+            logger.info("Running workers serially (max_workers=1)")
+        else:
+            logger.info(f"Running workers with max_workers={max_workers}")
         findings = []
-        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(worker.execute): worker for worker in workers}
             for future in as_completed(futures):
                 worker = futures[future]
