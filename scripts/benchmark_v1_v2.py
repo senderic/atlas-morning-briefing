@@ -42,7 +42,7 @@ class BenchmarkRunner:
         self.config_path = config_path
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
-        self.bedrock = BedrockClient(self.config)
+        self.bedrock = BedrockClient(self.config.get("bedrock", {}))
 
     def run(self) -> Dict[str, Any]:
         """
@@ -278,6 +278,9 @@ Return ONLY a JSON object in this format (no markdown, no explanation):
 
         try:
             response = self.bedrock.invoke(prompt, tier="heavy")
+            if not response:
+                logger.error(f"Empty response from Bedrock judge for {version}")
+                return {"relevance": 0, "accuracy": 0, "insight": 0, "actionability": 0, "overall_score": 0}
 
             # Extract JSON from response
             import re
