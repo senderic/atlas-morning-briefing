@@ -19,8 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.news_aggregator import NewsAggregator
 from scripts.stock_fetcher import StockFetcher
-from scripts.bedrock_client import BedrockClient
-from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
@@ -31,14 +29,15 @@ logger = logging.getLogger(__name__)
 class NewsMarketWorker(BaseWorker):
     """Fetches and enriches news + stock data independently."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], llm_client: Any = None):
         """
         Initialize NewsMarketWorker.
 
         Args:
             config: Full configuration dictionary
+            llm_client: Optional shared LLM client; see BaseWorker.
         """
-        super().__init__(config, "news_market_worker")
+        super().__init__(config, "news_market_worker", llm_client=llm_client)
         self.news_queries = config.get("news_queries", [])
         self.stocks = config.get("stocks", [])
         self.max_news = config.get("max_news", 15)
@@ -72,13 +71,10 @@ class NewsMarketWorker(BaseWorker):
             stocks_found = len(stocks)
             logger.info(f"[{self.worker_name}] Fetched {stocks_found} stock prices")
 
-            # Step 3: Initialize intelligence layer for enrichment
-            gemini_config = self.config.get("gemini", {})
-            if gemini_config.get("enabled", False):
-                llm = GeminiCLIClient(gemini_config)
-            else:
-                llm = BedrockClient(self.config.get("bedrock", {}))
-                
+            # Step 3: Initialize intelligence layer for enrichment.
+            # Reuse the coordinator's shared client when available so call
+            # budgets and Gemini key-rotation state are honored once per run.
+            llm = self._get_llm_client()
             intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:

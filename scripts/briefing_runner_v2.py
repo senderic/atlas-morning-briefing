@@ -99,7 +99,11 @@ class BriefingCoordinator:
         return 0 if not failed_workers else 1
 
     def _spawn_workers(self) -> List[Dict[str, Any]]:
-        workers = [PapersWorker(self.config), BlogsWorker(self.config), NewsMarketWorker(self.config)]
+        workers = [
+            PapersWorker(self.config, llm_client=self.llm),
+            BlogsWorker(self.config, llm_client=self.llm),
+            NewsMarketWorker(self.config, llm_client=self.llm),
+        ]
         findings = []
         with ThreadPoolExecutor(max_workers=len(workers)) as executor:
             futures = {executor.submit(worker.execute): worker for worker in workers}

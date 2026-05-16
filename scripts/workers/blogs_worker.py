@@ -17,8 +17,6 @@ from typing import Any, Dict
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.blog_scanner import BlogScanner
-from scripts.bedrock_client import BedrockClient
-from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
@@ -29,14 +27,15 @@ logger = logging.getLogger(__name__)
 class BlogsWorker(BaseWorker):
     """Fetches and enriches blog posts independently."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], llm_client: Any = None):
         """
         Initialize BlogsWorker.
 
         Args:
             config: Full configuration dictionary
+            llm_client: Optional shared LLM client; see BaseWorker.
         """
-        super().__init__(config, "blogs_worker")
+        super().__init__(config, "blogs_worker", llm_client=llm_client)
         self.feeds = config.get("blog_feeds", [])
         self.days_back = 7
         self.max_blogs = config.get("max_blogs", 12)
@@ -72,13 +71,10 @@ class BlogsWorker(BaseWorker):
                     items_found=0
                 )
 
-            # Step 2: Initialize intelligence layer for enrichment
-            gemini_config = self.config.get("gemini", {})
-            if gemini_config.get("enabled", False):
-                llm = GeminiCLIClient(gemini_config)
-            else:
-                llm = BedrockClient(self.config.get("bedrock", {}))
-                
+            # Step 2: Initialize intelligence layer for enrichment.
+            # Reuse the coordinator's shared client when available so call
+            # budgets and Gemini key-rotation state are honored once per run.
+            llm = self._get_llm_client()
             intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:

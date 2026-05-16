@@ -18,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.arxiv_scanner import ArxivScanner
 from scripts.paper_scorer import PaperScorer
-from scripts.bedrock_client import BedrockClient
-from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
@@ -30,14 +28,15 @@ logger = logging.getLogger(__name__)
 class PapersWorker(BaseWorker):
     """Fetches and enriches ArXiv papers independently."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], llm_client: Any = None):
         """
         Initialize PapersWorker.
 
         Args:
             config: Full configuration dictionary
+            llm_client: Optional shared LLM client; see BaseWorker.
         """
-        super().__init__(config, "papers_worker")
+        super().__init__(config, "papers_worker", llm_client=llm_client)
         self.topics = config.get("arxiv_topics", [])
         self.days_back = config.get("arxiv_days_back", 3)
         self.max_papers = config.get("max_papers", 30)
@@ -73,13 +72,10 @@ class PapersWorker(BaseWorker):
                     items_found=0
                 )
 
-            # Step 2: Initialize intelligence layer for enrichment
-            gemini_config = self.config.get("gemini", {})
-            if gemini_config.get("enabled", False):
-                llm = GeminiCLIClient(gemini_config)
-            else:
-                llm = BedrockClient(self.config.get("bedrock", {}))
-                
+            # Step 2: Initialize intelligence layer for enrichment.
+            # Reuse the coordinator's shared client when available so call
+            # budgets and Gemini key-rotation state are honored once per run.
+            llm = self._get_llm_client()
             intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:
