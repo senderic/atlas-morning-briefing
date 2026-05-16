@@ -54,19 +54,31 @@ class NewsMarketWorker(BaseWorker):
         try:
             logger.info(f"[{self.worker_name}] Starting news and market data fetch")
 
-            # Get API keys from environment
+            # Get API keys from environment.
             brave_api_key = os.environ.get("BRAVE_API_KEY", "")
             finnhub_api_key = os.environ.get("FINNHUB_API_KEY", "")
 
-            # Step 1: Fetch news articles
-            news_aggregator = NewsAggregator(brave_api_key, self.news_queries, self.max_news)
-            news = news_aggregator.aggregate_all_queries()
+            # Step 1: Fetch news articles. Skip the call entirely if no key —
+            # NewsAggregator/Brave does not gate on an empty key and would
+            # produce one 401 per query.
+            if brave_api_key and self.news_queries:
+                news_aggregator = NewsAggregator(brave_api_key, self.news_queries, self.max_news)
+                news = news_aggregator.aggregate_all_queries()
+            else:
+                if not brave_api_key:
+                    logger.warning(f"[{self.worker_name}] BRAVE_API_KEY not set; skipping news fetch")
+                news = []
             news_found = len(news)
             logger.info(f"[{self.worker_name}] Fetched {news_found} news articles")
 
-            # Step 2: Fetch stock data
-            stock_fetcher = StockFetcher(finnhub_api_key, self.stocks)
-            stocks = stock_fetcher.fetch_all_stocks()
+            # Step 2: Fetch stock data. Same guard — skip rather than 401.
+            if finnhub_api_key and self.stocks:
+                stock_fetcher = StockFetcher(finnhub_api_key, self.stocks)
+                stocks = stock_fetcher.fetch_all_stocks()
+            else:
+                if not finnhub_api_key:
+                    logger.warning(f"[{self.worker_name}] FINNHUB_API_KEY not set; skipping stock fetch")
+                stocks = []
             stocks_found = len(stocks)
             logger.info(f"[{self.worker_name}] Fetched {stocks_found} stock prices")
 

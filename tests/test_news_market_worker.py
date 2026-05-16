@@ -55,6 +55,15 @@ def _patches(news, stocks):
     ]
 
 
+@pytest.fixture(autouse=True)
+def _provide_api_keys(monkeypatch):
+    """Most tests in this module assume keys are present; provide them by
+    default. Tests that specifically exercise the missing-key paths
+    delete them via their own monkeypatch.delenv calls."""
+    monkeypatch.setenv("BRAVE_API_KEY", "test-brave")
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-finnhub")
+
+
 def test_no_intelligence_returns_raw_data(base_config, fake_news, fake_stocks, stub_llm):
     intel = MagicMock()
     intel.available = False
@@ -169,6 +178,43 @@ def test_news_aggregator_failure_returns_error(base_config, stub_llm):
     assert finding["status"] == "error"
     assert "brave down" in finding["error"]
     assert finding["items"] == {"news": [], "stocks": []}
+
+
+def test_skips_brave_when_api_key_missing(base_config, fake_stocks, stub_llm, monkeypatch):
+    """No BRAVE_API_KEY → skip news fetch entirely (don't trigger 401s)."""
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.setenv("FINNHUB_API_KEY", "k")
+    intel = MagicMock()
+    intel.available = False
+    with patch("scripts.workers.news_market_worker.NewsAggregator") as news_agg_cls, \
+         patch("scripts.workers.news_market_worker.StockFetcher") as stock_cls, \
+         patch("scripts.workers.news_market_worker.BriefingIntelligence", return_value=intel):
+        stock_inst = MagicMock()
+        stock_inst.fetch_all_stocks.return_value = fake_stocks
+        stock_cls.return_value = stock_inst
+        finding = NewsMarketWorker(base_config, llm_client=stub_llm).execute()
+    # NewsAggregator should NOT have been constructed at all.
+    news_agg_cls.assert_not_called()
+    assert finding["items"]["news"] == []
+    assert finding["items"]["stocks"] == fake_stocks
+
+
+def test_skips_finnhub_when_api_key_missing(base_config, fake_news, stub_llm, monkeypatch):
+    """No FINNHUB_API_KEY → skip stock fetch entirely (don't trigger 401s)."""
+    monkeypatch.setenv("BRAVE_API_KEY", "k")
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    intel = MagicMock()
+    intel.available = False
+    with patch("scripts.workers.news_market_worker.NewsAggregator") as news_agg_cls, \
+         patch("scripts.workers.news_market_worker.StockFetcher") as stock_cls, \
+         patch("scripts.workers.news_market_worker.BriefingIntelligence", return_value=intel):
+        news_inst = MagicMock()
+        news_inst.aggregate_all_queries.return_value = fake_news
+        news_agg_cls.return_value = news_inst
+        finding = NewsMarketWorker(base_config, llm_client=stub_llm).execute()
+    stock_cls.assert_not_called()
+    assert finding["items"]["news"] == fake_news
+    assert finding["items"]["stocks"] == []
 
 
 def test_synthesis_describes_market_state(
