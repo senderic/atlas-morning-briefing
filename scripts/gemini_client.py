@@ -417,10 +417,26 @@ class GeminiCLIClient:
         # Cap retries on subprocess hangs separately. Each TimeoutExpired
         # already cost the full 900s subprocess timeout — letting it consume
         # the full heavy_max_attempts budget would mean up to 20*15min=5h on
-        # network black-holing alone, with no chance of recovery. The
-        # _timeout_retries counter is consumed inside is_transient_error.
+        # network black-holing alone, with no chance of recovery.
         max_timeout_retries = 3
         timeout_retry_state = {"count": 0}
+        # Track hard-quota strikes for this logical call so a single key's
+        # RPD wall doesn't abort the whole call when other keys may still
+        # have headroom. Each strike advances round-robin to the next key.
+        hard_quota_state = {"count": 0}
+        # Per-tier siblings to try before giving up. For heavy with multiple
+        # keys, every key gets a chance against its own per-key RPD. For
+        # non-heavy (always key 0) and single-key heavy, one strike = abort.
+        max_hard_quota_attempts = (
+            len(self._api_keys) if (tier == "heavy" and len(self._api_keys) > 1) else 1
+        )
+
+        def _trim_error(msg: str, head: int = 80, tail: int = 280) -> str:
+            """Capture both ends of the error. Real reason is usually at the
+            tail; head helps identify the source (which model/key)."""
+            if len(msg) <= head + tail:
+                return msg
+            return f"{msg[:head]} ... {msg[-tail:]}"
 
         def is_transient_error(exception):
             """Decide whether to retry; rotate key on quota when appropriate."""
@@ -443,45 +459,58 @@ class GeminiCLIClient:
                 msg = str(exception).lower()
                 return msg.startswith("empty response from")
             if isinstance(exception, subprocess.CalledProcessError):
-                # Check both stderr and stdout for error messages
+                # Capture both stderr and stdout. CLI startup warnings often
+                # land in stdout/early stderr while the real error message
+                # arrives at the tail, so retain both ends when logging.
                 error_msg = ""
                 if exception.stderr:
                     error_msg += exception.stderr
                 if exception.stdout:
                     error_msg += exception.stdout
-                
+
                 if not error_msg:
                     error_msg = str(exception)
-                
-                error_msg = error_msg.lower()
-                
+
+                lower_msg = error_msg.lower()
+
                 # Keywords for typical transient errors (network + quota)
                 network_keywords = ["fetch failed", "connection", "econnrefused", "econnreset", "etimedout", "enetunreach", "socket hang up"]
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
-                # Keywords that usually mean a hard daily stop
-                hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
+                # Keywords that usually mean a hard daily stop. "terminalquotaerror"
+                # is the explicit class name gemini-cli emits when the API
+                # returns code=8 RESOURCE_EXHAUSTED with isTerminal=true.
+                hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded", "terminalquotaerror"]
 
-                # Network errors are always transient and worth retrying
-                if any(kw in error_msg for kw in network_keywords):
+                if any(kw in lower_msg for kw in network_keywords):
                     logger.info(f"Network error detected for tier {tier}. Retrying...")
                     return True
 
-                is_hard_quota = any(kw in error_msg for kw in hard_quota_keywords)
-                is_soft_quota = any(kw in error_msg for kw in quota_keywords)
+                is_hard_quota = any(kw in lower_msg for kw in hard_quota_keywords)
+                is_soft_quota = any(kw in lower_msg for kw in quota_keywords)
                 is_quota = is_hard_quota or is_soft_quota
 
                 if not is_quota:
                     return False
 
-                # Hard quota gate runs FIRST and applies to every tier and
-                # every key configuration. Once daily RPD is gone, no amount
-                # of rotation or backoff will help — burning the rest of the
-                # retry budget just delays the inevitable failure by hours.
-                # `ignore_hard_quota` is an opt-in escape hatch for users who
-                # know their quota error wording produces false positives.
+                # Hard-quota gate. RPD is per-key on the Gemini free tier, so
+                # one key hitting the daily wall doesn't mean siblings are
+                # exhausted. For multi-key heavy, try every key once before
+                # declaring the tier done. For single-key heavy or non-heavy
+                # (always key 0), one strike = abort.
                 if is_hard_quota and not self.ignore_hard_quota:
+                    hard_quota_state["count"] += 1
+                    if hard_quota_state["count"] < max_hard_quota_attempts:
+                        logger.info(
+                            f"Hard quota on tier {tier} key (strike "
+                            f"{hard_quota_state['count']}/{max_hard_quota_attempts}); "
+                            "round-robin will pick the next key. msg: "
+                            f"{_trim_error(error_msg)}"
+                        )
+                        return True
                     logger.warning(
-                        f"Hard quota reached for {tier} (msg: {error_msg[:120]}). "
+                        f"Hard quota reached on tier {tier} after trying "
+                        f"{hard_quota_state['count']}/{max_hard_quota_attempts} "
+                        f"key(s). msg: {_trim_error(error_msg)}. "
                         "Aborting retries; raise ignore_hard_quota=true in config "
                         "if this matched in error and you want to keep trying."
                     )

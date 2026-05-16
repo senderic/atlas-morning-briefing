@@ -489,13 +489,15 @@ class TestHardQuotaGate:
     """Verify hard-daily-quota errors abort retries on every code path."""
 
     @patch("subprocess.run")
-    def test_hard_quota_aborts_multi_key_heavy(self, mock_run, mock_config):
-        """Multi-key heavy was previously bypassing the hard-quota gate."""
+    def test_hard_quota_tries_all_heavy_keys_before_aborting(self, mock_run, mock_config):
+        """Each key has its own RPD on free tier, so we try every loaded key
+        once before declaring the tier done. After N strikes (where N is the
+        number of configured keys), abort."""
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2,k3"}, clear=True):
             client = GeminiCLIClient(mock_config)
             client._available = True
             client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
-            client.heavy_max_attempts = 5  # cap so test fails fast on regression
+            client.heavy_max_attempts = 20  # plenty of headroom
             client.ignore_hard_quota = False
 
             mock_run.side_effect = subprocess.CalledProcessError(
@@ -505,7 +507,67 @@ class TestHardQuotaGate:
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="heavy", allow_fallback=False)
             assert result is None
-            # Aborted on first attempt — no retries.
+            # 3 keys → 3 attempts → abort.
+            assert mock_run.call_count == 3
+
+    @patch("subprocess.run")
+    def test_hard_quota_aborts_single_key_heavy_immediately(self, mock_run, mock_config):
+        """Only one key configured: no sibling to try, so one strike = abort."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, ["gemini"], stderr="429: daily quota exceeded"
+            )
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result is None
+            assert mock_run.call_count == 1
+
+    @patch("subprocess.run")
+    def test_hard_quota_succeeds_when_second_key_has_headroom(self, mock_run, mock_config):
+        """If key 1 is RPD'd but key 2 still has quota, we succeed on retry."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "exhausted,fresh"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror: daily limit"),
+                MagicMock(returncode=0, stdout='{"response": "from fresh key"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result == "from fresh key"
+            assert mock_run.call_count == 2
+            # First attempt used k1, retry used k2 (round-robin advanced).
+            assert mock_run.call_args_list[0][1]["env"]["GEMINI_API_KEY"] == "exhausted"
+            assert mock_run.call_args_list[1][1]["env"]["GEMINI_API_KEY"] == "fresh"
+
+    @patch("subprocess.run")
+    def test_hard_quota_terminalquotaerror_keyword_matched(self, mock_run, mock_config):
+        """The exact production log keyword 'TerminalQuotaError' is recognized."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, ["gemini"],
+                # Real wording observed in production logs.
+                stderr="warning: 256-color support not detected\nTerminalQuotaError: You have exhausted your daily quota on this model.",
+            )
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result is None
             assert mock_run.call_count == 1
 
     @patch("subprocess.run")
