@@ -89,13 +89,13 @@ class NewsMarketWorker(BaseWorker):
             # Step 4: Rank and summarize news with LLM
             logger.info(f"[{self.worker_name}] Enriching news with LLM")
             topics = self.config.get("arxiv_topics", [])
+            tokens_before = self._count_client_tokens(llm)
             news = intelligence.rank_and_summarize_news(news, topics)
-            token_count += len(news) * 400  # ~400 tokens per news item
 
             # Step 5: Correlate stocks and news
             logger.info(f"[{self.worker_name}] Correlating stocks with news")
             stocks = intelligence.correlate_stocks_and_news(stocks, news)
-            token_count += len(stocks) * 300  # ~300 tokens per stock correlation
+            token_count = max(0, self._count_client_tokens(llm) - tokens_before)
 
             # Step 6: Trim to top news. rank_and_summarize_news already returns the
             # LLM's top picks in ranked order and does not assign a numeric score,

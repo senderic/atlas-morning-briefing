@@ -89,10 +89,9 @@ class BlogsWorker(BaseWorker):
             # Step 3: Rank and summarize blogs with LLM
             logger.info(f"[{self.worker_name}] Enriching blogs with LLM")
             topics = self.config.get("arxiv_topics", [])
+            tokens_before = self._count_client_tokens(llm)
             blogs = intelligence.rank_and_summarize_blogs(blogs, topics)
-
-            # Estimate token usage: ~400 tokens per blog for ranking/summarization
-            token_count = len(blogs) * 400
+            token_count = max(0, self._count_client_tokens(llm) - tokens_before)
 
             # Step 4: Filter to top blogs. Only apply the score gate when scores
             # are present (intelligence layer sets score_combined on ranked items);

@@ -101,11 +101,10 @@ class PapersWorker(BaseWorker):
 
             # Step 4: Semantic scoring and summarization
             logger.info(f"[{self.worker_name}] Enriching papers with LLM")
+            tokens_before = self._count_client_tokens(llm)
             papers = intelligence.summarize_papers(papers)
             papers = intelligence.score_papers_semantically(papers, self.topics)
-
-            # Estimate token usage (rough): ~500 tokens per paper for summarization
-            token_count = len(papers) * 500
+            token_count = max(0, self._count_client_tokens(llm) - tokens_before)
 
             # Step 5: Final scoring (combines TF-IDF + semantic)
             weights = self.config.get("paper_scoring", {})
