@@ -89,7 +89,12 @@ class BriefingCoordinator:
         epub_path = self._generate_epub(briefing_content, output_filename)
 
         if not self.dry_run:
-            self._distribute(briefing_content, output_filename, pdf_path, epub_path)
+            self._distribute(
+                briefing_content,
+                output_filename,
+                str(pdf_path) if pdf_path else None,
+                str(epub_path) if epub_path else None,
+            )
 
         self._update_memory(synthesis, papers, blogs, news, stocks)
         self._save_state(papers, blogs, news)
@@ -182,23 +187,42 @@ class BriefingCoordinator:
                 content += f"### {b.get('title', '')}{source_tag}\n\n{summary}\n\n[Read more]({link})\n\n"
         return content
 
-    def _generate_pdf(self, content, filename) -> Path:
-        path = f"{filename}.pdf"; logger.info(f"Generating PDF: {path}")
-        PDFGenerator(page_format=self.config.get("output_format", "kindle")).generate_pdf(content, path)
+    def _generate_pdf(self, content, filename):
+        pdf_cfg = self.config.get("pdf", {})
+        if not pdf_cfg.get("enabled", True):
+            logger.info("PDF generation disabled via config")
+            return None
+        path = f"{filename}.pdf"
+        logger.info(f"Generating PDF: {path}")
+        generator = PDFGenerator(
+            page_format=self.config.get("output_format", "kindle"),
+            font_size=pdf_cfg.get("font_size", 10),
+            line_spacing=pdf_cfg.get("line_spacing", 1.5),
+            include_toc=pdf_cfg.get("include_toc", True),
+        )
+        generator.generate_pdf(content, path)
         return Path(path)
 
-    def _generate_epub(self, content, filename) -> Path:
-        path = f"{filename}.epub"; logger.info(f"Generating EPUB: {path}")
+    def _generate_epub(self, content, filename):
+        path = f"{filename}.epub"
+        logger.info(f"Generating EPUB: {path}")
         EPUBGenerator(title=filename).generate_epub(content, path)
         return Path(path)
 
     def _distribute(self, content, filename, pdf_path, epub_path):
+        gmail_user = os.environ.get("GMAIL_USER", "")
+        gmail_password = os.environ.get("GMAIL_APP_PASSWORD", "")
+        if not gmail_user or not gmail_password:
+            logger.warning(
+                "Skipping distribution: GMAIL_USER or GMAIL_APP_PASSWORD not set"
+            )
+            return
         logger.info("Distributing briefing")
         distributor = EmailDistributor(
-            sender_email=os.environ.get("GMAIL_USER", ""),
-            sender_password=os.environ.get("GMAIL_APP_PASSWORD", "")
+            sender_email=gmail_user,
+            sender_password=gmail_password,
         )
-        distributor.distribute(self.config, content, str(pdf_path), str(epub_path), filename)
+        distributor.distribute(self.config, content, pdf_path, epub_path, filename)
 
     def _get_output_filename(self) -> str:
         now = datetime.now(timezone.utc)
