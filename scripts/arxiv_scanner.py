@@ -319,20 +319,23 @@ class ArxivScanner:
 
 
 def create_scanner(topics: list[str], days_back: int = 7, max_results: int = 20):
-    """Create the best available scanner (DeepXiv > legacy ArXiv API)."""
-    if HAS_DEEPXIV:
+    """Create the best available scanner.
+
+    Prefers DeepXiv when both the SDK is installed AND a token is reachable
+    (env var or ~/.env); otherwise falls back to the legacy ArXiv API
+    scanner. This avoids letting DeepXivReader raise on an empty token.
+    """
+    if HAS_DEEPXIV and _load_deepxiv_token():
         return DeepXivScanner(topics=topics, days_back=days_back, max_results=max_results)
+    if HAS_DEEPXIV:
+        logger.warning("DeepXiv SDK installed but no DEEPXIV_TOKEN found; using legacy ArXiv API")
     return ArxivScanner(topics=topics, days_back=days_back, max_results=max_results)
 
 
-# Keep old class name as alias for backwards compatibility
-# (briefing_runner.py imports ArxivScanner directly)
-if HAS_DEEPXIV:
-    # When DeepXiv is available, ArxivScanner points to DeepXiv
-    LegacyArxivScanner = ArxivScanner
-    ArxivScanner = DeepXivScanner  # type: ignore[misc]
-else:
-    LegacyArxivScanner = ArxivScanner
+# Export the legacy scanner under its original name for tests that need
+# to exercise the ArXiv XML parsing path directly. Production code should
+# use create_scanner() rather than importing either class.
+LegacyArxivScanner = ArxivScanner
 
 
 def load_config(config_path: str) -> dict[str, Any]:

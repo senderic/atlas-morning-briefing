@@ -26,7 +26,7 @@ import yaml
 # Ensure scripts directory is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import create_scanner
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
 from scripts.news_aggregator import NewsAggregator
@@ -94,7 +94,7 @@ class BriefingRunner:
                 logger.warning("No arxiv_topics configured, skipping")
                 return []
 
-            scanner = ArxivScanner(
+            scanner = create_scanner(
                 topics=topics,
                 days_back=days_back,
                 max_results=max_papers,

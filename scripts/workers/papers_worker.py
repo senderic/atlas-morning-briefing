@@ -16,7 +16,7 @@ from typing import Any, Dict
 # Ensure scripts directory is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import create_scanner
 from scripts.paper_scorer import PaperScorer
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
@@ -53,11 +53,11 @@ class PapersWorker(BaseWorker):
         try:
             logger.info(f"[{self.worker_name}] Starting ArXiv paper scan")
 
-            # Step 1: Fetch papers from ArXiv
-            scanner = ArxivScanner(
+            # Step 1: Fetch papers from ArXiv (DeepXiv when available + tokened)
+            scanner = create_scanner(
                 topics=self.topics,
                 days_back=self.days_back,
-                max_results=self.max_papers
+                max_results=self.max_papers,
             )
             papers = scanner.scan_all_topics()
             items_found = len(papers)
