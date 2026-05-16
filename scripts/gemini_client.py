@@ -57,6 +57,17 @@ class GeminiCLIClient:
             "medium": models_config.get("medium", self.DEFAULT_MODELS["medium"]),
             "light": models_config.get("light", self.DEFAULT_MODELS["light"]),
         }
+        # Per-tier alternate models to try BEFORE falling to the next tier
+        # when the primary model exhausts its retries. Each entry on this
+        # list has its own per-day RPD quota, so when gemini-2.5-pro is
+        # exhausted for the day, gemini-2.0-pro and gemini-1.5-pro may
+        # still have headroom. List order = try order.
+        fallbacks_config = config.get("fallback_models", {}) or {}
+        self.fallback_models = {
+            "heavy": list(fallbacks_config.get("heavy", [])),
+            "medium": list(fallbacks_config.get("medium", [])),
+            "light": list(fallbacks_config.get("light", [])),
+        }
 
         self.max_calls = config.get("max_calls_per_run", 50)
         self.retry_wait_seconds = config.get("retry_wait_seconds", 61)
@@ -84,6 +95,10 @@ class GeminiCLIClient:
         }
         self._tier_last_call: Dict[str, float] = {"heavy": 0.0, "medium": 0.0, "light": 0.0}
         self._call_lock = threading.Lock()
+        # Per-run memory of keys that hit hard-quota on heavy tier. Subsequent
+        # heavy calls in the same run skip these instead of repeating the same
+        # mistake (and burning the per-key wait budget). Reset by cleanup().
+        self._exhausted_heavy_keys: set = set()
 
         # Heavy-tier retry budget. 20 attempts × ~90-450s backoff ≈ 2-3 hours
         # of patient retrying — appropriate for an unattended cron run.
@@ -240,21 +255,40 @@ class GeminiCLIClient:
         process_env = os.environ.copy()
         process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
 
-        # Pick the API key. Heavy tier round-robins across all configured keys
-        # when there are multiple, so successive heavy calls naturally land on
-        # different keys instead of slamming one. Non-heavy tiers stick to key
-        # 0 (the original behavior — Flash quotas are looser).
+        # Pick the API key. Heavy tier round-robins across all NON-EXHAUSTED
+        # keys — keys that hit hard-quota earlier in the same run stay
+        # blacklisted in self._exhausted_heavy_keys so we don't waste another
+        # attempt on them. Non-heavy tiers stick to key 0 (Flash RPD is huge).
         if tier == "heavy" and len(self._api_keys) > 1:
             with self._call_lock:
-                key_index = self._next_heavy_key
-                api_key = self._api_keys[key_index]
-                self._next_heavy_key = (self._next_heavy_key + 1) % len(self._api_keys)
+                n = len(self._api_keys)
+                api_key = None
+                key_index = None
+                for offset in range(n):
+                    candidate = (self._next_heavy_key + offset) % n
+                    if candidate not in self._exhausted_heavy_keys:
+                        api_key = self._api_keys[candidate]
+                        key_index = candidate
+                        self._next_heavy_key = (candidate + 1) % n
+                        break
+                if api_key is None:
+                    # Every loaded key has been exhausted earlier in this run.
+                    # Bail out of THIS subprocess immediately so the caller
+                    # can fall through to alternate models / next tier
+                    # without waiting through tenacity backoff.
+                    raise RuntimeError(
+                        f"All {n} Gemini keys exhausted on heavy tier this run; "
+                        "give up on heavy and let tier fallback take over."
+                    )
         elif tier == "heavy":
             api_key = self._get_current_key()
             key_index = self._current_key_index
         else:
             api_key = self._api_keys[0] if self._api_keys else None
             key_index = 0
+        # Remember which key this attempt used so is_transient_error can
+        # blacklist it on a hard-quota response.
+        self._last_used_key_idx = key_index
 
         if api_key:
             process_env["GEMINI_API_KEY"] = api_key
@@ -349,8 +383,15 @@ class GeminiCLIClient:
             return output
 
         except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Failed to parse JSON response from gemini-cli: {e}")
-            output = result.stdout.strip()
+            raw_stdout = (result.stdout or "").strip()
+            stdout_preview = raw_stdout[:400].replace("\n", " ")
+            stderr_preview = (result.stderr or "").strip()[:400].replace("\n", " ")
+            logger.warning(
+                f"Failed to parse JSON response from gemini-cli (tier={tier}, "
+                f"model={model_id}): {type(e).__name__}: {e}. "
+                f"stdout[0:400]={stdout_preview!r}; stderr[0:400]={stderr_preview!r}"
+            )
+            output = raw_stdout
             self.usage_stats[tier]["calls"] += 1
             self.usage_stats[tier]["in_chars"] += len(prompt)
             self.usage_stats[tier]["out_chars"] += len(output)
@@ -402,7 +443,17 @@ class GeminiCLIClient:
             )
             return None
 
-        model_id = self.models.get(tier, self.models["medium"])
+        # Build the candidate-model list for this tier: primary first, then any
+        # configured fallback_models[tier] (de-duplicated, primary not repeated).
+        # Each entry is its own model id with its own per-day RPD on Gemini
+        # free tier, so when gemini-2.5-pro is RPD'd we still have a shot at
+        # gemini-2.0-pro or gemini-1.5-pro before falling to medium.
+        primary_model = self.models.get(tier, self.models["medium"])
+        candidates = [primary_model]
+        for alt in self.fallback_models.get(tier, []):
+            if alt and alt not in candidates:
+                candidates.append(alt)
+
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         # Ultra-persistence for the Heavy (Pro) model. With min=90s and
@@ -440,6 +491,10 @@ class GeminiCLIClient:
 
         def is_transient_error(exception):
             """Decide whether to retry; rotate key on quota when appropriate."""
+            if isinstance(exception, RuntimeError) and "exhausted" in str(exception).lower():
+                # _execute_command's "all keys exhausted" signal: don't retry,
+                # just propagate so the model/tier fallback takes over.
+                return False
             if isinstance(exception, subprocess.TimeoutExpired):
                 if timeout_retry_state["count"] >= max_timeout_retries:
                     logger.warning(
@@ -492,18 +547,24 @@ class GeminiCLIClient:
                 if not is_quota:
                     return False
 
-                # Hard-quota gate. RPD is per-key on the Gemini free tier, so
-                # one key hitting the daily wall doesn't mean siblings are
-                # exhausted. For multi-key heavy, try every key once before
-                # declaring the tier done. For single-key heavy or non-heavy
-                # (always key 0), one strike = abort.
+                # Hard-quota gate. RPD is per-key per-model on the Gemini
+                # free tier, so one key hitting the daily wall doesn't mean
+                # siblings are exhausted. For multi-key heavy, blacklist the
+                # offending key for the rest of the run and try the next one.
+                # For single-key heavy or non-heavy, one strike = abort
+                # (let alternate-model / next-tier fallback take over).
                 if is_hard_quota and not self.ignore_hard_quota:
+                    last_idx = getattr(self, "_last_used_key_idx", None)
+                    if tier == "heavy" and last_idx is not None:
+                        with self._call_lock:
+                            self._exhausted_heavy_keys.add(last_idx)
                     hard_quota_state["count"] += 1
                     if hard_quota_state["count"] < max_hard_quota_attempts:
                         logger.info(
-                            f"Hard quota on tier {tier} key (strike "
-                            f"{hard_quota_state['count']}/{max_hard_quota_attempts}); "
-                            "round-robin will pick the next key. msg: "
+                            f"Hard quota on tier {tier} key idx={last_idx} "
+                            f"(strike {hard_quota_state['count']}/"
+                            f"{max_hard_quota_attempts}); blacklisting key for "
+                            "this run and rotating to the next. msg: "
                             f"{_trim_error(error_msg)}"
                         )
                         return True
@@ -511,8 +572,8 @@ class GeminiCLIClient:
                         f"Hard quota reached on tier {tier} after trying "
                         f"{hard_quota_state['count']}/{max_hard_quota_attempts} "
                         f"key(s). msg: {_trim_error(error_msg)}. "
-                        "Aborting retries; raise ignore_hard_quota=true in config "
-                        "if this matched in error and you want to keep trying."
+                        "Aborting retries on this model; will try alternate "
+                        "models / next tier."
                     )
                     return False
 
@@ -541,51 +602,62 @@ class GeminiCLIClient:
                 return True
             return False
 
-        try:
-            # Smarter Wait Strategy:
-            # For Heavy tier, we start with a 90s floor to clear 60s RPM windows.
-            # Max wait of 450s (7.5m) to clear larger sliding windows.
-            wait_strategy = wait_random_exponential(
-                multiplier=60 if tier == "heavy" else 30, 
-                min=90 if tier == "heavy" else 60, 
-                max=450 if tier == "heavy" else 300
-            )
+        # Walk the same-tier candidate models. Each model gets its own retry
+        # budget (timeout + hard-quota + soft-quota). Reset the per-call
+        # counters between candidates so a quota-exhausted gemini-2.5-pro
+        # doesn't poison the budget for gemini-2.0-pro.
+        last_exception: Optional[Exception] = None
+        for model_id in candidates:
+            timeout_retry_state["count"] = 0
+            hard_quota_state["count"] = 0
+            if model_id != primary_model:
+                logger.info(
+                    f"--- Trying alternate {tier}-tier model: {model_id} ---"
+                )
+            try:
+                wait_strategy = wait_random_exponential(
+                    multiplier=60 if tier == "heavy" else 30,
+                    min=90 if tier == "heavy" else 60,
+                    max=450 if tier == "heavy" else 300,
+                )
 
-            @retry(
-                stop=stop_after_attempt(max_attempts),
-                wait=wait_strategy,
-                retry=retry_if_exception(is_transient_error),
-                before_sleep=before_sleep_log(logger, logging.INFO),
-                reraise=True
-            )
-            def retry_call():
-                return self._execute_command(model_id, full_prompt, tier)
+                @retry(
+                    stop=stop_after_attempt(max_attempts),
+                    wait=wait_strategy,
+                    retry=retry_if_exception(is_transient_error),
+                    before_sleep=before_sleep_log(logger, logging.INFO),
+                    reraise=True,
+                )
+                def retry_call():
+                    return self._execute_command(model_id, full_prompt, tier)
 
-            # Successful logical call — increment budget once, atomically.
-            result = retry_call()
-            if result:
-                with self._call_lock:
-                    self._call_count += 1
-            return result
+                result = retry_call()
+                if result:
+                    with self._call_lock:
+                        self._call_count += 1
+                    return result
+            except Exception as e:
+                last_exception = e
+                error_detail = str(e)
+                if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                    error_detail += f" | stderr: {e.stderr.strip()}"
+                logger.error(
+                    f"Model {model_id} (tier {tier}) failed after retries: "
+                    f"{error_detail}"
+                )
+                # Continue to next candidate model in this tier.
+                continue
 
-        except Exception as e:
-            # Capture more detail in the error log
-            error_detail = str(e)
-            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
-                error_detail += f" | stderr: {e.stderr.strip()}"
-            
-            logger.error(f"All attempts for tier {tier} failed after {max_attempts-1} retries: {error_detail}")
-            
-            # Recursive fallback for both timeout and other failures
-            if allow_fallback:
-                next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
-                if next_tier:
-                    logger.info(f"--- Falling back from {tier} to {next_tier} ---")
-                    return self.invoke(
-                        prompt, tier=next_tier, max_tokens=max_tokens,
-                        temperature=temperature, system_prompt=system_prompt,
-                        allow_fallback=True
-                    )
+        # Every same-tier model exhausted. Recurse into the next tier.
+        if allow_fallback:
+            next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
+            if next_tier:
+                logger.info(f"--- Falling back from {tier} to {next_tier} ---")
+                return self.invoke(
+                    prompt, tier=next_tier, max_tokens=max_tokens,
+                    temperature=temperature, system_prompt=system_prompt,
+                    allow_fallback=True,
+                )
 
         return None
 

@@ -295,7 +295,11 @@ class ArxivScanner:
                 })
             return papers
         except Exception as e:
-            logger.error(f"Failed to parse ArXiv XML: {e}")
+            snippet = xml_content[:300].replace("\n", " ") if xml_content else ""
+            logger.error(
+                f"Failed to parse ArXiv XML: {type(e).__name__}: {e}. "
+                f"Payload prefix: {snippet!r}"
+            )
             return []
 
     def scan_all_topics(self) -> list[dict[str, Any]]:

@@ -200,6 +200,23 @@ gemini:
     heavy: "pro"
     medium: "flash"
     light: "flash-lite"
+  # Alternate models tried IN ORDER when the primary model for a tier
+  # exhausts its retries before falling to the next tier. Each model has
+  # its own per-day RPD on Gemini free tier, so when gemini-2.5-pro is
+  # RPD'd you still get a shot at gemini-2.0-pro / gemini-1.5-pro before
+  # downgrading to Flash. Leave empty to use only the primary model.
+  fallback_models:
+    heavy:
+      - "gemini-2.5-pro"
+      - "gemini-2.0-pro-exp"
+      - "gemini-1.5-pro"
+    medium:
+      - "gemini-2.5-flash"
+      - "gemini-2.0-flash"
+      - "gemini-1.5-flash"
+    light:
+      - "gemini-2.5-flash-lite"
+      - "gemini-2.0-flash-lite"
   # Minimum seconds between successive calls per tier. Defaults are sized for
   # Pro free tier (~2 RPM heavy, looser on Flash). Lower if you have paid
   # quota or multiple keys; raise if you're seeing 429s. Set to 0 to disable.

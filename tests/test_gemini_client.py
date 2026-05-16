@@ -752,6 +752,158 @@ class TestEnvVarHandling:
             assert required in cmd, f"missing flag/value: {required}"
 
 
+class TestFallbackModelChain:
+    """Verify alternate-model fallback within a tier and across tiers."""
+
+    @patch("subprocess.run")
+    def test_alternate_model_tried_when_primary_fails(self, mock_run, mock_config):
+        """Primary heavy model exhausts retries; the configured alternate
+        model gets tried before falling to medium."""
+        mock_config["fallback_models"] = {
+            "heavy": ["gemini-2.5-pro", "gemini-2.0-pro-exp"],
+        }
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "only_key"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 1
+            client.ignore_hard_quota = False
+
+            # Primary 'test-heavy' fails; first alternate 'gemini-2.5-pro' also
+            # fails; second alternate 'gemini-2.0-pro-exp' succeeds.
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror: daily"),
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror: daily"),
+                MagicMock(returncode=0, stdout='{"response": "ok from alt"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+        assert result == "ok from alt"
+        # Verify the model id arg progressed through the candidate list.
+        models_called = [call[0][0][2] for call in mock_run.call_args_list]
+        assert models_called == ["test-heavy", "gemini-2.5-pro", "gemini-2.0-pro-exp"]
+
+    @patch("subprocess.run")
+    def test_alternates_not_tried_when_primary_succeeds(self, mock_run, mock_config):
+        """Primary success short-circuits — no alternates invoked."""
+        mock_config["fallback_models"] = {
+            "heavy": ["gemini-2.5-pro", "gemini-2.0-pro"],
+        }
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "ok"}')
+        client.invoke("p", tier="heavy")
+        assert mock_run.call_count == 1
+
+    @patch("subprocess.run")
+    def test_primary_not_repeated_in_fallback_list(self, mock_run, mock_config):
+        """If the user puts the primary id in fallback_models too, dedupe."""
+        mock_config["fallback_models"] = {
+            "heavy": ["test-heavy", "gemini-2.5-pro"],  # primary first
+        }
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 1
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror"),
+                MagicMock(returncode=0, stdout='{"response": "ok"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+        assert result == "ok"
+        models_called = [call[0][0][2] for call in mock_run.call_args_list]
+        # 'test-heavy' should appear only once (as the primary), then jump to
+        # the second entry in fallback_models.
+        assert models_called == ["test-heavy", "gemini-2.5-pro"]
+
+    @patch("subprocess.run")
+    def test_falls_to_next_tier_only_after_all_alternates_exhausted(self, mock_run, mock_config):
+        """Tier fallback should happen only AFTER every same-tier model has
+        had a turn."""
+        mock_config["fallback_models"] = {
+            "heavy": ["gemini-2.5-pro"],
+        }
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 1
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror"),
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror"),
+                MagicMock(returncode=0, stdout='{"response": "from medium"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy")
+        assert result == "from medium"
+        models_called = [call[0][0][2] for call in mock_run.call_args_list]
+        # heavy primary → heavy alternate → medium primary
+        assert models_called == ["test-heavy", "gemini-2.5-pro", "test-medium"]
+
+
+class TestExhaustedKeyMemory:
+    """Verify exhausted keys are remembered across invoke() calls in the run."""
+
+    @patch("subprocess.run")
+    def test_exhausted_key_skipped_on_second_invoke(self, mock_run, mock_config):
+        """First invoke exhausts key 0; the second invoke should jump
+        straight to key 1 without wasting a strike on key 0."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "exhausted,fresh"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            # Need at least 2 attempts so the retry actually rotates to key B
+            # after the hard-quota strike on key A.
+            client.heavy_max_attempts = 3
+            client.ignore_hard_quota = False
+
+            # First call: key 'exhausted' hits hard quota, key 'fresh' succeeds.
+            # Second call: 'exhausted' is blacklisted, only 'fresh' is used.
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="terminalquotaerror"),
+                MagicMock(returncode=0, stdout='{"response": "first ok"}'),
+                MagicMock(returncode=0, stdout='{"response": "second ok"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                r1 = client.invoke("p1", tier="heavy", allow_fallback=False)
+                r2 = client.invoke("p2", tier="heavy", allow_fallback=False)
+        assert r1 == "first ok"
+        assert r2 == "second ok"
+        assert mock_run.call_count == 3
+        keys_used = [c[1]["env"]["GEMINI_API_KEY"] for c in mock_run.call_args_list]
+        assert keys_used == ["exhausted", "fresh", "fresh"]
+        assert 0 in client._exhausted_heavy_keys
+
+    @patch("subprocess.run")
+    def test_all_keys_exhausted_triggers_tier_fallback(self, mock_run, mock_config):
+        """When every loaded key is blacklisted, heavy aborts and the next
+        tier picks up immediately — no wasted backoff waits."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "a,b"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 3
+            client.ignore_hard_quota = False
+            client._exhausted_heavy_keys = {0, 1}  # both pre-blacklisted
+
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "from medium"}')
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy")
+        assert result == "from medium"
+        # Heavy didn't even try a subprocess (RuntimeError raised inside
+        # _execute_command before subprocess.run was called).
+        models_called = [c[0][0][2] for c in mock_run.call_args_list]
+        assert all(m == "test-medium" for m in models_called)
+
+
 class TestApiKeyLoading:
     """Cover the env-var key loader paths."""
 
