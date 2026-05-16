@@ -308,7 +308,12 @@ class TestConfigDirCaching:
         with open(os.path.join(path, ".gemini", "settings.json")) as f:
             data = _json.load(f)
         assert data["general"]["maxAttempts"] == 7
-        assert data["tools"]["autoAccept"] is True
+        # Only documented keys are written. autoAccept and requestTimeout
+        # are not recognized by gemini-cli — auto-approval is handled via
+        # the --approval-mode yolo CLI flag, and the subprocess timeout
+        # caps the call duration in Python.
+        assert "autoAccept" not in data.get("tools", {})
+        assert "requestTimeout" not in data["general"]
         client.cleanup()
 
 

@@ -211,12 +211,15 @@ class GeminiCLIClient:
         gemini_dir = Path(tmp_config_dir) / ".gemini"
         gemini_dir.mkdir(parents=True, exist_ok=True)
         settings_path = gemini_dir / "settings.json"
-        # Force maxAttempts to the configured value so Tenacity owns retries,
-        # and shorten connection timeout so we fail fast and retry at our level.
+        # Force the CLI's internal retry count so Tenacity (Python-side) owns
+        # retries instead. `general.maxAttempts` is the only documented and
+        # accepted key here in current gemini-cli (cap is 10).
+        # `tools.autoAccept` and `general.requestTimeout` are NOT recognized
+        # keys — `--approval-mode yolo` (CLI flag) handles auto-approval, and
+        # the Python subprocess timeout enforces the call ceiling.
         with open(settings_path, "w") as f:
             json.dump({
-                "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
-                "tools": {"autoAccept": True},
+                "general": {"maxAttempts": self.internal_max_attempts},
             }, f)
         self._config_dir = tmp_config_dir
         return tmp_config_dir
@@ -252,21 +255,36 @@ class GeminiCLIClient:
         else:
             logger.warning(f"No Gemini API key available for tier {tier}!")
 
-        # CRITICAL: Force the CLI to use the API key by masking system-wide auth.
-        # This prevents fallback to local gcloud/ADC credentials or OAuth.
-        process_env["GOOGLE_API_KEY"] = ""
-        process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
-        process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
+        # CRITICAL: Force the CLI to use GEMINI_API_KEY by removing higher-
+        # precedence auth env vars. GOOGLE_API_KEY normally wins over
+        # GEMINI_API_KEY in google-genai's auth resolution, so its presence
+        # would shadow our key. Pop instead of setting "" — empty-string env
+        # vars are still "set" and some auth backends treat them differently
+        # from missing.
+        for var in (
+            "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+        ):
+            process_env.pop(var, None)
+        # Redirect HOME so gemini-cli doesn't pick up ~/.gemini settings or
+        # ~/.config OAuth caches we don't want.
         process_env["HOME"] = tmp_config_dir
-        process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
-        logger.debug("Strict Auth: Masked system-wide Google Cloud auth, redirected HOME.")
+        logger.debug("Strict Auth: removed Google Cloud auth env vars, redirected HOME.")
 
         logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
 
+        # `--skip-trust` is the documented replacement for the workspace-trust
+        # prompt that would otherwise block headless mode. (The
+        # GEMINI_CLI_TRUST_WORKSPACE env var is not recognized.)
         cmd = [
-            "gemini", "--model", model_id, "--prompt", prompt,
-            "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
-            "--output-format", "json"
+            "gemini",
+            "--model", model_id,
+            "--prompt", prompt,
+            "--approval-mode", "yolo",
+            "--raw-output", "--accept-raw-output-risk",
+            "--output-format", "json",
+            "--skip-trust",
         ]
 
         # Proactively honor per-tier RPM cap before spending the call.
