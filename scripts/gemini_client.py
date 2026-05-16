@@ -408,32 +408,50 @@ class GeminiCLIClient:
                     logger.info(f"Network error detected for tier {tier}. Retrying...")
                     return True
 
-                is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
-                
-                if is_quota:
-                    if tier == "heavy":
-                        if len(self._api_keys) > 1:
-                            # Round-robin already lined up the next key for the
-                            # retry; skip the explicit rotation sleep.
-                            logger.info(f"Quota error on heavy tier; round-robin will pick the next key on retry.")
-                            return True
-                        if self._rotate_key():
-                            logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
-                            return True
-                    else:
-                        # Non-heavy tiers are stuck on key index 0, so rotation doesn't help them.
-                        # Just retry with the same key (index 0) and let the wait strategy handle it.
-                        logger.warning(f"Quota error detected for tier {tier}. Retrying with base key...")
+                is_hard_quota = any(kw in error_msg for kw in hard_quota_keywords)
+                is_soft_quota = any(kw in error_msg for kw in quota_keywords)
+                is_quota = is_hard_quota or is_soft_quota
+
+                if not is_quota:
+                    return False
+
+                # Hard quota gate runs FIRST and applies to every tier and
+                # every key configuration. Once daily RPD is gone, no amount
+                # of rotation or backoff will help — burning the rest of the
+                # retry budget just delays the inevitable failure by hours.
+                # `ignore_hard_quota` is an opt-in escape hatch for users who
+                # know their quota error wording produces false positives.
+                if is_hard_quota and not self.ignore_hard_quota:
+                    logger.warning(
+                        f"Hard quota reached for {tier} (msg: {error_msg[:120]}). "
+                        "Aborting retries; raise ignore_hard_quota=true in config "
+                        "if this matched in error and you want to keep trying."
+                    )
+                    return False
+
+                # Soft quota / 5xx / generic rate-limit response: retry path.
+                if tier == "heavy":
+                    if len(self._api_keys) > 1:
+                        # Round-robin already lined up the next key for the
+                        # retry; skip the explicit rotation sleep.
+                        logger.info(
+                            f"Quota error on heavy tier; round-robin will pick the next key on retry."
+                        )
                         return True
-                    
-                    if any(kw in error_msg for kw in hard_quota_keywords):
-                        if self.ignore_hard_quota:
-                            logger.info(f"Potential hard quota hit for {tier}, but ignore_hard_quota is enabled. Retrying with current key...")
-                            return True
-                        logger.warning(f"Hard quota reached for {tier} and no more keys to rotate. Skipping retries.")
-                        return False
-                
-                return any(kw in error_msg for kw in quota_keywords)
+                    if self._rotate_key():
+                        logger.info(
+                            f"Quota error detected for tier {tier}. "
+                            "Rotated API key and retrying..."
+                        )
+                        return True
+                    # Single key, nothing to rotate to — fall through to
+                    # backoff-and-retry below.
+
+                # Non-heavy tiers stick to key 0 and just wait through backoff.
+                logger.warning(
+                    f"Quota error detected for tier {tier}. Retrying after backoff..."
+                )
+                return True
             return False
 
         try:

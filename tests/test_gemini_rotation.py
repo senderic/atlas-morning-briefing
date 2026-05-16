@@ -84,7 +84,7 @@ class TestGeminiRotation:
 
             # Simulate first heavy call hitting quota on key1, succeeding on key2.
             quota_error = subprocess.CalledProcessError(
-                1, ["gemini"], stderr="Quota exceeded for this model."
+                1, ["gemini"], stderr="Error 429: capacity exhausted, please retry"
             )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
             mock_run.side_effect = [quota_error, success_result]
@@ -112,7 +112,7 @@ class TestGeminiRotation:
             client._available = True
 
             quota_error = subprocess.CalledProcessError(
-                1, ["gemini"], stderr="Quota exceeded for this model."
+                1, ["gemini"], stderr="Error 429: capacity exhausted, please retry"
             )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
             mock_run.side_effect = [quota_error, success_result]
@@ -158,9 +158,11 @@ class TestGeminiRotation:
             client = GeminiCLIClient(rotation_config)
             client._available = True
             
-            # Fail with quota error
+            # Fail with soft quota / 429 capacity error so retries actually
+            # happen (a hard "quota exceeded" message would now correctly
+            # abort instead of rotating).
             mock_run.side_effect = subprocess.CalledProcessError(
-                1, ["gemini"], stderr="Quota exceeded."
+                1, ["gemini"], stderr="Error 429: capacity exhausted"
             )
             
             # Capture the rotation attempt

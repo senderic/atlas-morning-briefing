@@ -116,11 +116,13 @@ class TestGeminiCLIClient:
 
     @patch("subprocess.run")
     def test_invoke_retry_and_rotation_tracking(self, mock_run, mock_config):
-        # Mock 2 quota failures then 1 success
-        # "429" triggers retry/rotation
+        # Mock 2 transient (soft-quota) failures then 1 success.
+        # Use "429 capacity" — that's a SOFT quota / RPM-burst keyword that
+        # triggers retry; "quota exceeded" would now correctly classify as
+        # hard daily quota and abort.
         mock_run.side_effect = [
-            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
-            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
+            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 capacity"),
+            subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 capacity"),
             MagicMock(returncode=0, stdout='{"response": "Success after retries"}')
         ]
         
@@ -426,6 +428,155 @@ class TestUsageStatsParsing:
         assert client.usage_stats["medium"]["calls"] == 1
         # No token counts since we couldn't parse them.
         assert client.usage_stats["medium"]["in_tokens"] == 0
+
+
+class TestHardQuotaGate:
+    """Verify hard-daily-quota errors abort retries on every code path."""
+
+    @patch("subprocess.run")
+    def test_hard_quota_aborts_multi_key_heavy(self, mock_run, mock_config):
+        """Multi-key heavy was previously bypassing the hard-quota gate."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2,k3"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 5  # cap so test fails fast on regression
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, ["gemini"], stderr="429: daily quota exceeded"
+            )
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result is None
+            # Aborted on first attempt — no retries.
+            assert mock_run.call_count == 1
+
+    @patch("subprocess.run")
+    def test_hard_quota_aborts_non_heavy(self, mock_run, mock_config):
+        """Non-heavy (medium/light) tiers also need to honor the hard-quota gate."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = subprocess.CalledProcessError(
+                1, ["gemini"], stderr="rpd limit reached"
+            )
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="medium", allow_fallback=False)
+            assert result is None
+            assert mock_run.call_count == 1
+
+    @patch("subprocess.run")
+    def test_hard_quota_overridden_by_ignore_flag(self, mock_run, mock_config):
+        """ignore_hard_quota=True keeps retrying even on hard quota messages."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 3
+            client.ignore_hard_quota = True
+
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 daily quota exceeded"),
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 daily quota exceeded"),
+                MagicMock(returncode=0, stdout='{"response": "ok"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result == "ok"
+            assert mock_run.call_count == 3
+
+    @patch("subprocess.run")
+    def test_soft_quota_still_retries(self, mock_run, mock_config):
+        """Pure 429/capacity (no hard-quota keyword) should retry as before."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            client.heavy_max_attempts = 3
+            client.ignore_hard_quota = False
+
+            mock_run.side_effect = [
+                subprocess.CalledProcessError(1, ["gemini"], stderr="429 capacity"),
+                MagicMock(returncode=0, stdout='{"response": "ok"}'),
+            ]
+            with patch("scripts.gemini_client.wait_random_exponential",
+                       return_value=lambda x: 0.001):
+                result = client.invoke("p", tier="heavy", allow_fallback=False)
+            assert result == "ok"
+            assert mock_run.call_count == 2
+
+    @patch("subprocess.run")
+    def test_non_quota_error_fails_fast(self, mock_run, mock_config):
+        """Errors that don't match any keyword (e.g., unknown flag) fail fast."""
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        mock_run.side_effect = subprocess.CalledProcessError(
+            1, ["gemini"], stderr="Unknown command flag --raw-output"
+        )
+        result = client.invoke("p", tier="medium", allow_fallback=False)
+        assert result is None
+        # No retry — error message didn't match any retry keyword.
+        assert mock_run.call_count == 1
+
+
+class TestEnvVarHandling:
+    """Verify GOOGLE_API_KEY etc. are unset (popped), not blanked, and that
+    --skip-trust is in the cmd args, not the env."""
+
+    @patch("subprocess.run")
+    def test_google_api_key_is_popped_not_blanked(self, mock_run, mock_config):
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "k1",
+            "GOOGLE_API_KEY": "should_be_removed",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/creds",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "stale_token",
+        }, clear=True):
+            client = GeminiCLIClient(mock_config)
+            client._available = True
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "ok"}')
+            client.invoke("p", tier="medium")
+        env = mock_run.call_args[1]["env"]
+        assert "GOOGLE_API_KEY" not in env
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+        assert "CLOUDSDK_AUTH_ACCESS_TOKEN" not in env
+        # GEMINI_API_KEY should still be set.
+        assert env["GEMINI_API_KEY"] == "k1"
+
+    @patch("subprocess.run")
+    def test_skip_trust_in_cmd_not_env(self, mock_run, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "ok"}')
+        client.invoke("p", tier="medium")
+        cmd = mock_run.call_args[0][0]
+        assert "--skip-trust" in cmd
+        env = mock_run.call_args[1]["env"]
+        assert "GEMINI_CLI_TRUST_WORKSPACE" not in env
+
+    @patch("subprocess.run")
+    def test_required_cli_flags_present(self, mock_run, mock_config):
+        client = GeminiCLIClient(mock_config)
+        client._available = True
+        client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "ok"}')
+        client.invoke("p", tier="medium")
+        cmd = mock_run.call_args[0][0]
+        for required in [
+            "--model", "--prompt", "--approval-mode", "yolo",
+            "--raw-output", "--accept-raw-output-risk",
+            "--output-format", "json", "--skip-trust",
+        ]:
+            assert required in cmd, f"missing flag/value: {required}"
 
 
 class TestApiKeyLoading:
