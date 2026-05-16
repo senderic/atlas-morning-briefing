@@ -194,10 +194,20 @@ class BriefingCoordinator:
         with open(STATE_FILENAME, "w") as f: json.dump(state, f, indent=2)
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("--config", required=True); parser.add_argument("--dry-run", action="store_true")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    with open(args.config) as f: config = yaml.safe_load(f)
-    validate_config(config); check_environment(config)
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    is_valid, _ = validate_config(config)
+    if not is_valid:
+        logger.error("Configuration is invalid. Fix errors above and retry.")
+        sys.exit(2)
+
+    check_environment(config, dry_run=args.dry_run)
     sys.exit(BriefingCoordinator(config, args.dry_run).run())
 
 if __name__ == "__main__": main()
