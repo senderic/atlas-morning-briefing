@@ -33,7 +33,7 @@ from scripts.news_aggregator import NewsAggregator
 from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.email_distributor import EmailDistributor
-from scripts.config_validator import validate_config, check_environment
+from scripts.config_validator import validate_config, check_environment, expand_env_vars
 from scripts.bedrock_client import BedrockClient
 from scripts.intelligence import BriefingIntelligence
 
@@ -1116,6 +1116,8 @@ def main() -> int:
 
     # Load config
     config = load_config(args.config)
+    # Expand ${VAR} / ${VAR:-default} placeholders BEFORE validation.
+    config = expand_env_vars(config)
 
     # Validate config
     is_valid, messages = validate_config(config)

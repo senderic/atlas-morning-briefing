@@ -33,7 +33,7 @@ from scripts.gemini_client import GeminiCLIClient
 from scripts.pdf_generator import PDFGenerator
 from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
-from scripts.config_validator import validate_config, check_environment
+from scripts.config_validator import validate_config, check_environment, expand_env_vars
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -320,6 +320,10 @@ def main():
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    # Expand ${VAR} / ${VAR:-default} placeholders BEFORE validation so
+    # downstream code (email distribution, file paths, LLM prompts) never
+    # sees literal bash-style strings.
+    config = expand_env_vars(config)
 
     is_valid, _ = validate_config(config)
     if not is_valid:

@@ -8,9 +8,47 @@ Validates config.yaml values at startup to catch errors early.
 
 import logging
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ${VAR} or ${VAR:-default}. Inner default is captured non-greedily, stopping
+# at the closing brace. We deliberately don't support nested expansion since
+# config values shouldn't need it.
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_env_vars(value: Any) -> Any:
+    """Recursively expand ${VAR} / ${VAR:-default} in a config value tree.
+
+    Strings get substituted; lists and dicts are walked element-wise; other
+    types pass through. ${VAR} resolves to os.environ[VAR] when present,
+    otherwise the literal placeholder is preserved (so config validation
+    can still flag missing required vars). ${VAR:-default} resolves to
+    os.environ[VAR] when truthy, otherwise to `default`.
+
+    This is run BEFORE validate_config so downstream code never sees raw
+    bash-style placeholders that would render as literal strings in emails,
+    file paths, or LLM prompts.
+    """
+    if isinstance(value, str):
+        def _sub(match):
+            var = match.group(1)
+            default = match.group(2)
+            env_value = os.environ.get(var)
+            if env_value:
+                return env_value
+            if default is not None:
+                return default
+            return match.group(0)  # leave unresolved placeholder in place
+        return _ENV_PATTERN.sub(_sub, value)
+    if isinstance(value, list):
+        return [expand_env_vars(v) for v in value]
+    if isinstance(value, dict):
+        return {k: expand_env_vars(v) for k, v in value.items()}
+    return value
 
 
 def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
