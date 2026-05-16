@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from tenacity import (
@@ -66,6 +67,19 @@ class GeminiCLIClient:
         self._current_key_index = 0
         # Cached per-instance config dir (written once, reused across calls).
         self._config_dir: Optional[str] = None
+
+        # Per-tier minimum interval (seconds) between successive calls. Sized
+        # for free-tier RPM caps: heavy=Pro is the tightest at ~2 RPM, medium
+        # and light are Flash variants with looser caps. Override via config
+        # under gemini.tier_min_interval_seconds.
+        intervals = config.get("tier_min_interval_seconds", {}) or {}
+        self.tier_min_interval = {
+            "heavy": float(intervals.get("heavy", 30.0)),
+            "medium": float(intervals.get("medium", 5.0)),
+            "light": float(intervals.get("light", 2.0)),
+        }
+        self._tier_last_call: Dict[str, float] = {"heavy": 0.0, "medium": 0.0, "light": 0.0}
+        self._call_lock = threading.Lock()
 
         # Usage tracking
         self.usage_stats = {
@@ -159,6 +173,24 @@ class GeminiCLIClient:
         
         return self._available
 
+    def _pace_tier(self, tier: str) -> None:
+        """Sleep so successive calls to `tier` honor its minimum interval.
+
+        Records the call's intended start time (under a lock so concurrent
+        callers also serialize), then sleeps if the previous call was too
+        recent. Set tier_min_interval_seconds.<tier>=0 in config to disable.
+        """
+        min_interval = self.tier_min_interval.get(tier, 0.0)
+        if min_interval <= 0:
+            return
+        with self._call_lock:
+            elapsed = time.time() - self._tier_last_call[tier]
+            wait = min_interval - elapsed
+            if wait > 0:
+                logger.info(f"Pacing {tier} tier: sleeping {wait:.1f}s to honor {min_interval:.0f}s min interval")
+                time.sleep(wait)
+            self._tier_last_call[tier] = time.time()
+
     def _ensure_config_dir(self) -> str:
         """Build (once) and return a config dir holding .gemini/settings.json."""
         import tempfile
@@ -221,6 +253,9 @@ class GeminiCLIClient:
             "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
             "--output-format", "json"
         ]
+
+        # Proactively honor per-tier RPM cap before spending the call.
+        self._pace_tier(tier)
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)

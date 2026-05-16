@@ -130,7 +130,9 @@ class TestGeminiCLIClient:
             client._available = True
             # Shorten delays for test
             client.key_swap_delay = 0.01
-            
+            # Disable per-tier pacing so the test doesn't wait 30s between retries
+            client.tier_min_interval = {"heavy": 0, "medium": 0, "light": 0}
+
             # Using patch to avoid long exponential waits in test
             with patch("scripts.gemini_client.wait_random_exponential", return_value=lambda x: 0.01):
                 response = client.invoke("Prompt", tier="heavy")

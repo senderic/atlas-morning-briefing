@@ -192,6 +192,13 @@ gemini:
     heavy: "pro"
     medium: "flash"
     light: "flash-lite"
+  # Minimum seconds between successive calls per tier. Defaults are sized for
+  # Pro free tier (~2 RPM heavy, looser on Flash). Lower if you have paid
+  # quota or multiple keys; raise if you're seeing 429s. Set to 0 to disable.
+  tier_min_interval_seconds:
+    heavy: 30
+    medium: 5
+    light: 2
 
 # Amazon Bedrock configuration
 # Set enabled: false to run in deterministic mode (no LLM, zero cost)
