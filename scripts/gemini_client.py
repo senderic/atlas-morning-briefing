@@ -380,6 +380,15 @@ class GeminiCLIClient:
     ) -> Optional[str]:
         """
         Invoke a Gemini model via CLI with recursive tier fallback.
+
+        Note: `max_tokens` and `temperature` are accepted for interface
+        compatibility with BedrockClient but are NOT currently forwarded
+        to gemini-cli. The CLI's per-call generation parameters live
+        under modelConfig.generateContentConfig in settings.json, which
+        we cache once per client instance, so per-call overrides would
+        require rewriting the settings file before each subprocess.run.
+        gemini-cli falls back to the model's default output cap
+        (8,192 tokens for Pro/Flash) — fine for our prompt sizes.
         """
         if not self.available:
             return None
