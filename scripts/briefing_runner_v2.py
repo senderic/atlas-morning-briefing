@@ -168,6 +168,14 @@ class BriefingCoordinator:
                 summary = p.get("brief_summary", "") or p.get("summary", "")[:400]
                 link = p.get("arxiv_url") or p.get("pdf_link") or p.get("id", "")
                 content += f"### {p.get('title', '')}\n\n{summary}\n\n[ArXiv]({link})\n\n"
+        if blogs:
+            content += "## Blogs\n\n"
+            for b in blogs[:5]:
+                summary = b.get("brief_summary", "") or b.get("summary", "")[:400]
+                link = b.get("link", "")
+                source = b.get("source", "")
+                source_tag = f" *({source})*" if source else ""
+                content += f"### {b.get('title', '')}{source_tag}\n\n{summary}\n\n[Read more]({link})\n\n"
         return content
 
     def _generate_pdf(self, content, filename) -> Path:
