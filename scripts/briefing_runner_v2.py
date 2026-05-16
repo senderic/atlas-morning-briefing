@@ -130,11 +130,14 @@ class BriefingCoordinator:
     def _extract_items(self, findings: List[Dict[str, Any]]) -> tuple:
         papers, blogs, news, stocks = [], [], [], []
         for f in findings:
-            if f["worker"] == "papers_worker": papers = f.get("items", [])
-            elif f["worker"] == "blogs_worker": blogs = f.get("items", [])
+            if f["worker"] == "papers_worker":
+                papers = f.get("items", [])
+            elif f["worker"] == "blogs_worker":
+                blogs = f.get("items", [])
             elif f["worker"] == "news_market_worker":
                 items = f.get("items", {})
-                news = items.get("news", []); stocks = items.get("stocks", [])
+                news = items.get("news", [])
+                stocks = items.get("stocks", [])
         return papers, blogs, news, stocks
 
     def _synthesize_findings(self, findings, papers, blogs, news, stocks, memory) -> Dict[str, Any]:
@@ -167,15 +170,19 @@ class BriefingCoordinator:
         return [t.strip() for t in res.split(",") if t.strip()]
 
     def _generate_executive_summary(self, syntheses, themes, stocks) -> str:
-        if not self.llm.available: return "LLM offline"
+        if not self.llm.available:
+            return "LLM offline"
         prompt = f"Summarize today's findings:\nThemes: {', '.join(themes)}\n"
-        for w, s in syntheses.items(): prompt += f"{w}: {s}\n"
+        for worker, summary in syntheses.items():
+            prompt += f"{worker}: {summary}\n"
         return self.llm.invoke(prompt, tier="medium") or "Synthesis failed"
 
     def _analyze_market_trend(self, stocks, news) -> str:
-        if not stocks or not self.llm.available: return ""
+        if not stocks or not self.llm.available:
+            return ""
         prompt = "Analyze market trend from these stocks:\n"
-        for s in stocks: prompt += f"- {s.get('symbol')}: {s.get('percent_change', 0.0):.2f}%\n"
+        for s in stocks:
+            prompt += f"- {s.get('symbol')}: {s.get('percent_change', 0.0):.2f}%\n"
         return self.llm.invoke(prompt, tier="light") or ""
 
     def _generate_briefing(self, synthesis, papers, blogs, news, stocks) -> str:
@@ -183,7 +190,8 @@ class BriefingCoordinator:
         content += f"## Executive Summary\n\n{synthesis['executive_summary']}\n\n"
         if stocks:
             content += f"## Markets\n\n{synthesis['market_trend']}\n\n"
-            for s in stocks: content += f"- **{s.get('symbol')}**: {s.get('percent_change', 0.0):.2f}%\n"
+            for s in stocks:
+                content += f"- **{s.get('symbol')}**: {s.get('percent_change', 0.0):.2f}%\n"
         if news:
             content += "## News\n\n"
             for n in news[:5]:

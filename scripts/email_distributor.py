@@ -261,8 +261,11 @@ class EmailDistributor:
                                         "Content-Disposition", "attachment", filename=doc_file.name
                                     )
                                     msg_mixed = MIMEMultipart("mixed")
-                                    msg_mixed["From"] = msg["From"]; msg_mixed["To"] = msg["To"]; msg_mixed["Subject"] = msg["Subject"]
-                                    msg_mixed.attach(msg); msg_mixed.attach(attachment)
+                                    msg_mixed["From"] = msg["From"]
+                                    msg_mixed["To"] = msg["To"]
+                                    msg_mixed["Subject"] = msg["Subject"]
+                                    msg_mixed.attach(msg)
+                                    msg_mixed.attach(attachment)
                                     msg = msg_mixed
 
                         server.send_message(msg)
@@ -273,7 +276,8 @@ class EmailDistributor:
         except Exception as e:
             logger.error(f"SMTP connection failed: {e}")
             for r in recipients:
-                if r not in results: results[r] = False
+                if r not in results:
+                    results[r] = False
 
         return results
 
@@ -288,7 +292,8 @@ class EmailDistributor:
     ) -> Dict[str, bool]:
         """Distribute briefing to all configured channels."""
         results = {}
-        if dry_run: return results
+        if dry_run:
+            return results
 
         # Kindle (Prefer EPUB)
         kindle_email = config.get("kindle_email")

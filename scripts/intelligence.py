@@ -783,7 +783,8 @@ class BriefingIntelligence:
             symbol = s.get("symbol", "")
             name = s.get("name", symbol)
             pct = s.get("percent_change")
-            if pct is None: pct = 0.0
+            if pct is None:
+                pct = 0.0
             sign = "+" if pct >= 0 else ""
             stock_lines.append(f"{name} ({symbol}): {sign}{pct:.1f}%")
 
@@ -943,7 +944,8 @@ class BriefingIntelligence:
             for s in stocks:
                 if "error" not in s:
                     pct = s.get("percent_change")
-                    if pct is None: pct = 0.0
+                    if pct is None:
+                        pct = 0.0
                     sign = "+" if pct >= 0 else ""
                     corr = s.get("news_correlation", "")
                     line = f"- {s.get('symbol', '')}: {sign}{pct:.1f}%"
