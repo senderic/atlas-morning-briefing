@@ -85,8 +85,10 @@ class PapersWorker(BaseWorker):
             if not intelligence.available:
                 logger.warning(f"[{self.worker_name}] Intelligence layer unavailable, skipping enrichment")
                 # Fallback: basic TF-IDF scoring only
-                scorer = PaperScorer(self.config)
-                papers = scorer.score_papers(papers, self.topics)
+                weights = self.config.get("paper_scoring", {})
+                num_picks = self.config.get("num_paper_picks", 3)
+                scorer = PaperScorer(topics=self.topics, weights=weights, num_picks=num_picks)
+                papers = scorer.score_papers(papers)
                 return self._create_finding(
                     status="success",
                     items=papers,
