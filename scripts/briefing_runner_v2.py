@@ -99,6 +99,11 @@ class BriefingCoordinator:
         self._update_memory(synthesis, papers, blogs, news, stocks)
         self._save_state(papers, blogs, news, stocks=stocks, synthesis=synthesis)
 
+        total_tokens = sum(
+            f.get("metadata", {}).get("token_count", 0) for f in findings
+        )
+        logger.info(f"Total LLM tokens used: {total_tokens}")
+
         elapsed = time.time() - start_time
         logger.info(f"=== Briefing completed in {elapsed:.1f}s ===")
         return 0 if not failed_workers else 1

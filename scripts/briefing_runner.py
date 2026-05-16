@@ -1053,6 +1053,17 @@ class BriefingRunner:
         self.status["elapsed_seconds"] = round(elapsed, 1)
         self.save_status()
 
+        # Emit a consistent token-count line so benchmark scripts can scrape it.
+        # BedrockClient doesn't track tokens, so this is best-effort against
+        # whichever client exposes usage_stats.
+        total_tokens = 0
+        stats = getattr(self.bedrock, "usage_stats", None)
+        if isinstance(stats, dict):
+            for tier in stats.values():
+                if isinstance(tier, dict):
+                    total_tokens += tier.get("in_tokens", 0) + tier.get("out_tokens", 0)
+        logger.info(f"Total LLM tokens used: {total_tokens}")
+
         logger.info(f"=== Briefing Complete in {elapsed:.1f}s ===")
 
         if self.errors:
