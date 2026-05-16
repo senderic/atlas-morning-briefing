@@ -395,3 +395,130 @@ def test_run_aborts_when_all_workers_fail(coordinator, tmp_path, monkeypatch):
     with patch.object(coordinator, "_spawn_workers", return_value=[failing_finding] * 3):
         rc = coordinator.run()
     assert rc == 2  # abort code per the runner
+
+
+def _success_finding(worker_name, items=None):
+    return {
+        "worker": worker_name,
+        "status": "success",
+        "items": items if items is not None else [],
+        "metadata": {"token_count": 100},
+        "synthesis": f"{worker_name} synthesis",
+    }
+
+
+def test_run_succeeds_end_to_end_writes_md_and_state(
+    coordinator, tmp_path, monkeypatch, stub_llm
+):
+    """Smoke test the full happy path: workers succeed, briefing is written, state saved."""
+    monkeypatch.chdir(tmp_path)
+    # Make sure pdf/epub/distribute are skipped via dry_run + pdf disabled.
+    coordinator.dry_run = True
+    coordinator.config["pdf"] = {"enabled": False}
+
+    findings = [
+        _success_finding("papers_worker", [{
+            "title": "PaperX", "score": 5.0, "brief_summary": "agent system",
+            "arxiv_url": "http://arxiv/abs/x", "summary": "long abstract",
+        }]),
+        _success_finding("blogs_worker", [{
+            "title": "BlogY", "brief_summary": "agent post",
+            "link": "http://b/y", "source": "S",
+        }]),
+        _success_finding("news_market_worker", {
+            "news": [{"title": "NewsZ", "brief_summary": "AI news", "url": "http://n"}],
+            "stocks": [{"symbol": "NVDA", "current_price": 1000.0, "percent_change": 2.5}],
+        }),
+    ]
+
+    stub_llm.invoke.return_value = "stub-response"  # for synthesis calls
+
+    with patch.object(coordinator, "_spawn_workers", return_value=findings), \
+         patch("scripts.briefing_runner_v2.EPUBGenerator") as epub_cls:
+        # Stub EPUBGenerator so we don't actually write a real epub.
+        epub_inst = MagicMock()
+        epub_cls.return_value = epub_inst
+        rc = coordinator.run()
+
+    assert rc == 0
+    # The .md file should have landed in the cwd.
+    md_files = list(tmp_path.glob("Atlas-Briefing-*.md"))
+    assert len(md_files) == 1
+    md_content = md_files[0].read_text()
+    assert "PaperX" in md_content
+    assert "BlogY" in md_content
+    assert "NewsZ" in md_content
+    # State file persisted.
+    state_path = tmp_path / STATE_FILENAME
+    assert state_path.exists()
+    state = json.loads(state_path.read_text())
+    assert state["top_paper_titles"] == ["PaperX"]
+    assert state["stock_closes"] == {"NVDA": 1000.0}
+
+
+def test_run_returns_1_when_some_workers_fail(coordinator, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    coordinator.dry_run = True
+    coordinator.config["pdf"] = {"enabled": False}
+    findings = [
+        _success_finding("papers_worker"),
+        _success_finding("blogs_worker"),
+        {"worker": "news_market_worker", "status": "error", "items": {"news": [], "stocks": []},
+         "metadata": {"token_count": 0}, "synthesis": "", "error": "x"},
+    ]
+    with patch.object(coordinator, "_spawn_workers", return_value=findings), \
+         patch("scripts.briefing_runner_v2.EPUBGenerator"):
+        rc = coordinator.run()
+    assert rc == 1
+
+
+# --- main() entry point ------------------------------------------------------
+
+def test_main_aborts_on_invalid_config(tmp_path, monkeypatch):
+    """main() should exit with code 2 when validate_config flags errors."""
+    from scripts.briefing_runner_v2 import main
+    bad_config = tmp_path / "bad.yaml"
+    bad_config.write_text("arxiv_topics: not_a_list\n")
+    monkeypatch.setattr("sys.argv", ["briefing_runner_v2.py", "--config", str(bad_config)])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
+def test_main_runs_dry_run_path(tmp_path, monkeypatch):
+    """main() with --dry-run should construct the coordinator and run."""
+    from scripts.briefing_runner_v2 import main
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "arxiv_topics: [agents]\n"
+        "max_workers: 1\n"
+        "pdf: {enabled: false}\n"
+        "gemini: {enabled: false}\n"
+        "bedrock: {enabled: false}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", [
+        "briefing_runner_v2.py", "--config", str(config_path), "--dry-run"
+    ])
+    # Stub the spawn so we don't actually hit the network or LLMs.
+    with patch("scripts.briefing_runner_v2.BriefingCoordinator._spawn_workers",
+               return_value=[_success_finding("papers_worker"),
+                             _success_finding("blogs_worker"),
+                             _success_finding("news_market_worker",
+                                              {"news": [], "stocks": []})]), \
+         patch("scripts.briefing_runner_v2.EPUBGenerator"):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code in (0, 1)
+
+
+# --- gemini config branch in BriefingCoordinator.__init__ -------------------
+
+def test_init_uses_gemini_when_enabled(monkeypatch):
+    """Verify the coordinator picks GeminiCLIClient when gemini.enabled is set."""
+    from scripts.briefing_runner_v2 import BriefingCoordinator
+    with patch("scripts.briefing_runner_v2.GeminiCLIClient") as gem_cls:
+        gem_cls.return_value = MagicMock()
+        coord = BriefingCoordinator({"gemini": {"enabled": True}}, dry_run=True)
+    gem_cls.assert_called_once_with({"enabled": True})
+    assert coord.llm is gem_cls.return_value
