@@ -43,9 +43,11 @@ logs/*.log
 !CONTRIBUTING.md
 !README.md
 !SKILL.md
+!GEMINI.md
 !SECURITY_FIXES.md
 !examples/*.md
 !references/*.md
+!skills/*.md
 atlas-morning-briefing.json
 .env
 uv.lock
