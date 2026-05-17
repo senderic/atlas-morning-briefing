@@ -360,6 +360,8 @@ class BriefingRunner:
         synthesis: Optional[Dict[str, str]] = None,
         market_trend: str = "",
         weekly_deep_dive: str = "",
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
     ) -> str:
         """
         Generate markdown briefing from all data.
@@ -373,6 +375,8 @@ class BriefingRunner:
             synthesis: Optional intelligence synthesis output.
             market_trend: Pre-generated market trend summary.
             weekly_deep_dive: Optional weekly deep dive section (Saturday only).
+            start_time: Optional briefing start unix timestamp.
+            end_time: Optional briefing end unix timestamp.
 
         Returns:
             Markdown string.
@@ -467,7 +471,7 @@ class BriefingRunner:
 
         # Gemini Usage Summary
         if self.gemini:
-            md.append(self.gemini.get_usage_summary())
+            md.append(self.gemini.get_usage_summary(start_time=start_time, end_time=end_time))
 
         return "".join(md)
 
@@ -1120,6 +1124,8 @@ class BriefingRunner:
             papers, blogs, stocks, news, top_papers, synthesis,
             market_trend=market_trend,
             weekly_deep_dive=weekly_deep_dive,
+            start_time=start_time,
+            end_time=time.time(),
         )
 
         # --- Save markdown ---

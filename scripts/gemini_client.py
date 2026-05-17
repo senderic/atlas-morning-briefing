@@ -385,7 +385,7 @@ class GeminiCLIClient:
 
         return None
 
-    def get_usage_summary(self) -> str:
+    def get_usage_summary(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
         """Generate a formatted markdown summary of Gemini API usage and estimated costs."""
         # Cost constants (Gemini 1.5 Pay-as-you-go pricing)
         # Pro: $1.25/1M in, $3.75/1M out
@@ -427,6 +427,26 @@ class GeminiCLIClient:
             f"| **Total** | **{sum(s['calls'] for s in self.usage_stats.values())}** | "
             f"**{sum(s['failed_attempts'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n"
         )
-        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n")
+        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n\n")
         
+        # Add timing information if provided
+        if start_time and end_time:
+            from datetime import datetime
+            duration = end_time - start_time
+            start_str = datetime.fromtimestamp(start_time).strftime("%I:%M:%S %p")
+            end_str = datetime.fromtimestamp(end_time).strftime("%I:%M:%S %p")
+            
+            # Format duration as H:M:S if over an hour, else M:S
+            if duration >= 3600:
+                h = int(duration // 3600)
+                m = int((duration % 3600) // 60)
+                s = int(duration % 60)
+                duration_str = f"{h}h {m}m {s}s"
+            else:
+                m = int(duration // 60)
+                s = int(duration % 60)
+                duration_str = f"{m}m {s}s"
+                
+            lines.append(f"**Briefing generation took {duration_str}** (Started: {start_str}, Finished: {end_str})\n")
+
         return "".join(lines)
