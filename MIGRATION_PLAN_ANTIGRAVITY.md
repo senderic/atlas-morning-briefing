@@ -6,31 +6,87 @@ This document outlines the necessary steps to migrate the **Atlas Morning Briefi
 
 The Antigravity CLI is a Go-based binary, replacing the Node.js implementation.
 
-### Installation Steps
-Run the following command to install the binary. Since your fast scratch storage is at `/mnt/fast_scratch`, we will place the binary there for faster loading and access.
+### Installation Steps (Safe Approach)
+
+**⚠️ IMPORTANT:** The original `curl | bash` install script was not verified. Use a safer manual download approach instead:
 
 ```bash
-# Download and install the agy binary
-curl -sSL https://antigravity.google/install | bash
-
-# Move it to your fast_scratch bin directory for faster loading
+# Create directory for faster access
 mkdir -p /mnt/fast_scratch/bin
-mv ~/bin/agy /mnt/fast_scratch/bin/
 
-# Add to PATH (ensure this is in your .bashrc or .zshrc)
+# Download the binary directly (replace with actual release URL once verified)
+# First, check the official Antigravity repository for the latest release
+# https://github.com/google/antigravity/releases
+
+# Example (adjust version and URL based on actual release):
+wget -O /tmp/agy-linux-x64.tar.gz "https://github.com/google/antigravity/releases/download/v1.0.0/agy-linux-x64.tar.gz"
+
+# Verify the downloaded file is actually a valid archive
+file /tmp/agy-linux-x64.tar.gz
+
+# Extract and place in your fast_scratch bin
+tar -xzf /tmp/agy-linux-x64.tar.gz -C /mnt/fast_scratch/bin/
+chmod +x /mnt/fast_scratch/bin/agy
+
+# Verify installation
+/mnt/fast_scratch/bin/agy --version
+```
+
+### Add to PATH
+Add this line to your shell configuration file (`~/.bashrc`, `~/.zshrc`, etc.):
+```bash
 export PATH="/mnt/fast_scratch/bin:$PATH"
 ```
 
-### Initial Setup
-Verify installation and test the CLI:
+Then reload:
 ```bash
-agy --version
-agy --help
+source ~/.bashrc  # or ~/.zshrc
 ```
 
-**Note:** Do NOT run `agy plugin import gemini` unless the migration docs explicitly recommend it. Test basic functionality first.
+### Verification
+```bash
+which agy
+agy --version
+```
 
-## 2. Configuration Changes
+## 2. Before You Download: Verify the Official Source
+
+**CRITICAL STEPS:**
+
+1. **Find the official repository:**
+   - Check if Antigravity has an official GitHub repo or documentation
+   - Verify the domain (should be `google.com`, not a third-party site)
+   - Look for official release pages with checksums (SHA256, MD5)
+
+2. **Inspect the download before running:**
+   ```bash
+   # Download but don't extract yet
+   wget "https://official-url/agy-latest.tar.gz"
+   
+   # Inspect the file type
+   file agy-latest.tar.gz
+   
+   # Check contents without extracting
+   tar -tzf agy-latest.tar.gz | head -20
+   
+   # Verify checksums if provided
+   sha256sum agy-latest.tar.gz
+   # Compare against official SHA256 from release page
+   ```
+
+3. **Never pipe downloads directly to execution:**
+   ```bash
+   # ❌ UNSAFE - Don't do this
+   curl -sSL https://example.com/install | bash
+   
+   # ✅ SAFE - Always download, inspect, then execute
+   curl -sSL https://example.com/install > /tmp/install.sh
+   file /tmp/install.sh
+   cat /tmp/install.sh  # Review the script first
+   bash /tmp/install.sh
+   ```
+
+## 3. Configuration Changes
 
 ### File Renaming (Optional)
 Antigravity uses new naming conventions for workspace context:
@@ -42,7 +98,7 @@ Antigravity uses new naming conventions for workspace context:
 ### Skill Relocation (Deferred)
 Current repo does not have custom skills in `.gemini/skills/`. This step can be skipped unless you add custom skills later.
 
-## 3. Code Changes
+## 4. Code Changes
 
 ### `scripts/gemini_client.py` - Authentication & Environment Variables
 
@@ -52,8 +108,14 @@ Current repo does not have custom skills in `.gemini/skills/`. This step can be 
 
 Test with:
 ```bash
-GEMINI_API_KEY="test-key" agy "test prompt" --help 2>&1 | grep -i "key\|auth\|environment"
-agy --help | grep -i "environment\|key\|auth"
+# Test 1: Basic auth check - review help for env var docs
+agy --help | grep -iE "environment|api.?key|auth"
+
+# Test 2: Check if GEMINI_API_KEY is still valid
+GEMINI_API_KEY="test-key" agy "what is 2+2?" 2>&1 | head -20
+
+# Test 3: Look for config files or alternate auth methods
+ls -la ~/.agy/ 2>/dev/null || echo "No ~/.agy directory"
 ```
 
 **Once verified**, update the following in `gemini_client.py`:
@@ -192,7 +254,7 @@ agy --help | grep -i "environment\|key\|auth"
            shutil.rmtree(tmp_config_dir, ignore_errors=True)
    ```
 
-## 4. Key Usage & Authentication
+## 5. Key Usage & Authentication
 
 **Environment Variable:** Determine which variable `agy` uses:
 - Primary candidate: `GEMINI_API_KEY` (same as gemini-cli)
@@ -212,15 +274,18 @@ ls -la ~/.agy/ 2>/dev/null || echo "No ~/.agy directory"
 
 **Key Rotation:** The existing rotation logic in `gemini_client.py` (lines 121-140) will continue to work once you verify the environment variable name.
 
-## 5. Pre-Migration Testing Checklist
+## 6. Pre-Migration Testing Checklist
 
 Before updating `gemini_client.py`, complete these steps:
 
+- [ ] Verify official Antigravity source/GitHub repo
+- [ ] Download binary and verify file type (should be .tar.gz, .zip, or ELF binary)
+- [ ] Inspect downloaded contents before extraction
 - [ ] Install `agy` binary to `/mnt/fast_scratch/bin/`
 - [ ] Verify `agy --version` works
 - [ ] Run `agy "test prompt"` to confirm basic functionality
 - [ ] Document the exact command-line flags (run `agy --help`)
-- [ ] Determine which environment variable `agy` uses for API keys
+- [ ] Determine which environment variable (`GEMINI_API_KEY` or other) `agy` uses for API keys
 - [ ] Test API key injection: `GEMINI_API_KEY="key" agy "prompt"` or `AGY_API_KEY="key" agy "prompt"`
 - [ ] Verify JSON output format with `agy "prompt" --output=json`
 - [ ] Confirm model selection syntax (e.g., `--model pro`)
@@ -228,9 +293,9 @@ Before updating `gemini_client.py`, complete these steps:
 - [ ] Create a test branch and update only the `_execute_command` method
 - [ ] Run existing tests to ensure parsing logic still works
 
-## 6. Timeline
+## 7. Timeline
 
-- **NOW:** Install `agy` and run verification tests
+- **NOW:** Verify official source, download binary safely, install and test
 - **This week:** Update `gemini_client.py` with verified flag names
 - **Before June 18, 2026:** Complete full migration and remove `gemini-cli` dependency
 
