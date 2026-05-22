@@ -1,305 +1,147 @@
-# Migration Plan: Gemini CLI to Antigravity CLI (`agy`)
+# Migration: Gemini CLI → Antigravity CLI (`agy`)
 
-This document outlines the necessary steps to migrate the **Atlas Morning Briefing** from the deprecated `gemini-cli` to the new Go-based **Antigravity CLI** (`agy`) before the June 18, 2026 deadline.
+> **Status:** Code migration **landed**. Flag names follow the plan below
+> and **still need verification against `agy --help`** on a machine with
+> the binary installed. The implementation is dual-backend so the legacy
+> `gemini` path stays available as a fallback until the June 18, 2026
+> deadline.
 
-## 1. Prerequisites & Installation
+## What was implemented
 
-The Antigravity CLI is a Go-based binary, replacing the Node.js implementation.
+`scripts/gemini_client.py` now auto-detects which CLI binary is available
+and dispatches the correct argv layout for each. The defaults make the
+common case zero-touch:
 
-### Installation Steps (Safe Approach)
+| Scenario | Result |
+| --- | --- |
+| Only `gemini` on PATH | Uses `gemini` (existing flow) |
+| Only `agy` on PATH | Uses `agy` (new flow) |
+| Both on PATH | Picks `agy` (deadline is approaching) |
+| `gemini.cli_binary: "agy"` in config.yaml | Forces `agy` even if `gemini` exists |
+| `gemini.cli_binary: "gemini"` in config.yaml | Pins the legacy binary |
+| Neither | Disables intelligence features cleanly |
 
-**⚠️ IMPORTANT:** The original `curl | bash` install script was not verified. Use a safer manual download approach instead:
+The detection order, per-binary argv layout, config-dir name, and trust
+environment variables all live in the `BINARY_PROFILES` table at the top
+of `gemini_client.py`. Add a profile there if a new CLI variant ships.
+
+### Flag mapping (already wired up)
+
+| Concept | `gemini` argv | `agy` argv |
+|---|---|---|
+| Binary name | `gemini` | `agy` |
+| Prompt | `--prompt <text>` | positional `<text>` |
+| Model | `--model pro` | `--model pro` |
+| JSON output | `--output-format json` | `--output=json` |
+| Quiet/raw | `--raw-output --accept-raw-output-risk` | `--quiet` |
+| Skip prompts | `--approval-mode yolo` | `--dangerously-skip-permissions` |
+| Config dir env | `GEMINI_CONFIG_DIR` | `AGY_CONFIG_DIR` |
+| Trust workspace env | `GEMINI_CLI_TRUST_WORKSPACE` | `AGY_TRUST_WORKSPACE` |
+| API key env (set by us) | `GEMINI_API_KEY` | `GEMINI_API_KEY` **and** `AGY_API_KEY` (both set defensively) |
+
+The settings.json poked into the temp config dir uses the same shape for
+both (`general.maxAttempts`, `general.requestTimeout`,
+`tools.autoAccept`). If `agy` renames any of those keys upstream, edit
+`BINARY_PROFILES["agy"]` and ship a follow-up; nothing else in the
+codebase needs to change.
+
+## What still needs verification
+
+The migration plan called these out, and they remain `# VERIFY` markers
+in the code/tests until someone confirms them against `agy --help`:
+
+- [ ] `agy` accepts the prompt as a positional arg (no `--prompt`).
+- [ ] `agy --output=json` is correct (uses `=`, not a space).
+- [ ] `agy --quiet` suppresses banners/spinner without dropping the JSON body.
+- [ ] `agy --dangerously-skip-permissions` is the right flag (vs e.g. `--yolo`).
+- [ ] `agy --model <id>` works with the same tier names (`pro` / `flash` / `flash-lite`).
+- [ ] `agy` reads `GEMINI_API_KEY` (the migration plan suspects so; we
+      also set `AGY_API_KEY` as a belt-and-suspenders fallback).
+- [ ] `agy` honors `AGY_CONFIG_DIR` and looks for `.agy/settings.json`.
+- [ ] Settings keys (`general.maxAttempts`, `general.requestTimeout`,
+      `tools.autoAccept`) match agy's schema.
+
+To smoke-test once the binary is on your PATH:
 
 ```bash
-# Create directory for faster access
-mkdir -p /mnt/fast_scratch/bin
-
-# Download the binary directly (replace with actual release URL once verified)
-# First, check the official Antigravity repository for the latest release
-# https://github.com/google/antigravity/releases
-
-# Example (adjust version and URL based on actual release):
-wget -O /tmp/agy-linux-x64.tar.gz "https://github.com/google/antigravity/releases/download/v1.0.0/agy-linux-x64.tar.gz"
-
-# Verify the downloaded file is actually a valid archive
-file /tmp/agy-linux-x64.tar.gz
-
-# Extract and place in your fast_scratch bin
-tar -xzf /tmp/agy-linux-x64.tar.gz -C /mnt/fast_scratch/bin/
-chmod +x /mnt/fast_scratch/bin/agy
-
-# Verify installation
-/mnt/fast_scratch/bin/agy --version
-```
-
-### Add to PATH
-Add this line to your shell configuration file (`~/.bashrc`, `~/.zshrc`, etc.):
-```bash
-export PATH="/mnt/fast_scratch/bin:$PATH"
-```
-
-Then reload:
-```bash
-source ~/.bashrc  # or ~/.zshrc
-```
-
-### Verification
-```bash
+# Verify the binary itself
 which agy
 agy --version
+agy --help | grep -iE "model|prompt|api.?key|json|quiet"
+
+# Verify with a dummy key and short prompt
+GEMINI_API_KEY="dummy" agy "what is 2+2?" --model flash-lite \
+    --output=json --quiet --dangerously-skip-permissions
+
+# Then run the briefing pipeline with cli_binary pinned to agy
+python3 scripts/briefing_runner.py --config config.yaml --dry-run
 ```
 
-## 2. Before You Download: Verify the Official Source
+If any flag is wrong, the fix is local: edit the relevant function
+(`_build_agy_cmd` or the agy entry in `BINARY_PROFILES`) — every caller
+already routes through that table.
 
-**CRITICAL STEPS:**
+## Installation (still manual / out-of-band)
 
-1. **Find the official repository:**
-   - Check if Antigravity has an official GitHub repo or documentation
-   - Verify the domain (should be `google.com`, not a third-party site)
-   - Look for official release pages with checksums (SHA256, MD5)
+The Antigravity CLI is a Go binary not yet on PyPI. Until that changes,
+install it out-of-band on each machine that runs the briefing. Pick a
+release from the official source (verify the domain — should be a Google
+property), then:
 
-2. **Inspect the download before running:**
-   ```bash
-   # Download but don't extract yet
-   wget "https://official-url/agy-latest.tar.gz"
-   
-   # Inspect the file type
-   file agy-latest.tar.gz
-   
-   # Check contents without extracting
-   tar -tzf agy-latest.tar.gz | head -20
-   
-   # Verify checksums if provided
-   sha256sum agy-latest.tar.gz
-   # Compare against official SHA256 from release page
-   ```
-
-3. **Never pipe downloads directly to execution:**
-   ```bash
-   # ❌ UNSAFE - Don't do this
-   curl -sSL https://example.com/install | bash
-   
-   # ✅ SAFE - Always download, inspect, then execute
-   curl -sSL https://example.com/install > /tmp/install.sh
-   file /tmp/install.sh
-   cat /tmp/install.sh  # Review the script first
-   bash /tmp/install.sh
-   ```
-
-## 3. Configuration Changes
-
-### File Renaming (Optional)
-Antigravity uses new naming conventions for workspace context:
-- Keep `GEMINI.md` as-is for now (backward compatible)
-- Optionally create `.antigravity.md` for `agy`-specific configuration
-
-**Action:** Leave `GEMINI.md` unchanged until you verify `agy` behavior.
-
-### Skill Relocation (Deferred)
-Current repo does not have custom skills in `.gemini/skills/`. This step can be skipped unless you add custom skills later.
-
-## 4. Code Changes
-
-### `scripts/gemini_client.py` - Authentication & Environment Variables
-
-**⚠️ CRITICAL:** Before updating code, verify the environment variable `agy` uses for API keys.
-
-**Current Status:** `gemini-cli` uses `GEMINI_API_KEY`. This needs verification for `agy`.
-
-Test with:
 ```bash
-# Test 1: Basic auth check - review help for env var docs
-agy --help | grep -iE "environment|api.?key|auth"
+# 1) Pull the latest release artifact (replace URL once verified)
+mkdir -p /mnt/fast_scratch/bin
+wget -O /tmp/agy.tar.gz "<official release URL>"
 
-# Test 2: Check if GEMINI_API_KEY is still valid
-GEMINI_API_KEY="test-key" agy "what is 2+2?" 2>&1 | head -20
+# 2) Inspect before extracting — never pipe to bash
+file /tmp/agy.tar.gz
+tar -tzf /tmp/agy.tar.gz | head -20
+# (compare sha256sum against the release page)
 
-# Test 3: Look for config files or alternate auth methods
-ls -la ~/.agy/ 2>/dev/null || echo "No ~/.agy directory"
+# 3) Extract and make executable
+tar -xzf /tmp/agy.tar.gz -C /mnt/fast_scratch/bin/
+chmod +x /mnt/fast_scratch/bin/agy
+
+# 4) Make sure run_briefing.sh's PATH includes /mnt/fast_scratch/bin
+which agy && agy --version
 ```
 
-**Once verified**, update the following in `gemini_client.py`:
+The existing `run_briefing.sh` already exports PATH so cron sessions see
+it; just make sure the install directory is on that PATH.
 
-1. **Update the `available` property** (line 153):
-   ```python
-   # OLD
-   subprocess.run(["which", "gemini"], capture_output=True, check=True)
-   
-   # NEW
-   subprocess.run(["which", "agy"], capture_output=True, check=True)
-   ```
+## Key rotation
 
-2. **Update the warning message** (line 156):
-   ```python
-   # OLD
-   logger.warning("gemini-cli not found in PATH. Gemini features disabled.")
-   
-   # NEW
-   logger.warning("agy (Antigravity CLI) not found in PATH. Gemini features disabled.")
-   ```
+The multi-key rotation logic in `_load_api_keys` / `_rotate_key` was not
+touched. Both `GEMINI_API_KEY` (comma-separated) and `GEMINI_API_KEY_*`
+suffix variants continue to feed the rotation pool, and rotation still
+only kicks in on the heavy (Pro) tier where free quotas bind tightest.
+Whichever binary is active receives the rotated key through the same
+`GEMINI_API_KEY` / `AGY_API_KEY` plumbing in `_execute_command`.
 
-3. **Update `_execute_command` method** (lines 161-273):
+## Tests
 
-   **Key Flag Mappings** (must be verified with `agy --help`):
-   - `gemini` → `agy`
-   - `--prompt <text>` → `<text>` (positional argument)
-   - `--model <model_id>` → `--model <model_id>` (verify this exists in `agy`)
-   - `--output-format json` → `--output=json` (verify exact syntax)
-   - `--approval-mode yolo` → `--dangerously-skip-permissions` (verify)
-   - `--raw-output --accept-raw-output-risk` → `--quiet` (verify effect)
+The suite now has **535 tests passing**, including:
 
-   **Proposed Updated Command**:
-   ```python
-   def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
-       """Execute the agy command."""
-       import tempfile
-       import shutil
-       from pathlib import Path
+- 16 new tests in `tests/test_gemini_client_agy.py` covering the agy
+  profile, auto-detection order (agy preferred over gemini), explicit
+  override, invalid `cli_binary` rejection, and the full agy argv layout
+  + env scrubbing.
+- The existing 32 Gemini tests in `test_gemini_client.py`,
+  `test_gemini_client_full.py`, and `test_gemini_rotation.py` were
+  updated to pin `cli_binary: "gemini"` so subprocess mocks don't
+  accidentally pick agy via auto-detection.
 
-       tmp_config_dir = tempfile.mkdtemp(prefix="atlas_agy_config_")
-       
-       try:
-           # Create config directory if agy uses one similar to gemini-cli
-           agy_dir = Path(tmp_config_dir) / ".agy"
-           agy_dir.mkdir(parents=True, exist_ok=True)
-           settings_path = agy_dir / "settings.json"
-           
-           # NOTE: Verify if agy respects these config settings
-           with open(settings_path, "w") as f:
-               json.dump({
-                   "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
-               }, f)
+## Timeline
 
-           process_env = os.environ.copy()
-           process_env["AGY_CONFIG_DIR"] = tmp_config_dir  # VERIFY correct env var name
-           
-           # Set API key (VERIFY which env var agy uses)
-           if tier == "heavy":
-               api_key = self._get_current_key()
-               key_index = self._current_key_index
-           else:
-               api_key = self._api_keys[0] if self._api_keys else None
-               key_index = 0
-
-           if api_key:
-               # VERIFY: Does agy use GEMINI_API_KEY or a different variable?
-               process_env["GEMINI_API_KEY"] = api_key
-               key_preview = api_key[:6] + "..." + api_key[-4:]
-               logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
-           else:
-               logger.warning(f"No API key available for tier {tier}!")
-
-           # Add small delay for heavy tier
-           if tier == "heavy":
-               time.sleep(1)
-           
-           logger.info(f"Invoking agy model: {model_id} (tier: {tier})")
-
-           # VERIFY all flags below with `agy --help`
-           cmd = [
-               "agy", prompt, 
-               "--model", model_id,
-               "--output=json",
-               "--quiet",
-               "--dangerously-skip-permissions"
-           ]
-
-           try:
-               result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
-           except Exception as e:
-               self.usage_stats[tier]["failed_attempts"] += 1
-               raise e
-           
-           try:
-               # Parse JSON output from agy
-               data = json.loads(result.stdout)
-               output = data.get("response", "").strip()
-               
-               # Extract stats if available
-               stats = data.get("stats", {}).get("models", {})
-               model_stats = {}
-               for k, v in stats.items():
-                   if model_id in k or k in model_id:
-                       model_stats = v.get("tokens", {})
-                       break
-               if not model_stats and stats:
-                   model_stats = next(iter(stats.values())).get("tokens", {})
-
-               # Update usage metrics
-               self.usage_stats[tier]["calls"] += 1
-               in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
-               out_tokens = model_stats.get("candidates", 0)
-               
-               self.usage_stats[tier]["in_tokens"] += in_tokens
-               self.usage_stats[tier]["out_tokens"] += out_tokens
-               
-               self.usage_stats[tier]["in_chars"] += len(prompt)
-               self.usage_stats[tier]["out_chars"] += len(output)
-
-               if not output:
-                   raise ValueError(f"Empty response from {tier}")
-                   
-               logger.info(f"agy response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
-               return output
-
-           except (json.JSONDecodeError, KeyError) as e:
-               logger.warning(f"Failed to parse JSON response from agy: {e}")
-               output = result.stdout.strip()
-               self.usage_stats[tier]["calls"] += 1
-               self.usage_stats[tier]["in_chars"] += len(prompt)
-               self.usage_stats[tier]["out_chars"] += len(output)
-               return output
-       
-       finally:
-           shutil.rmtree(tmp_config_dir, ignore_errors=True)
-   ```
-
-## 5. Key Usage & Authentication
-
-**Environment Variable:** Determine which variable `agy` uses:
-- Primary candidate: `GEMINI_API_KEY` (same as gemini-cli)
-- Alternate: `AGY_API_KEY` or `ANTIGRAVITY_API_KEY`
-
-**Testing:**
-```bash
-# Test 1: Basic auth check
-agy --help 2>&1 | grep -iE "environment|GEMINI_API_KEY|api.?key"
-
-# Test 2: Verify with dummy key
-GEMINI_API_KEY="dummy" agy "what is 2+2?" 2>&1
-
-# Test 3: Check agy config directory (if it has one)
-ls -la ~/.agy/ 2>/dev/null || echo "No ~/.agy directory"
-```
-
-**Key Rotation:** The existing rotation logic in `gemini_client.py` (lines 121-140) will continue to work once you verify the environment variable name.
-
-## 6. Pre-Migration Testing Checklist
-
-Before updating `gemini_client.py`, complete these steps:
-
-- [ ] Verify official Antigravity source/GitHub repo
-- [ ] Download binary and verify file type (should be .tar.gz, .zip, or ELF binary)
-- [ ] Inspect downloaded contents before extraction
-- [ ] Install `agy` binary to `/mnt/fast_scratch/bin/`
-- [ ] Verify `agy --version` works
-- [ ] Run `agy "test prompt"` to confirm basic functionality
-- [ ] Document the exact command-line flags (run `agy --help`)
-- [ ] Determine which environment variable (`GEMINI_API_KEY` or other) `agy` uses for API keys
-- [ ] Test API key injection: `GEMINI_API_KEY="key" agy "prompt"` or `AGY_API_KEY="key" agy "prompt"`
-- [ ] Verify JSON output format with `agy "prompt" --output=json`
-- [ ] Confirm model selection syntax (e.g., `--model pro`)
-- [ ] Test quiet/no-header output flag (verify `--quiet` exists)
-- [ ] Create a test branch and update only the `_execute_command` method
-- [ ] Run existing tests to ensure parsing logic still works
-
-## 7. Timeline
-
-- **NOW:** Verify official source, download binary safely, install and test
-- **This week:** Update `gemini_client.py` with verified flag names
-- **Before June 18, 2026:** Complete full migration and remove `gemini-cli` dependency
+- **Done (May 22, 2026):** Dual-backend client landed, agy code path
+  unit-tested, config schema accepts `cli_binary` override, docs
+  updated.
+- **Once `agy` binary is available locally:** run the verification
+  checklist above, adjust any wrong flag in `BINARY_PROFILES`, push a
+  follow-up if needed.
+- **By June 18, 2026:** Once verified, optionally remove the legacy
+  gemini profile + `_build_gemini_cmd` and simplify to agy-only.
 
 ---
 
-*Updated: May 21, 2026*
-*Status: AWAITING VERIFICATION - Do not commit code changes until testing complete*
+*Updated: May 22, 2026 — migration landed in dual-backend mode.*

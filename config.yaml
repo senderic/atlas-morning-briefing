@@ -180,9 +180,12 @@ pdf:
   include_toc: true
   include_emoji: false
 
-# Gemini CLI configuration
+# LLM CLI configuration (supports both `agy` (Antigravity) and legacy `gemini`).
+# When `cli_binary` is omitted the client auto-detects, preferring `agy` if
+# present. Set explicitly to "agy" or "gemini" to pin a specific backend.
 gemini:
   enabled: true
+  # cli_binary: "agy"   # uncomment to force Antigravity even if both exist
   ignore_hard_quota: true
   internal_max_attempts: 1
   max_calls_per_run: 50

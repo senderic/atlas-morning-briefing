@@ -16,6 +16,7 @@ def rotation_config():
         "enabled": True,
         "max_calls_per_run": 10,
         "key_swap_delay": 0.001, # Set to 1ms for fast testing as requested
+        "cli_binary": "gemini",  # pin to legacy binary so test mocks are stable
         "models": {
             "heavy": "test-heavy",
             "medium": "test-medium",

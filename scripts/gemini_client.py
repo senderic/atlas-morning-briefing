@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Junjie Tang. MIT License. See LICENSE file for details.
 """
-Gemini CLI model client.
+Google Gemini CLI client (supports both `agy` (Antigravity) and legacy `gemini`).
 
-Provides tiered model access to Gemini CLI for intelligence features.
-Uses subprocess to call the 'gemini' command.
+The Antigravity CLI (`agy`) is the Go-based successor to `gemini-cli` and
+replaces it before the June 18, 2026 deadline. This module auto-detects
+which binary is available on PATH (preferring `agy`) and dispatches the
+right argv layout for each via the BINARY_PROFILES table.
+
+Per-binary differences captured by the profiles:
+- `agy`: prompt is positional, uses `--output=json`, `--quiet`, and
+  `--dangerously-skip-permissions`. Config dir is `.agy/`.
+- `gemini`: prompt via `--prompt`, uses `--output-format json`,
+  `--raw-output --accept-raw-output-risk`, and `--approval-mode yolo`.
+  Config dir is `.gemini/`.
+
+Override the auto-detection by setting `gemini.cli_binary` in config.yaml
+to "agy" or "gemini" — useful when both binaries exist or for testing.
 """
 
 import json
@@ -13,12 +25,12 @@ import os
 import random
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from tenacity import (
-    retry, 
-    stop_after_attempt, 
-    wait_random_exponential, 
-    retry_if_exception, 
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+    retry_if_exception,
     before_sleep_log
 )
 
@@ -26,10 +38,57 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-class GeminiCLIClient:
-    """Client for Gemini CLI model inference with tiered model support."""
+def _build_agy_cmd(model_id: str, prompt: str) -> List[str]:
+    """
+    Build argv for the Antigravity CLI (`agy`).
 
-    # Default model IDs for each tier based on gemini-cli help
+    Flag layout follows MIGRATION_PLAN_ANTIGRAVITY.md §4. Verify against
+    `agy --help` on your installation; adjust profile if upstream renames.
+    """
+    return [
+        "agy", prompt,
+        "--model", model_id,
+        "--output=json",
+        "--quiet",
+        "--dangerously-skip-permissions",
+    ]
+
+
+def _build_gemini_cmd(model_id: str, prompt: str) -> List[str]:
+    """Build argv for the legacy gemini-cli (Node.js implementation)."""
+    return [
+        "gemini", "--model", model_id, "--prompt", prompt,
+        "--approval-mode", "yolo",
+        "--raw-output", "--accept-raw-output-risk",
+        "--output-format", "json",
+    ]
+
+
+# Per-binary configuration. Order of `_DETECTION_ORDER` controls preference
+# when multiple binaries are available (agy wins over the deprecated gemini).
+BINARY_PROFILES: Dict[str, Dict[str, Any]] = {
+    "agy": {
+        "build_cmd": _build_agy_cmd,
+        "config_dirname": ".agy",
+        "config_dir_env": "AGY_CONFIG_DIR",
+        "trust_workspace_env": "AGY_TRUST_WORKSPACE",
+        "display_name": "Antigravity CLI (agy)",
+    },
+    "gemini": {
+        "build_cmd": _build_gemini_cmd,
+        "config_dirname": ".gemini",
+        "config_dir_env": "GEMINI_CONFIG_DIR",
+        "trust_workspace_env": "GEMINI_CLI_TRUST_WORKSPACE",
+        "display_name": "Gemini CLI (gemini)",
+    },
+}
+_DETECTION_ORDER: List[str] = ["agy", "gemini"]
+
+
+class GeminiCLIClient:
+    """Tiered LLM CLI client (auto-detects between `agy` and `gemini`)."""
+
+    # Default model IDs for each tier — used by both agy and gemini.
     DEFAULT_MODELS = {
         "heavy": "pro",
         "medium": "flash",
@@ -49,7 +108,18 @@ class GeminiCLIClient:
         self.enabled = config.get("enabled", True)
         self.ignore_hard_quota = config.get("ignore_hard_quota", False)
         self.internal_max_attempts = config.get("internal_max_attempts", 1)
-        
+
+        # Explicit binary override (e.g. "agy" or "gemini"); None = auto-detect.
+        # Validate so a typo doesn't silently fall through to auto-detect.
+        cli_binary = config.get("cli_binary")
+        if cli_binary is not None and cli_binary not in BINARY_PROFILES:
+            raise ValueError(
+                f"cli_binary={cli_binary!r} is not one of "
+                f"{sorted(BINARY_PROFILES.keys())}"
+            )
+        self.cli_binary_override = cli_binary
+        self._binary: Optional[str] = None  # populated on first .available
+
         # Model IDs per tier
         models_config = config.get("models", {})
         self.models = {
@@ -143,84 +213,144 @@ class GeminiCLIClient:
 
     @property
     def available(self) -> bool:
-        """Check if Gemini CLI is available and enabled."""
+        """
+        Resolve which CLI binary to use and cache the result.
+
+        If `cli_binary_override` is set, only that binary is checked.
+        Otherwise we walk _DETECTION_ORDER and pick the first that's on PATH.
+        """
         if self._available is not None:
             return self._available
         if not self.enabled:
             self._available = False
             return False
-        
-        try:
-            # Check if 'gemini' command exists
-            subprocess.run(["which", "gemini"], capture_output=True, check=True)
+
+        candidates = (
+            [self.cli_binary_override]
+            if self.cli_binary_override
+            else _DETECTION_ORDER
+        )
+        for binary in candidates:
+            try:
+                subprocess.run(
+                    ["which", binary], capture_output=True, check=True
+                )
+            except subprocess.CalledProcessError:
+                continue
+            self._binary = binary
             self._available = True
-        except subprocess.CalledProcessError:
-            logger.warning("gemini-cli not found in PATH. Gemini features disabled.")
-            self._available = False
-        
-        return self._available
+            logger.info(
+                f"Using {BINARY_PROFILES[binary]['display_name']} for LLM calls"
+            )
+            return True
+
+        attempted = ", ".join(candidates)
+        logger.warning(
+            f"No LLM CLI binary found in PATH (looked for: {attempted}). "
+            "Intelligence features disabled."
+        )
+        self._available = False
+        return False
+
+    @property
+    def binary(self) -> Optional[str]:
+        """
+        Return the active binary name.
+
+        Resolution order:
+          1. The binary picked by .available (cached on first read).
+          2. The explicit cli_binary override (if no detection was run).
+          3. The first entry in _DETECTION_ORDER as a last-resort default.
+
+        The last two fallbacks let callers that bypass .available (e.g. unit
+        tests that pre-set ._available = True) still build a coherent argv.
+        """
+        if self._binary is not None:
+            return self._binary
+        if self._available is None and self.enabled:
+            # Try real detection first
+            _ = self.available
+            if self._binary is not None:
+                return self._binary
+        # Fall back to the override or the default preference
+        return self.cli_binary_override or _DETECTION_ORDER[0]
 
     def _execute_command(self, model_id: str, prompt: str, tier: str) -> str:
-        """Execute the gemini command with a local config to force maxAttempts=1."""
+        """Execute the active CLI binary with a sandboxed config dir."""
         import tempfile
         import shutil
         from pathlib import Path
 
-        # Create a temporary directory for the gemini config
-        tmp_config_dir = tempfile.mkdtemp(prefix="atlas_gemini_config_")
-        
+        # `binary` falls back to override / preferred default when detection
+        # hasn't run, so this is always defined for an enabled client.
+        binary = self.binary
+        profile = BINARY_PROFILES[binary]
+
+        # Create a temporary directory for the CLI config (sandboxed per call)
+        tmp_config_dir = tempfile.mkdtemp(prefix=f"atlas_{binary}_config_")
+
         try:
-            # Create .gemini/settings.json in the temp dir
-            gemini_dir = Path(tmp_config_dir) / ".gemini"
-            gemini_dir.mkdir(parents=True, exist_ok=True)
-            settings_path = gemini_dir / "settings.json"
-            
-            # CRITICAL: Force maxAttempts to the configured value so Python Tenacity controls the retries
-            # Also set a shorter connection timeout to fail fast and retry at our level
+            # Drop a settings.json into <tmp>/<config_dirname>/ so the CLI
+            # picks up our retry override. Gemini honors `general.maxAttempts`
+            # and `general.requestTimeout`; agy is expected to use the same
+            # shape per the migration plan — verify against `agy --help` and
+            # tweak BINARY_PROFILES if upstream changes the key names.
+            cli_cfg_dir = Path(tmp_config_dir) / profile["config_dirname"]
+            cli_cfg_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = cli_cfg_dir / "settings.json"
             with open(settings_path, "w") as f:
                 json.dump({
-                    "general": {"maxAttempts": self.internal_max_attempts, "requestTimeout": 120000},
-                    "tools": {"autoAccept": True}
+                    "general": {
+                        "maxAttempts": self.internal_max_attempts,
+                        "requestTimeout": 120000,
+                    },
+                    "tools": {"autoAccept": True},
                 }, f)
 
-            # Use standard environment but override the config directory
+            # Use standard environment but override the config directory and HOME
             process_env = os.environ.copy()
-            process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
-            
-            # Ensure compatibility by setting both common API key environment variables
+            process_env[profile["config_dir_env"]] = tmp_config_dir
+
+            # API key plumbing — set both GEMINI_API_KEY (legacy) and the
+            # agy-named alias so either binary picks it up.
             api_key = self._get_current_key()
             key_index = self._current_key_index
 
             if api_key:
                 process_env["GEMINI_API_KEY"] = api_key
+                process_env["AGY_API_KEY"] = api_key
                 key_preview = api_key[:6] + "..." + api_key[-4:]
-                logger.debug(f"Using API Key index {key_index} for tier {tier}: {key_preview}")
+                logger.debug(
+                    f"Using API Key index {key_index} for tier {tier}: {key_preview}"
+                )
             else:
-                logger.warning(f"No Gemini API key available for tier {tier}!")
+                logger.warning(f"No API key available for tier {tier}!")
 
-            # CRITICAL: Force the CLI to use the API key by masking system-wide auth
-            # This prevents fallback to local gcloud/ADC credentials or OAuth
-            process_env["GOOGLE_API_KEY"] = ""  # Explicitly clear any inherited Google key
+            # CRITICAL: Force the CLI to use the API key by masking system-wide
+            # auth. This prevents fallback to gcloud/ADC credentials or OAuth.
+            process_env["GOOGLE_API_KEY"] = ""
             process_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
             process_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
-            process_env["HOME"] = tmp_config_dir  # Prevent looking up ~/.config or ~/.gemini
-            process_env["GEMINI_CLI_TRUST_WORKSPACE"] = "true" # Ensure it runs in headless mode
-            logger.debug("Strict Auth: Masked system-wide Google Cloud auth (ADC/OAuth), redirected HOME, and cleared GOOGLE_API_KEY.")
+            process_env["HOME"] = tmp_config_dir  # block ~/.config / ~/.gemini lookups
+            process_env[profile["trust_workspace_env"]] = "true"  # headless mode
+            logger.debug(
+                f"Strict Auth: Masked system-wide Google Cloud auth, "
+                f"redirected HOME, cleared GOOGLE_API_KEY (binary={binary})."
+            )
 
             # Add a small initial delay for the heavy tier to avoid hitting RPM limits
             if tier == "heavy":
                 time.sleep(1)
-            
-            logger.info(f"Invoking Gemini model: {model_id} (tier: {tier})")
 
-            cmd = [
-                "gemini", "--model", model_id, "--prompt", prompt,
-                "--approval-mode", "yolo", "--raw-output", "--accept-raw-output-risk",
-                "--output-format", "json"
-            ]
+            logger.info(f"Invoking {binary} model: {model_id} (tier: {tier})")
+
+            cmd = profile["build_cmd"](model_id, prompt)
 
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=True,
+                    timeout=900, env=process_env,
+                )
                 if key_index in self.key_usage_stats:
                     self.key_usage_stats[key_index]["success"] += 1
             except Exception as e:

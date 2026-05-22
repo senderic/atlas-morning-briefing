@@ -18,6 +18,7 @@ def cfg():
         "max_calls_per_run": 10,
         "key_swap_delay": 0.001,
         "internal_max_attempts": 1,
+        "cli_binary": "gemini",  # tests assert gemini-shaped argv
         "models": {"heavy": "h", "medium": "m", "light": "l"},
     }
 

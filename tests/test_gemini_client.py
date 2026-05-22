@@ -12,9 +12,12 @@ from scripts.gemini_client import GeminiCLIClient
 
 @pytest.fixture
 def mock_config():
+    # Pin cli_binary so subprocess mocks don't accidentally land on `agy`
+    # via auto-detection. The agy path has its own dedicated tests.
     return {
         "enabled": True,
         "max_calls_per_run": 10,
+        "cli_binary": "gemini",
         "models": {
             "heavy": "test-heavy",
             "medium": "test-medium",
@@ -41,14 +44,15 @@ class TestGeminiCLIClient:
     @patch("subprocess.run")
     def test_available_true(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
-        client = GeminiCLIClient({"enabled": True})
+        client = GeminiCLIClient({"enabled": True, "cli_binary": "gemini"})
         assert client.available is True
+        assert client.binary == "gemini"
         mock_run.assert_called_once_with(["which", "gemini"], capture_output=True, check=True)
 
     @patch("subprocess.run")
     def test_available_false_not_in_path(self, mock_run):
         mock_run.side_effect = subprocess.CalledProcessError(1, ["which", "gemini"])
-        client = GeminiCLIClient({"enabled": True})
+        client = GeminiCLIClient({"enabled": True, "cli_binary": "gemini"})
         assert client.available is False
 
     def test_available_false_disabled(self):
