@@ -51,6 +51,7 @@ htmlcov/
 !SKILL.md
 !GEMINI.md
 !SECURITY_FIXES.md
+!CHANGELOG.md
 !examples/*.md
 !references/*.md
 !skills/*.md

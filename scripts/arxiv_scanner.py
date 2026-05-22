@@ -3,16 +3,22 @@
 """
 ArXiv paper scanner.
 
-Scans arxiv.org for papers matching configured topics.
+Provides two scanners:
+- ArxivScanner: legacy XML/Atom client using defusedxml + parallel topic
+  scanning (the default; what tests import and what briefing_runner uses).
+- DeepXivScanner: optional DeepXiv SDK wrapper with semantic search,
+  TLDRs, and GitHub URL extraction. Opt-in via `create_scanner()` when
+  DeepXiv is installed AND a DEEPXIV_TOKEN is available.
 """
 
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import yaml
@@ -28,6 +34,31 @@ except ImportError:
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# DeepXiv is an optional upgrade — if not installed, ArxivScanner is used.
+try:
+    from deepxiv_sdk import Reader as DeepXivReader  # type: ignore
+    HAS_DEEPXIV = True
+except ImportError:
+    HAS_DEEPXIV = False
+    DeepXivReader = None  # type: ignore
+
+
+def _load_deepxiv_token() -> Optional[str]:
+    """Load DeepXiv token from environment or ~/.env (saved by deepxiv CLI)."""
+    token = os.environ.get("DEEPXIV_TOKEN")
+    if token:
+        return token
+    env_path = Path.home() / ".env"
+    if env_path.exists():
+        try:
+            for line in env_path.read_text().splitlines():
+                if line.startswith("DEEPXIV_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return None
 
 
 class ArxivScanner:
@@ -199,6 +230,196 @@ class ArxivScanner:
 
         logger.info(f"Total unique papers found: {len(all_papers)}")
         return all_papers
+
+
+# ── Optional DeepXiv SDK scanner (upstream v0.2 addition) ──
+
+
+class DeepXivScanner:
+    """
+    DeepXiv SDK scanner with semantic search and progressive reading.
+
+    Advantages over the legacy ArXiv API:
+    - Semantic / hybrid search vs keyword-only
+    - TLDR briefs without loading the full paper
+    - Citation counts and GitHub URLs
+    - 200M+ papers indexed, T+1 daily sync
+
+    Requires `deepxiv_sdk` installed AND a DEEPXIV_TOKEN.
+    Falls back to ArxivScanner if either is missing — see create_scanner().
+    """
+
+    def __init__(self, topics: List[str], days_back: int = 7, max_results: int = 20):
+        if not HAS_DEEPXIV:
+            raise RuntimeError(
+                "DeepXiv SDK not installed. "
+                "Use create_scanner() or fall back to ArxivScanner."
+            )
+        self.topics = topics
+        self.days_back = days_back
+        self.max_results = max_results
+        token = _load_deepxiv_token()
+        self.reader = DeepXivReader(token=token)
+
+    def search_topic(self, topic: str) -> List[Dict[str, Any]]:
+        """Search DeepXiv for papers on a topic."""
+        try:
+            logger.info(f"DeepXiv search: {topic}")
+            start_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+            date_from = start_date.strftime("%Y-%m-%d")
+
+            response = self.reader.search(
+                topic,
+                size=self.max_results,
+                search_mode="hybrid",
+                date_from=date_from,
+            )
+
+            # DeepXiv returns {"total": N, "results": [...], "took": ms}
+            if isinstance(response, dict) and "results" in response:
+                raw_papers = response["results"]
+            elif isinstance(response, list):
+                raw_papers = response
+            else:
+                logger.warning(f"Unexpected DeepXiv response type: {type(response)}")
+                raw_papers = []
+
+            papers = []
+            for r in raw_papers:
+                paper = self._normalize_result(r)
+                if paper:
+                    papers.append(paper)
+
+            logger.info(f"Found {len(papers)} papers for: {topic}")
+            return papers
+
+        except Exception as e:
+            logger.error(f"DeepXiv search failed for '{topic}': {e}")
+            return []
+
+    def _normalize_result(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Normalize a DeepXiv search result to our standard paper format."""
+        try:
+            arxiv_id = data.get("arxiv_id", data.get("id", ""))
+            if isinstance(arxiv_id, str) and "arxiv.org" in arxiv_id:
+                arxiv_id = arxiv_id.split("/")[-1]
+
+            title = data.get("title", "").strip()
+            summary = data.get("abstract", data.get("summary", "")).strip()
+
+            raw_authors = data.get("authors", [])
+            if isinstance(raw_authors, list) and raw_authors:
+                authors = [
+                    a.get("name", str(a)) if isinstance(a, dict) else str(a)
+                    for a in raw_authors
+                ]
+            elif isinstance(raw_authors, str) and "," in raw_authors:
+                authors = [a.strip() for a in raw_authors.split(",")]
+            else:
+                an = data.get("author_names", "")
+                authors = [a.strip() for a in an.split(",")] if "," in an else []
+
+            published = data.get(
+                "publish_at",
+                data.get("published", data.get("created_at", "")),
+            )
+            categories = data.get("categories", [])
+            if isinstance(categories, str):
+                categories = [c.strip() for c in categories.split(",") if c.strip()]
+
+            citations = data.get("citation", data.get("citations", 0)) or 0
+            score = data.get("score", 0)
+
+            return {
+                "id": f"http://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
+                "arxiv_id": str(arxiv_id),
+                "title": title,
+                "summary": summary,
+                "authors": authors,
+                "published": str(published) if published else "",
+                "updated": str(
+                    data.get("updated_at", data.get("modified_at", published) or "")
+                ),
+                "categories": categories,
+                "pdf_link": f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else "",
+                "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
+                "citations": citations,
+                "deepxiv_score": score,
+                "source": "deepxiv",
+            }
+        except Exception as e:
+            logger.warning(f"Failed to normalize DeepXiv result: {e}")
+            return None
+
+    def enrich_paper(self, arxiv_id: str) -> Dict[str, Any]:
+        """Get a brief summary for a paper (saves tokens vs full read)."""
+        try:
+            clean_id = arxiv_id.split("/")[-1] if "/" in arxiv_id else arxiv_id
+            brief = self.reader.brief(clean_id)
+            if isinstance(brief, dict):
+                return brief
+            if isinstance(brief, str):
+                return {"brief": brief}
+            if hasattr(brief, "__dict__"):
+                return brief.__dict__
+            return {}
+        except Exception as e:
+            logger.debug(f"Brief failed for {arxiv_id}: {e}")
+            return {}
+
+    def scan_all_topics(self) -> List[Dict[str, Any]]:
+        """Scan all configured topics, dedupe by arxiv_id, enrich top 10."""
+        all_papers: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+
+        for topic in self.topics:
+            for paper in self.search_topic(topic):
+                pid = paper.get("arxiv_id", paper.get("id", ""))
+                if pid and pid not in seen_ids:
+                    all_papers.append(paper)
+                    seen_ids.add(pid)
+
+        logger.info(f"Total unique papers: {len(all_papers)}")
+
+        # Enrich top 10 papers with briefs (saves DeepXiv API budget)
+        top_papers = sorted(
+            all_papers, key=lambda p: p.get("deepxiv_score", 0), reverse=True
+        )[:10]
+        for paper in top_papers:
+            aid = paper.get("arxiv_id", "")
+            if not aid:
+                continue
+            brief_data = self.enrich_paper(aid)
+            if not brief_data:
+                continue
+            if "tldr" in brief_data:
+                paper["tldr"] = brief_data["tldr"]
+            if brief_data.get("github_url"):
+                paper["github_url"] = brief_data["github_url"]
+            if "keywords" in brief_data:
+                paper["keywords"] = brief_data["keywords"]
+
+        return all_papers
+
+
+def create_scanner(
+    topics: List[str], days_back: int = 7, max_results: int = 20
+):
+    """
+    Return the best available scanner.
+
+    Picks DeepXivScanner when both the SDK and a token are present;
+    otherwise falls back to the parallel defusedxml ArxivScanner.
+    """
+    if HAS_DEEPXIV and _load_deepxiv_token():
+        logger.info("Using DeepXiv SDK for paper search")
+        return DeepXivScanner(
+            topics=topics, days_back=days_back, max_results=max_results
+        )
+    logger.info("Using legacy ArXiv API scanner")
+    return ArxivScanner(
+        topics=topics, days_back=days_back, max_results=max_results
+    )
 
 
 def load_config(config_path: str) -> Dict[str, Any]:

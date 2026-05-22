@@ -26,10 +26,10 @@ triggers:
 requires:
   python: ">=3.10"
   env:
-    required: []
-    optional:
+    required:
       - FINNHUB_API_KEY
       - BRAVE_API_KEY
+    optional:
       - GMAIL_USER
       - GMAIL_APP_PASSWORD
 ---
@@ -237,6 +237,46 @@ Reproduction difficulty is estimated as S/M/L/XL based on:
 - Compute requirements
 
 When Gemini is enabled, reproduction assessment includes specific compute estimates and blocker identification.
+
+## Troubleshooting
+
+### No papers found
+- Check arxiv_topics in config.yaml match arxiv categories
+- Verify date range is not too narrow
+
+### PDF generation fails
+- PDF generation is disabled by default; enable via `pdf.enabled: true` in config.yaml
+- Ensure fonts are installed for CJK support
+- Check markdown formatting is valid
+
+### Email delivery fails
+- Verify GMAIL_USER and GMAIL_APP_PASSWORD are set
+- Check sender_email matches GMAIL_USER
+- Ensure Kindle email is whitelisted in Amazon account
+
+### API rate limits
+- Finnhub: Free tier allows 60 calls/minute
+- Brave Search: Check your plan limits
+- Rate limiting is built-in (0.5s delay between Finnhub calls, 1.0s between Brave calls)
+
+### LLM call budget exhausted
+- The intelligence layer has a per-run call budget (default: 50 calls for Gemini)
+- With all features enabled and many papers, this can be exceeded
+- Increase via `gemini.max_calls_per_run` in config.yaml:
+  ```yaml
+  gemini:
+    max_calls_per_run: 80
+  ```
+- Typical usage: ~20-30 calls with default settings
+
+### Gemini CLI errors
+- Verify the `gemini` binary is on PATH (`which gemini`)
+- Ensure GEMINI_API_KEY (or GEMINI_API_KEY_* for rotation) is set
+- Set `gemini.enabled: false` to disable and run deterministically
+
+### Config validation errors
+- The runner validates config at startup and reports specific errors
+- Check the error message for the invalid field and expected type
 
 ## Architecture
 
