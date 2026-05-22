@@ -73,29 +73,31 @@ class TestBinaryProfiles:
 
 class TestAvailableAutoDetect:
     @patch("subprocess.run")
-    def test_picks_agy_when_present(self, mock_run):
-        """When auto-detecting, agy is preferred over gemini."""
+    def test_picks_gemini_when_present(self, mock_run):
+        """Default preference is gemini (agy 1.0.1 is OAuth-only, see
+        MIGRATION_PLAN_ANTIGRAVITY.md §Findings). When both binaries are
+        on PATH, gemini wins."""
         mock_run.return_value = MagicMock(returncode=0)
         client = GeminiCLIClient({"enabled": True})  # no explicit binary
         assert client.available is True
-        assert client.binary == "agy"
+        assert client.binary == "gemini"
         # Only one `which` call — first candidate wins
         first_call = mock_run.call_args_list[0]
-        assert first_call.args[0] == ["which", "agy"]
+        assert first_call.args[0] == ["which", "gemini"]
 
     @patch("subprocess.run")
-    def test_falls_back_to_gemini(self, mock_run):
-        """When agy isn't on PATH but gemini is, we get gemini."""
-        # First call (which agy) fails; second (which gemini) succeeds
+    def test_falls_back_to_agy(self, mock_run):
+        """When gemini isn't on PATH but agy is, we get agy."""
+        # First call (which gemini) fails; second (which agy) succeeds
         mock_run.side_effect = [
-            subprocess.CalledProcessError(1, ["which", "agy"]),
+            subprocess.CalledProcessError(1, ["which", "gemini"]),
             MagicMock(returncode=0),
         ]
         client = GeminiCLIClient({"enabled": True})
         assert client.available is True
-        assert client.binary == "gemini"
-        assert mock_run.call_args_list[0].args[0] == ["which", "agy"]
-        assert mock_run.call_args_list[1].args[0] == ["which", "gemini"]
+        assert client.binary == "agy"
+        assert mock_run.call_args_list[0].args[0] == ["which", "gemini"]
+        assert mock_run.call_args_list[1].args[0] == ["which", "agy"]
 
     @patch("subprocess.run")
     def test_explicit_override_skips_detection(self, mock_run):

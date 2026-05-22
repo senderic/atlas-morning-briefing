@@ -65,7 +65,11 @@ def _build_gemini_cmd(model_id: str, prompt: str) -> List[str]:
 
 
 # Per-binary configuration. Order of `_DETECTION_ORDER` controls preference
-# when multiple binaries are available (agy wins over the deprecated gemini).
+# when multiple binaries are available. `gemini` wins because gemini-cli is
+# the actively maintained headless tool with API-key auth, while `agy`
+# (Antigravity 1.0.1) is OAuth-only and not viable for cron use — see
+# MIGRATION_PLAN_ANTIGRAVITY.md §Findings. Flip the order or set
+# `gemini.cli_binary: "agy"` in config.yaml once agy gains headless auth.
 BINARY_PROFILES: Dict[str, Dict[str, Any]] = {
     "agy": {
         "build_cmd": _build_agy_cmd,
@@ -82,7 +86,7 @@ BINARY_PROFILES: Dict[str, Dict[str, Any]] = {
         "display_name": "Gemini CLI (gemini)",
     },
 }
-_DETECTION_ORDER: List[str] = ["agy", "gemini"]
+_DETECTION_ORDER: List[str] = ["gemini", "agy"]
 
 
 class GeminiCLIClient:
