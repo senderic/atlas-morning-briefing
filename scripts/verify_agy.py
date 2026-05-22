@@ -26,25 +26,36 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Flag combos we want to confirm. These match what's currently in
-# scripts/gemini_client.py:BINARY_PROFILES["agy"] — anything that fails
-# here is something to fix in that table.
+# Flag combos that ACTUALLY exist in agy 1.0.1 (per `agy --help`):
+#   --print / --prompt / -p   Run a single prompt non-interactively
+#   --print-timeout           Timeout for print mode (default 5m)
+#   --dangerously-skip-permissions  Auto-approve tool permissions
+#   --sandbox                 Run with terminal sandbox
+#   --add-dir                 Add workspace dir (repeatable)
+#
+# Notably absent: --model, --output, --output-format, --quiet, --raw-output,
+# --approval-mode. So model selection must happen via env var / config /
+# default. Output is plain text, not JSON.
 PLAN_ARGS = {
-    "prompt_via": "positional",          # not "--prompt"
-    "output_flag": "--output=json",      # not "--output-format json"
-    "quiet_flag": "--quiet",             # not "--raw-output"
-    "skip_perm_flag": "--dangerously-skip-permissions",  # not "--yolo"
+    "prompt_mode_flag": "--print",
+    "prompt_via": "positional",
+    "skip_perm_flag": "--dangerously-skip-permissions",
 }
 
+# Variant probes — if the above primary args fail, we walk these to find what
+# does work. Plain values where flag takes a value, list of (flag, value)
+# tuples where the flag is a switch on its own.
 FALLBACK_VARIANTS = {
-    "output_flag": ["--output=json", "--output", "--output-format"],
-    "quiet_flag": ["--quiet", "--silent", "--raw-output", "--no-spinner"],
-    "skip_perm_flag": [
-        "--dangerously-skip-permissions",
-        "--yolo",
-        "--approval-mode",
-        "--skip-permissions",
-        "--no-confirm",
+    "prompt_mode_flag": ["--print", "--prompt", "-p"],
+    "model_selection_env": [
+        "AGY_MODEL", "GEMINI_MODEL", "ANTIGRAVITY_MODEL", "MODEL",
+    ],
+    "api_key_env": [
+        "GEMINI_API_KEY", "AGY_API_KEY", "ANTIGRAVITY_API_KEY",
+        "GOOGLE_API_KEY",
+    ],
+    "config_dir_env": [
+        "AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR", "GEMINI_CONFIG_DIR",
     ],
 }
 
@@ -197,114 +208,151 @@ def grep_help(binary: str) -> Optional[str]:
     return out_text
 
 
-def attempt_call(binary: str, model: str, prompt: str,
-                 argv_after_prompt: List[str],
+def first_api_key() -> Optional[str]:
+    """Match scripts/gemini_client.py:_load_api_keys precedence."""
+    raw = os.environ.get("GEMINI_API_KEY", "")
+    if raw:
+        return raw.split(",")[0].strip()
+    for var in sorted(k for k in os.environ if k.startswith("GEMINI_API_KEY_")):
+        val = os.environ[var].strip()
+        if val:
+            return val
+    for var in ("AGY_API_KEY", "ANTIGRAVITY_API_KEY", "GOOGLE_API_KEY"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return None
+
+
+def attempt_call(binary: str, prompt: str,
+                 argv: List[str],
                  env_overrides: Dict[str, str],
-                 label: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """One verification call. Returns (success, parsed_json_or_None)."""
+                 label: str,
+                 timeout: int = 90) -> Tuple[bool, str, str]:
+    """
+    One verification call. Returns (success, stdout, stderr).
+
+    Unlike the previous version this passes the full argv as-is so each
+    test can supply its own ordering / flag combination.
+    """
     process_env = os.environ.copy()
     process_env.update(env_overrides)
 
-    cmd = [binary, prompt, "--model", model] + argv_after_prompt
-    pretty_cmd = " ".join(
-        ["agy", repr(prompt), "--model", model] + argv_after_prompt
-    )
-    print(f"\n  Trying: {pretty_cmd}")
+    pretty = " ".join("'" + a + "'" if " " in a else a for a in argv)
+    print(f"\n  Trying ({label}): {pretty}")
 
-    rc, stdout, stderr = run(cmd, env=process_env, timeout=60)
+    rc, stdout, stderr = run(argv, env=process_env, timeout=timeout)
     if rc != 0:
-        first_err = (stderr or stdout).splitlines()[:3]
-        print(f"  FAIL ({label}): exit {rc}")
-        for line in first_err:
-            print(f"    | {line[:120]}")
-        return False, None
+        print(f"  FAIL: exit {rc}")
+        for line in (stderr or stdout).splitlines()[:5]:
+            print(f"    err| {line[:120]}")
+        return False, stdout, stderr
 
-    print(f"  PASS ({label}): exit 0, stdout {len(stdout)} chars")
-    try:
-        data = json.loads(stdout)
-        print(f"    JSON keys: {sorted(data.keys())[:8]}")
-        return True, data
-    except json.JSONDecodeError:
-        first_line = stdout.splitlines()[0][:120] if stdout else "(empty)"
-        print(f"    NOT JSON, first line: {first_line}")
-        return True, None  # call succeeded but response wasn't JSON
+    print(f"  PASS: exit 0, stdout={len(stdout)}c stderr={len(stderr)}c")
+    if stdout:
+        head = "\n".join(stdout.splitlines()[:5])
+        for line in head.splitlines():
+            print(f"    out| {line[:120]}")
+        if len(stdout.splitlines()) > 5:
+            print(f"    out| ... ({len(stdout.splitlines()) - 5} more lines)")
+    if stderr:
+        head = "\n".join(stderr.splitlines()[:3])
+        for line in head.splitlines():
+            print(f"    err| {line[:120]}")
+    return True, stdout, stderr
 
 
-def try_plan_argv(binary: str, model: str, prompt: str) -> Optional[Dict[str, Any]]:
-    section("[3] Real call with migration-plan argv")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("AGY_API_KEY")
+def try_plan_argv(binary: str, prompt: str) -> Optional[str]:
+    section("[3] Real call with agy 1.0.1 best-guess argv")
+    api_key = first_api_key()
     if not api_key:
-        print("  SKIP: no GEMINI_API_KEY or AGY_API_KEY in env")
+        print("  SKIP: no API key found in any known env var")
         return None
-
     print(f"  Using key: {mask(api_key)}")
-    # Set both envs as the production client does
-    env = {"GEMINI_API_KEY": api_key, "AGY_API_KEY": api_key}
+
+    # Set every env var agy *might* read; the production client does the same.
+    env = {
+        "GEMINI_API_KEY": api_key,
+        "AGY_API_KEY": api_key,
+        "ANTIGRAVITY_API_KEY": api_key,
+    }
+    # Per `agy --help`: --print is the non-interactive mode flag, prompt is
+    # positional. We also try with --dangerously-skip-permissions to avoid
+    # any interactive permission grant.
     argv = [
-        PLAN_ARGS["output_flag"],
-        PLAN_ARGS["quiet_flag"],
-        PLAN_ARGS["skip_perm_flag"],
+        binary,
+        "--print",
+        "--dangerously-skip-permissions",
+        prompt,
     ]
-    success, data = attempt_call(binary, model, prompt, argv, env, "plan argv")
-    return data if success else None
+    ok, stdout, stderr = attempt_call(binary, prompt, argv, env, "primary")
+    return stdout if ok else None
 
 
-def try_fallback_combos(binary: str, model: str, prompt: str) -> None:
-    section("[4] Flag variant probing (only if plan argv failed)")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("AGY_API_KEY")
+def try_alternate_argv(binary: str, prompt: str) -> None:
+    section("[4] Alternate argv variants")
+    api_key = first_api_key()
     if not api_key:
-        print("  SKIP: no key, cannot probe variants")
+        print("  SKIP: no API key")
         return
+    env = {
+        "GEMINI_API_KEY": api_key,
+        "AGY_API_KEY": api_key,
+        "ANTIGRAVITY_API_KEY": api_key,
+    }
+    # Try several orderings & flag aliases to see what agy accepts
+    variants = [
+        # No skip-permissions
+        [binary, "--print", prompt],
+        # --prompt alias
+        [binary, "--prompt", prompt],
+        # -p short alias
+        [binary, "-p", prompt],
+        # Flag-then-prompt with skip-permissions BEFORE --print
+        [binary, "--dangerously-skip-permissions", "--print", prompt],
+        # Prompt BEFORE the flags (some CLIs are positional-first)
+        [binary, prompt, "--print", "--dangerously-skip-permissions"],
+        # Just positional, no mode flag (does agy print-mode by default in non-tty?)
+        [binary, prompt],
+    ]
+    for argv in variants:
+        attempt_call(binary, prompt, argv, env, label=f"{argv[1]} ...", timeout=45)
 
-    env = {"GEMINI_API_KEY": api_key, "AGY_API_KEY": api_key}
 
-    # Walk fallbacks for the skip-perm flag first (most likely to be renamed)
-    for variant in FALLBACK_VARIANTS["skip_perm_flag"]:
-        # Some flags take a value (e.g. --approval-mode yolo)
-        argv = [PLAN_ARGS["output_flag"], PLAN_ARGS["quiet_flag"]]
-        if variant == "--approval-mode":
-            argv += [variant, "yolo"]
-        else:
-            argv += [variant]
-        attempt_call(binary, model, prompt, argv, env, f"skip-perm={variant}")
-
-
-def env_var_probe(binary: str, model: str, prompt: str) -> None:
-    section("[5] API key env var detection")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("AGY_API_KEY")
+def env_var_probe(binary: str, prompt: str) -> None:
+    section("[5] API key env var detection (which one does agy read?)")
+    api_key = first_api_key()
     if not api_key:
         print("  SKIP: no key in env")
         return
 
-    plan_argv = [
-        PLAN_ARGS["output_flag"],
-        PLAN_ARGS["quiet_flag"],
-        PLAN_ARGS["skip_perm_flag"],
-    ]
+    base_argv = [binary, "--print", "--dangerously-skip-permissions", prompt]
+    # Clear EVERY known auth env so only the one under test is set.
     base_env = {k: "" for k in (
         "GEMINI_API_KEY", "AGY_API_KEY", "ANTIGRAVITY_API_KEY",
         "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUDSDK_AUTH_ACCESS_TOKEN",
     )}
+    # Also clear any GEMINI_API_KEY_* suffix vars from the inherited env.
+    for k in list(os.environ):
+        if k.startswith("GEMINI_API_KEY_"):
+            base_env[k] = ""
 
-    for var_name in ("GEMINI_API_KEY", "AGY_API_KEY", "ANTIGRAVITY_API_KEY"):
+    for var_name in FALLBACK_VARIANTS["api_key_env"]:
         env = {**base_env, var_name: api_key}
-        attempt_call(binary, model, prompt, plan_argv, env, f"only {var_name}")
+        attempt_call(binary, prompt, base_argv, env, label=f"only {var_name}")
 
 
-def config_dir_probe(binary: str, model: str, prompt: str) -> None:
+def config_dir_probe(binary: str, prompt: str) -> None:
     section("[6] Config dir env var detection")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("AGY_API_KEY")
+    api_key = first_api_key()
     if not api_key:
         print("  SKIP: no key in env")
         return
 
-    plan_argv = [
-        PLAN_ARGS["output_flag"],
-        PLAN_ARGS["quiet_flag"],
-        PLAN_ARGS["skip_perm_flag"],
-    ]
+    base_argv = [binary, "--print", "--dangerously-skip-permissions", prompt]
 
-    for var_name in ("AGY_CONFIG_DIR", "ANTIGRAVITY_CONFIG_DIR", "GEMINI_CONFIG_DIR"):
+    for var_name in FALLBACK_VARIANTS["config_dir_env"]:
         with tempfile.TemporaryDirectory(prefix=f"verify_{var_name}_") as tmp:
             # Drop a settings.json into both .agy/ and .gemini/ for safety
             for subdir in (".agy", ".gemini"):
@@ -320,15 +368,33 @@ def config_dir_probe(binary: str, model: str, prompt: str) -> None:
                 var_name: tmp,
                 "HOME": tmp,
             }
-            attempt_call(binary, model, prompt, plan_argv, env, f"only {var_name}")
+            attempt_call(binary, prompt, base_argv, env, label=f"{var_name}={mask(tmp)}")
+
+
+def model_env_probe(binary: str, prompt: str) -> None:
+    section("[5b] Model selection env var probe")
+    api_key = first_api_key()
+    if not api_key:
+        print("  SKIP: no key in env")
+        return
+
+    base_argv = [binary, "--print", "--dangerously-skip-permissions", prompt]
+    base_env = {
+        "GEMINI_API_KEY": api_key,
+        "AGY_API_KEY": api_key,
+    }
+    # agy 1.0.1 has no --model flag, so model selection must be env-driven.
+    # Try each candidate env var with a known model name. If the call still
+    # succeeds we can't distinguish; we just record the result.
+    for var_name in FALLBACK_VARIANTS["model_selection_env"]:
+        env = {**base_env, var_name: "flash-lite"}
+        attempt_call(binary, prompt, base_argv, env, label=f"{var_name}=flash-lite")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--binary", default="agy",
                         help="CLI binary to test (default: agy)")
-    parser.add_argument("--model", default="flash-lite",
-                        help="Model tier name (default: flash-lite, cheapest)")
     parser.add_argument("--prompt", default="Reply with just '4' and nothing else: what is 2+2?",
                         help="Short test prompt (default: math question)")
     parser.add_argument("--skip-real-call", action="store_true",
@@ -366,30 +432,34 @@ def main() -> int:
         print("\n→ --skip-real-call set; stopping before any LLM call.")
         return 0
 
-    data = try_plan_argv(args.binary, args.model, args.prompt)
-    if data is None and not args.skip_variant_probe:
-        try_fallback_combos(args.binary, args.model, args.prompt)
+    primary_stdout = try_plan_argv(args.binary, args.prompt)
+    if primary_stdout is None and not args.skip_variant_probe:
+        try_alternate_argv(args.binary, args.prompt)
 
     if not args.skip_variant_probe:
-        env_var_probe(args.binary, args.model, args.prompt)
-        config_dir_probe(args.binary, args.model, args.prompt)
+        env_var_probe(args.binary, args.prompt)
+        model_env_probe(args.binary, args.prompt)
+        config_dir_probe(args.binary, args.prompt)
 
     section("[7] Summary")
-    if data is not None:
-        print("  Migration-plan argv WORKS as-is. No changes needed to")
-        print("  BINARY_PROFILES['agy'] in scripts/gemini_client.py.")
-        # Inspect the JSON shape so we know whether usage_stats keys match
-        print(f"\n  JSON top-level keys: {sorted(data.keys())}")
-        stats = data.get("stats", {}).get("models")
-        if stats:
-            sample_key = next(iter(stats.keys()))
-            sample_tok = stats[sample_key].get("tokens", {})
-            print(f"  stats.models.{sample_key}.tokens = {sample_tok}")
+    if primary_stdout is not None:
+        print("  Primary argv WORKS:")
+        print("    agy --print --dangerously-skip-permissions <prompt>")
+        print()
+        print("  Response is plain text (not JSON). First 200 chars of stdout:")
+        print(f"    {primary_stdout[:200]!r}")
+        print()
+        print("  Next steps:")
+        print("  1. Update scripts/gemini_client.py:_build_agy_cmd to match.")
+        print("  2. Add a plain-text response parser to BINARY_PROFILES['agy']")
+        print("     (the existing JSON parser falls back to raw stdout already,")
+        print("     which works but loses token stats).")
+        print("  3. Review sections [5], [5b], [6] above for which env vars")
+        print("     agy actually reads.")
     else:
-        print("  Migration-plan argv FAILED. Review section [4] above to")
-        print("  see which flag variant worked, then patch BINARY_PROFILES")
-        print("  ['agy'] in scripts/gemini_client.py.")
-    return 0 if data is not None else 1
+        print("  Primary argv FAILED. Look at section [4] to see which")
+        print("  argv variant returned exit 0 with a coherent response.")
+    return 0 if primary_stdout is not None else 1
 
 
 if __name__ == "__main__":
