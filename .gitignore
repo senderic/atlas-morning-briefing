@@ -40,6 +40,9 @@ logs/*.log
 
 # Test cache
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Markdown files (except docs)
 *.md
