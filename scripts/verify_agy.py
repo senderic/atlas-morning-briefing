@@ -58,6 +58,42 @@ def mask(s: Optional[str]) -> str:
     return f"{s[:4]}...{s[-4:]}"
 
 
+def load_env_files() -> List[str]:
+    """
+    Load .env from common locations into os.environ so the verifier picks
+    up credentials the same way briefing_runner.py does.
+
+    Returns the list of paths that were loaded (for reporting).
+    """
+    loaded = []
+    # Look at the project root (parent of scripts/) and the user's home
+    candidates = [
+        Path(__file__).resolve().parent.parent / ".env",
+        Path.home() / ".env",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            # Strip optional `export ` prefix
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+        loaded.append(str(path))
+    return loaded
+
+
 def run(cmd: List[str], env: Optional[Dict[str, str]] = None,
         timeout: int = 30) -> Tuple[int, str, str]:
     """Run a command, return (exit_code, stdout, stderr). Errors don't raise."""
@@ -100,43 +136,65 @@ def check_binary(binary: str) -> Optional[str]:
 
 def grep_help(binary: str) -> Optional[str]:
     section("[2] --help analysis")
-    rc, out, err = run([binary, "--help"], timeout=10)
-    if rc != 0:
-        # Some CLIs put help on stderr
-        out = out or err
-    if not out:
-        print("  FAIL: no --help output")
+    # Try several conventions: --help, -h, help subcommand, no args.
+    # Capture both stdout and stderr separately — many Go CLIs print
+    # help on stderr by default.
+    attempts = [
+        [binary, "--help"],
+        [binary, "-h"],
+        [binary, "help"],
+        [binary],
+    ]
+    out_text = ""
+    for cmd in attempts:
+        rc, out, err = run(cmd, timeout=10)
+        combined = (out or "") + ("\n" + err if err else "")
+        combined = combined.strip()
+        print(f"  Tried: {' '.join(cmd):20} exit={rc} "
+              f"stdout={len(out)}c stderr={len(err)}c")
+        if combined and len(combined) > out_text.__len__():
+            out_text = combined
+
+    if not out_text:
+        print("\n  FAIL: no help output from any invocation")
+        print("  Try manually:  agy --help; agy -h; agy help; agy")
         return None
 
-    print(f"  Lines: {len(out.splitlines())} ({len(out)} chars)")
+    print(f"\n  Best output: {len(out_text.splitlines())} lines, "
+          f"{len(out_text)} chars")
+    print("  --- first 30 help lines (truncated) ---")
+    for line in out_text.splitlines()[:30]:
+        print(f"  | {line[:110]}")
+    print("  --- end ---")
     print()
 
     # Find the lines that mention each interesting flag pattern
     patterns = {
-        "model": r"--model\b",
-        "prompt": r"--prompt\b",
-        "output": r"--output(\b|[=-])",
-        "quiet": r"--quiet\b",
+        "model": r"--model\b|-m\b",
+        "prompt": r"--prompt\b|-p\b",
+        "output": r"--output(\b|[=-])|-o\b",
+        "quiet": r"--quiet\b|-q\b",
         "raw": r"--raw[\w-]*\b",
         "json": r"\bjson\b",
         "yolo": r"--yolo\b|approval[\w-]*",
-        "skip-perm": r"--(?:dangerously-)?skip[\w-]*permission",
-        "api_key_env": r"GEMINI_API_KEY|AGY_API_KEY|ANTIGRAVITY_API_KEY",
-        "config_dir_env": r"GEMINI_CONFIG_DIR|AGY_CONFIG_DIR|ANTIGRAVITY_CONFIG_DIR",
+        "skip-perm": r"--(?:dangerously-)?skip[\w-]*permission|--unsafe",
+        "api_key_env": r"GEMINI_API_KEY|AGY_API_KEY|ANTIGRAVITY_API_KEY|API[\s_-]?KEY",
+        "config_dir_env": r"GEMINI_CONFIG_DIR|AGY_CONFIG_DIR|ANTIGRAVITY_CONFIG_DIR|CONFIG[\s_-]?DIR",
     }
+    print("  --- flag/env greps ---")
     for name, pat in patterns.items():
         hits = [
-            line.strip() for line in out.splitlines()
+            line.strip() for line in out_text.splitlines()
             if re.search(pat, line, flags=re.IGNORECASE)
         ]
         if hits:
-            print(f"  [{name:14}] " + (hits[0][:100]))
+            print(f"  [{name:14}] " + (hits[0][:110]))
             for extra in hits[1:3]:
-                print(f"  {'':17} " + extra[:100])
+                print(f"  {'':17} " + extra[:110])
         else:
-            print(f"  [{name:14}] (not found in --help)")
+            print(f"  [{name:14}] (not found)")
 
-    return out
+    return out_text
 
 
 def attempt_call(binary: str, model: str, prompt: str,
@@ -283,6 +341,19 @@ def main() -> int:
     print(f"Plan argv (from BINARY_PROFILES[\"agy\"]):")
     for k, v in PLAN_ARGS.items():
         print(f"  {k:18} = {v}")
+
+    loaded = load_env_files()
+    print(f"\n.env files loaded: {loaded if loaded else '(none found)'}")
+    print("Key env vars now visible to subprocess:")
+    for name in (
+        "GEMINI_API_KEY", "AGY_API_KEY", "ANTIGRAVITY_API_KEY",
+        "GEMINI_API_KEY_1", "GEMINI_API_KEY_PRIMARY",
+    ):
+        print(f"  {name:24} = {mask(os.environ.get(name))}")
+    extra_gemini = [k for k in os.environ if k.startswith("GEMINI_API_KEY_")
+                    and k not in ("GEMINI_API_KEY_1", "GEMINI_API_KEY_PRIMARY")]
+    if extra_gemini:
+        print(f"  (+{len(extra_gemini)} more GEMINI_API_KEY_* keys)")
 
     path = check_binary(args.binary)
     if path is None:
