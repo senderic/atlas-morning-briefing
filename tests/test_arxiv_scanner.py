@@ -333,11 +333,19 @@ class TestCreateScanner:
         assert scanner.__class__.__name__ == "ArxivScanner"
 
     def test_deepxiv_scanner_init_when_no_token(self, monkeypatch):
-        """Reader() is called with no token args, allowing auto-register."""
+        """Reader() is called with no token args, allowing auto-register.
+
+        Hermetic isolation: stub _load_deepxiv_token directly. The function
+        normally checks both os.environ['DEEPXIV_TOKEN'] AND ~/.env, so
+        clearing only the env var leaves the test sensitive to whatever
+        ~/.env happens to contain on the developer's machine — which once
+        leaked a real production token into the assertion error
+        ('Actual: DeepXivReader(token=...)'). Stubbing the loader keeps
+        the test green regardless of filesystem state."""
         if not arxiv_mod.HAS_DEEPXIV:
             pytest.skip("deepxiv-sdk not installed")
         monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
-        # Patch Reader to a mock so we can inspect what was passed
+        monkeypatch.setattr(arxiv_mod, "_load_deepxiv_token", lambda: None)
         with patch.object(arxiv_mod, "DeepXivReader") as mock_reader:
             create_scanner(topics=["X"], days_back=1, max_results=1)
             mock_reader.assert_called_once_with()  # no kwargs == auto-register
@@ -346,6 +354,8 @@ class TestCreateScanner:
         if not arxiv_mod.HAS_DEEPXIV:
             pytest.skip("deepxiv-sdk not installed")
         monkeypatch.setenv("DEEPXIV_TOKEN", "explicit-token")
+        monkeypatch.setattr(arxiv_mod, "_load_deepxiv_token",
+                            lambda: "explicit-token")
         with patch.object(arxiv_mod, "DeepXivReader") as mock_reader:
             create_scanner(topics=["X"], days_back=1, max_results=1)
             mock_reader.assert_called_once_with(token="explicit-token")
