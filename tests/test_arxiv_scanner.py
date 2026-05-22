@@ -45,6 +45,14 @@ class TestExtractPapersList:
         papers = self._paper(3)
         assert _extract_papers_list({"data": papers, "total": 3}) == papers
 
+    def test_singular_result_key(self):
+        """May 2026 'unified retrieve endpoint' uses 'result' (singular).
+        Pinned by the breadcrumb-warning loop in our first live run after
+        the multi-key extractor shipped — the walker recovered the data,
+        then we promoted 'result' to a known key."""
+        papers = self._paper(30)
+        assert _extract_papers_list({"result": papers}) == papers
+
     def test_new_docs_key(self):
         """Common RAG/retrieval envelope key."""
         papers = self._paper(2)

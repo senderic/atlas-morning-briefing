@@ -49,10 +49,15 @@ except ImportError:
 # observed frequency / specificity. The "unified retrieve endpoint"
 # (introduced May 2026) is what triggered this: the legacy `results` key
 # stopped showing up and the daily briefing started rendering with zero
-# Top Papers. If the SDK ever changes shape again, the unknown-key
-# fallback below should still recover the data.
+# Top Papers. The fallback walker (in _extract_papers_list below)
+# recovered automatically by finding the list-of-dicts value under
+# `result` (singular) and logged a breadcrumb telling us to add the key
+# here — which is why `result` is now in this list. If the SDK ever
+# changes shape again, the same fallback path will recover the data and
+# log the next key to add.
 _KNOWN_DEEPXIV_LIST_KEYS = (
-    "results", "data", "docs", "items", "hits", "papers", "top_k", "retrieve",
+    "results", "result", "data", "docs", "items", "hits", "papers",
+    "top_k", "retrieve",
 )
 
 
