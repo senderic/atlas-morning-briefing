@@ -45,6 +45,67 @@ except ImportError:
     DeepXivReader = None  # type: ignore
 
 
+# Known envelope keys the DeepXiv SDK has used across versions. Ordered by
+# observed frequency / specificity. The "unified retrieve endpoint"
+# (introduced May 2026) is what triggered this: the legacy `results` key
+# stopped showing up and the daily briefing started rendering with zero
+# Top Papers. If the SDK ever changes shape again, the unknown-key
+# fallback below should still recover the data.
+_KNOWN_DEEPXIV_LIST_KEYS = (
+    "results", "data", "docs", "items", "hits", "papers", "top_k", "retrieve",
+)
+
+
+def _extract_papers_list(response: Any) -> List[Dict[str, Any]]:
+    """Pull the list of paper records out of a DeepXiv search response.
+
+    The SDK has gone through several response shapes:
+      v1: {"total": N, "results": [...], "took": ms}
+      v2 (unified retrieve endpoint, May 2026): different envelope key
+      Direct list (some endpoints): [...]
+
+    Strategy: list → use as-is; dict → try known keys, then fall back to
+    any list-of-dicts value we can find. Logs which path was taken so
+    that quiet shape changes leave breadcrumbs in the briefing log.
+    """
+    if isinstance(response, list):
+        return response
+    if not isinstance(response, dict):
+        logger.warning(
+            "Unexpected DeepXiv response type: %s (expected list or dict)",
+            type(response).__name__,
+        )
+        return []
+
+    for key in _KNOWN_DEEPXIV_LIST_KEYS:
+        value = response.get(key)
+        if isinstance(value, list):
+            if key != "results":
+                logger.info(
+                    "DeepXiv response used key '%s' (legacy key 'results' "
+                    "no longer present)", key,
+                )
+            return value
+
+    # Unknown shape: walk the dict looking for a list-of-dicts value
+    for key, value in response.items():
+        if (isinstance(value, list) and value
+                and isinstance(value[0], dict)):
+            logger.warning(
+                "DeepXiv response shape unrecognized; falling back to key "
+                "'%s' (a list of %d dicts). Add '%s' to "
+                "_KNOWN_DEEPXIV_LIST_KEYS to silence this warning.",
+                key, len(value), key,
+            )
+            return value
+
+    logger.warning(
+        "DeepXiv response had no list-of-dicts value. Top-level keys: %s",
+        list(response.keys()),
+    )
+    return []
+
+
 def _load_deepxiv_token() -> Optional[str]:
     """
     Read an existing DeepXiv token from environment or ~/.env (where the
@@ -288,14 +349,7 @@ class DeepXivScanner:
                 date_from=date_from,
             )
 
-            # DeepXiv returns {"total": N, "results": [...], "took": ms}
-            if isinstance(response, dict) and "results" in response:
-                raw_papers = response["results"]
-            elif isinstance(response, list):
-                raw_papers = response
-            else:
-                logger.warning(f"Unexpected DeepXiv response type: {type(response)}")
-                raw_papers = []
+            raw_papers = _extract_papers_list(response)
 
             papers = []
             for r in raw_papers:

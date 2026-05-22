@@ -9,12 +9,82 @@ import requests
 
 from scripts.arxiv_scanner import (
     ArxivScanner,
+    _extract_papers_list,
     _load_deepxiv_token,
     create_scanner,
     load_config,
     main,
 )
 import scripts.arxiv_scanner as arxiv_mod
+
+
+class TestExtractPapersList:
+    """Regression tests for the DeepXiv response-shape extractor.
+
+    The SDK's 'unified retrieve endpoint' (May 2026) changed the envelope
+    key away from 'results', and the old extractor silently dropped every
+    paper. These tests pin the recovery behavior so the same regression
+    can't reach production again."""
+
+    def _paper(self, n=1):
+        return [{"arxiv_id": f"260{i}.0001", "title": f"Paper {i}"}
+                for i in range(n)]
+
+    def test_legacy_results_key(self):
+        """v1 shape — what the SDK returned before the unified endpoint."""
+        response = {"total": 30, "results": self._paper(30), "took": 12}
+        assert _extract_papers_list(response) == response["results"]
+
+    def test_direct_list_response(self):
+        """Some endpoints return a bare list."""
+        papers = self._paper(5)
+        assert _extract_papers_list(papers) == papers
+
+    def test_new_data_key(self):
+        """If the SDK switches the envelope key to 'data'."""
+        papers = self._paper(3)
+        assert _extract_papers_list({"data": papers, "total": 3}) == papers
+
+    def test_new_docs_key(self):
+        """Common RAG/retrieval envelope key."""
+        papers = self._paper(2)
+        assert _extract_papers_list({"docs": papers}) == papers
+
+    def test_unknown_envelope_falls_back_to_first_list_of_dicts(self):
+        """If the SDK invents a totally new envelope key, the walker
+        should still find the list-of-dicts and recover. This is the
+        property that prevents 'silent zero papers' regressions."""
+        papers = self._paper(7)
+        # 'foobar' isn't in _KNOWN_DEEPXIV_LIST_KEYS but it's the only
+        # list-of-dicts in the response
+        result = _extract_papers_list({
+            "foobar": papers,
+            "total": 7,
+            "took": 42,
+        })
+        assert result == papers
+
+    def test_dict_with_no_list_returns_empty(self):
+        """An exotic envelope with no list values — return [] (not None
+        or raise) so the caller's loop is a no-op."""
+        assert _extract_papers_list({"status": "ok", "total": 0}) == []
+
+    def test_non_dict_non_list_returns_empty(self):
+        """Defensive: garbage in, empty list out."""
+        assert _extract_papers_list("oops") == []
+        assert _extract_papers_list(None) == []
+        assert _extract_papers_list(42) == []
+
+    def test_empty_dict_returns_empty(self):
+        assert _extract_papers_list({}) == []
+
+    def test_results_key_preferred_over_other_keys(self):
+        """If both 'results' and 'data' are present, prefer 'results'
+        (matches legacy SDK behavior — safer default)."""
+        legacy = self._paper(1)
+        new = [{"arxiv_id": "should-not-be-picked", "title": "X"}]
+        response = {"results": legacy, "data": new}
+        assert _extract_papers_list(response) == legacy
 
 
 def _build_arxiv_xml(recent_iso: str) -> str:
