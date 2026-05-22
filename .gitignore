@@ -31,6 +31,8 @@ scored_papers.json
 stocks.json
 logs/*.log
 *.log
+logs/alignment-report-*.txt
+logs/mock-briefing.md
 
 # IDE and Tools
 .vscode/
