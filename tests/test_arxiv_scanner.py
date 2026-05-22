@@ -7,7 +7,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from scripts.arxiv_scanner import ArxivScanner, load_config, main
+from scripts.arxiv_scanner import (
+    ArxivScanner,
+    _load_deepxiv_token,
+    create_scanner,
+    load_config,
+    main,
+)
+import scripts.arxiv_scanner as arxiv_mod
 
 
 def _build_arxiv_xml(recent_iso: str) -> str:
@@ -198,6 +205,72 @@ class TestLoadConfig:
         with pytest.raises(SystemExit) as exc:
             load_config(str(config_path))
         assert exc.value.code == 2
+
+
+class TestLoadDeepXivToken:
+    def test_returns_env_var_when_set(self, monkeypatch):
+        monkeypatch.setenv("DEEPXIV_TOKEN", "from-env-123")
+        assert _load_deepxiv_token() == "from-env-123"
+
+    def test_reads_from_home_env(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".env").write_text(
+            "OTHER_VAR=x\nDEEPXIV_TOKEN=from-file-abc\nNEXT=y\n"
+        )
+        assert _load_deepxiv_token() == "from-file-abc"
+
+    def test_strips_quotes_around_value(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".env").write_text('DEEPXIV_TOKEN="quoted-token"\n')
+        assert _load_deepxiv_token() == "quoted-token"
+
+    def test_returns_none_when_missing_everywhere(self, monkeypatch, tmp_path):
+        """The 'None' result is what tells Reader() to auto-register."""
+        monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert _load_deepxiv_token() is None
+
+    def test_env_var_wins_over_file(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("DEEPXIV_TOKEN", "env-wins")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("DEEPXIV_TOKEN=file-value\n")
+        assert _load_deepxiv_token() == "env-wins"
+
+
+class TestCreateScanner:
+    def test_picks_deepxiv_when_sdk_available(self, monkeypatch):
+        """DeepXivScanner is preferred whenever HAS_DEEPXIV is True —
+        no token needed (SDK auto-registers on first use)."""
+        if not arxiv_mod.HAS_DEEPXIV:
+            pytest.skip("deepxiv-sdk not installed")
+        monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
+        scanner = create_scanner(topics=["AI"], days_back=1, max_results=2)
+        assert scanner.__class__.__name__ == "DeepXivScanner"
+
+    def test_falls_back_to_legacy_when_sdk_missing(self, monkeypatch):
+        monkeypatch.setattr(arxiv_mod, "HAS_DEEPXIV", False)
+        scanner = create_scanner(topics=["AI"], days_back=1, max_results=2)
+        assert scanner.__class__.__name__ == "ArxivScanner"
+
+    def test_deepxiv_scanner_init_when_no_token(self, monkeypatch):
+        """Reader() is called with no token args, allowing auto-register."""
+        if not arxiv_mod.HAS_DEEPXIV:
+            pytest.skip("deepxiv-sdk not installed")
+        monkeypatch.delenv("DEEPXIV_TOKEN", raising=False)
+        # Patch Reader to a mock so we can inspect what was passed
+        with patch.object(arxiv_mod, "DeepXivReader") as mock_reader:
+            create_scanner(topics=["X"], days_back=1, max_results=1)
+            mock_reader.assert_called_once_with()  # no kwargs == auto-register
+
+    def test_deepxiv_scanner_init_with_token(self, monkeypatch):
+        if not arxiv_mod.HAS_DEEPXIV:
+            pytest.skip("deepxiv-sdk not installed")
+        monkeypatch.setenv("DEEPXIV_TOKEN", "explicit-token")
+        with patch.object(arxiv_mod, "DeepXivReader") as mock_reader:
+            create_scanner(topics=["X"], days_back=1, max_results=1)
+            mock_reader.assert_called_once_with(token="explicit-token")
 
 
 class TestMain:

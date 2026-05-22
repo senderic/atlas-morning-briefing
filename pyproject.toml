@@ -23,6 +23,8 @@ dependencies = [
     "nh3>=0.2.14",
     "defusedxml>=0.7.1",
     "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0",
+    "deepxiv-sdk>=0.1.0",
 ]
 
 [project.optional-dependencies]

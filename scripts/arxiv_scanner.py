@@ -46,7 +46,12 @@ except ImportError:
 
 
 def _load_deepxiv_token() -> Optional[str]:
-    """Load DeepXiv token from environment or ~/.env (saved by deepxiv CLI)."""
+    """
+    Read an existing DeepXiv token from environment or ~/.env (where the
+    deepxiv CLI saves auto-registered tokens). Returns None if none found —
+    in that case Reader() will auto-register a free 1,000-req/day token on
+    first use and persist it to ~/.env.
+    """
     token = os.environ.get("DEEPXIV_TOKEN")
     if token:
         return token
@@ -258,8 +263,16 @@ class DeepXivScanner:
         self.topics = topics
         self.days_back = days_back
         self.max_results = max_results
+        # If a token is already cached we pass it explicitly; otherwise let
+        # Reader() auto-register a free anonymous token (1,000 req/day) on
+        # first use and persist it to ~/.env.
         token = _load_deepxiv_token()
-        self.reader = DeepXivReader(token=token)
+        self.reader = DeepXivReader(token=token) if token else DeepXivReader()
+        if not token:
+            logger.info(
+                "No DEEPXIV_TOKEN found; DeepXiv SDK will auto-register a "
+                "free anonymous token (1,000 req/day) on first request."
+            )
 
     def search_topic(self, topic: str) -> List[Dict[str, Any]]:
         """Search DeepXiv for papers on a topic."""
@@ -408,10 +421,12 @@ def create_scanner(
     """
     Return the best available scanner.
 
-    Picks DeepXivScanner when both the SDK and a token are present;
-    otherwise falls back to the parallel defusedxml ArxivScanner.
+    Picks DeepXivScanner whenever the SDK is installed — the SDK
+    auto-registers a free anonymous token on first use, so no explicit
+    DEEPXIV_TOKEN is required. Falls back to the parallel defusedxml
+    ArxivScanner when the SDK is not installed.
     """
-    if HAS_DEEPXIV and _load_deepxiv_token():
+    if HAS_DEEPXIV:
         logger.info("Using DeepXiv SDK for paper search")
         return DeepXivScanner(
             topics=topics, days_back=days_back, max_results=max_results

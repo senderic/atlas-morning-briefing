@@ -412,11 +412,11 @@ class TestScanWrappers:
         runner.config["news_queries"] = []
         assert runner.run_news_aggregation() == []
 
-    @patch("scripts.briefing_runner.ArxivScanner")
-    def test_arxiv_scan_exception(self, mock_cls, runner):
+    @patch("scripts.briefing_runner.create_scanner")
+    def test_arxiv_scan_exception(self, mock_create, runner):
         instance = MagicMock()
         instance.scan_all_topics.side_effect = RuntimeError("boom")
-        mock_cls.return_value = instance
+        mock_create.return_value = instance
         result = runner.run_arxiv_scan(["topic"])
         assert result == []
         assert any("ArXiv" in e for e in runner.errors)

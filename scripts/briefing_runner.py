@@ -31,7 +31,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 # Ensure scripts directory is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import ArxivScanner, create_scanner
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
 from scripts.news_aggregator import NewsAggregator
@@ -102,7 +102,10 @@ class BriefingRunner:
                 logger.warning("No arxiv_topics configured, skipping")
                 return []
 
-            scanner = ArxivScanner(
+            # create_scanner picks DeepXivScanner when the SDK is installed
+            # (auto-registers a free token on first use) and falls back to
+            # our parallel defusedxml ArxivScanner otherwise.
+            scanner = create_scanner(
                 topics=topics,
                 days_back=days_back,
                 max_results=max_papers,

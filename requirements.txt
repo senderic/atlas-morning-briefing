@@ -27,3 +27,6 @@ defusedxml>=0.7.1
 
 python-dotenv>=1.0.0
 tenacity>=8.2.0
+
+# ArXiv semantic search (auto-registers a free 1,000 req/day token on first use)
+deepxiv-sdk>=0.1.0
