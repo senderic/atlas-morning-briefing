@@ -100,15 +100,11 @@ class GeminiCLIClient:
             for k in raw.split(","):
                 add_key(k.strip())
             
-        # 2. Check for suffixed variants, sorted by environment variable name
-        suffixed_vars = []
-        for var_name in os.environ:
-            if var_name.startswith("GEMINI_API_KEY_"):
-                # Skip the primary one we already handled
-                if var_name != "GEMINI_API_KEY":
-                    suffixed_vars.append(var_name)
-        
-        for var_name in sorted(suffixed_vars):
+        # 2. Check for suffixed variants (GEMINI_API_KEY_*), sorted by name
+        suffixed_vars = sorted(
+            v for v in os.environ if v.startswith("GEMINI_API_KEY_")
+        )
+        for var_name in suffixed_vars:
             add_key(os.environ[var_name].strip())
 
         if not keys:
@@ -281,13 +277,15 @@ class GeminiCLIClient:
         self,
         prompt: str,
         tier: str = "medium",
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
         system_prompt: Optional[str] = None,
         allow_fallback: bool = True,
     ) -> Optional[str]:
         """
         Invoke a Gemini model via CLI with recursive tier fallback.
+
+        Note: The Gemini CLI does not expose max_tokens or temperature flags
+        on the command line, so those knobs are intentionally absent here.
+        Control output length via prompt wording.
         """
         if not self.available:
             return None
@@ -383,9 +381,9 @@ class GeminiCLIClient:
                 if next_tier:
                     logger.info(f"--- Falling back from {tier} to {next_tier} ---")
                     return self.invoke(
-                        prompt, tier=next_tier, max_tokens=max_tokens,
-                        temperature=temperature, system_prompt=system_prompt,
-                        allow_fallback=True
+                        prompt, tier=next_tier,
+                        system_prompt=system_prompt,
+                        allow_fallback=True,
                     )
 
         return None

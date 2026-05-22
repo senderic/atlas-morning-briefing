@@ -3,9 +3,9 @@
 """
 Morning briefing runner.
 
-Main orchestrator that runs all scanners, applies intelligence layer,
-and generates the briefing. Supports Amazon Bedrock for LLM-powered
-synthesis and summarization.
+Main orchestrator that runs all scanners, applies the intelligence layer,
+and generates the briefing. Uses the Gemini CLI for LLM-powered synthesis
+and summarization (with a deterministic fallback when unavailable).
 """
 
 import argparse
@@ -516,7 +516,7 @@ class BriefingRunner:
             f"<stock_data>\n{data_block}\n</stock_data>"
         )
         result = self.intelligence.gemini.invoke(
-            prompt, tier="light", max_tokens=150
+            prompt, tier="light"
         )
         return result.strip() if result else ""
 
@@ -678,7 +678,7 @@ class BriefingRunner:
             "Be factual. Do not add information not in the abstract."
         )
         result = self.intelligence.gemini.invoke(
-            prompt, tier="light", max_tokens=500
+            prompt, tier="light"
         )
         if not result:
             return papers
