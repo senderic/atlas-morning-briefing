@@ -66,6 +66,12 @@ class GeminiCLIClient:
         self._api_keys = self._load_api_keys()
         self._current_key_index = 0
 
+        # Key usage tracking
+        self.key_usage_stats = {
+            i: {"success": 0, "failure": 0, "preview": (k[:6] + "..." + k[-4:]) if k else "None"}
+            for i, k in enumerate(self._api_keys)
+        }
+
         # Usage tracking
         self.usage_stats = {
             "heavy": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
@@ -186,13 +192,8 @@ class GeminiCLIClient:
             process_env["GEMINI_CONFIG_DIR"] = tmp_config_dir
             
             # Ensure compatibility by setting both common API key environment variables
-            if tier == "heavy":
-                api_key = self._get_current_key()
-                key_index = self._current_key_index
-            else:
-                # For non-heavy tiers, always stick to the first API key
-                api_key = self._api_keys[0] if self._api_keys else None
-                key_index = 0
+            api_key = self._get_current_key()
+            key_index = self._current_key_index
 
             if api_key:
                 process_env["GEMINI_API_KEY"] = api_key
@@ -224,8 +225,12 @@ class GeminiCLIClient:
 
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900, env=process_env)
+                if key_index in self.key_usage_stats:
+                    self.key_usage_stats[key_index]["success"] += 1
             except Exception as e:
                 self.usage_stats[tier]["failed_attempts"] += 1
+                if key_index in self.key_usage_stats:
+                    self.key_usage_stats[key_index]["failure"] += 1
                 raise e
             
             try:
@@ -387,13 +392,14 @@ class GeminiCLIClient:
 
     def get_usage_summary(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
         """Generate a formatted markdown summary of Gemini API usage and estimated costs."""
-        # Cost constants (Gemini 1.5 Pay-as-you-go pricing)
-        # Pro: $1.25/1M in, $3.75/1M out
-        # Flash: $0.075/1M in, $0.30/1M out
+        # Cost constants (Gemini 3.1 Pay-as-you-go pricing, Audited May 2026)
+        # Pro: $5.00/1M in, $18.00/1M out (Adjusted to match actual $0.03/call observed)
+        # Flash: $1.00/1M in, $4.00/1M out
+        # Flash-Lite: $0.20/1M in, $0.80/1M out
         PRICING = {
-            "heavy": {"in": 1.25 / 1_000_000, "out": 3.75 / 1_000_000},
-            "medium": {"in": 0.075 / 1_000_000, "out": 0.30 / 1_000_000},
-            "light": {"in": 0.075 / 1_000_000, "out": 0.30 / 1_000_000}, # Same as flash
+            "heavy": {"in": 5.00 / 1_000_000, "out": 18.00 / 1_000_000},
+            "medium": {"in": 1.00 / 1_000_000, "out": 4.00 / 1_000_000},
+            "light": {"in": 0.20 / 1_000_000, "out": 0.80 / 1_000_000},
         }
 
         total_cost = 0.0
@@ -406,9 +412,9 @@ class GeminiCLIClient:
             if stats["calls"] == 0 and stats["failed_attempts"] == 0:
                 continue
             
-            # Estimate tokens if they were missing (4 chars per token)
-            in_tok = stats["in_tokens"] or (stats["in_chars"] // 4)
-            out_tok = stats["out_tokens"] or (stats["out_chars"] // 4)
+            # Estimate tokens if they were missing (3.5 chars per token for Gemini 1.5+)
+            in_tok = stats["in_tokens"] or int(stats["in_chars"] / 3.5)
+            out_tok = stats["out_tokens"] or int(stats["out_chars"] / 3.5)
             
             cost = (in_tok * PRICING[tier]["in"]) + (out_tok * PRICING[tier]["out"])
             total_cost += cost
@@ -427,7 +433,18 @@ class GeminiCLIClient:
             f"| **Total** | **{sum(s['calls'] for s in self.usage_stats.values())}** | "
             f"**{sum(s['failed_attempts'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n"
         )
-        lines.append(f"*Note: Costs are estimated based on Gemini 1.5 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n\n")
+
+        # Add API Key Rotation Summary
+        if self.key_usage_stats:
+            lines.append("### API Key Rotation Summary\n\n")
+            lines.append("| Key Index | Preview | Success | Quota/Failures |\n")
+            lines.append("| :--- | :--- | :---: | :---: |\n")
+            for idx in sorted(self.key_usage_stats.keys()):
+                stats = self.key_usage_stats[idx]
+                lines.append(f"| {idx} | `{stats['preview']}` | {stats['success']} | {stats['failure']} |\n")
+            lines.append("\n")
+
+        lines.append(f"*Note: Costs are estimated based on Gemini 3.1 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n\n")
         
         # Add timing information if provided
         if start_time and end_time:

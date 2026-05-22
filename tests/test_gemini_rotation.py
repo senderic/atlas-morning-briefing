@@ -74,7 +74,7 @@ class TestGeminiRotation:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_invoke_with_rotation_on_quota(self, mock_sleep, mock_run, rotation_config):
-        """Test that invoke automatically rotates keys ONLY for heavy tier."""
+        """Test that invoke automatically rotates keys for all tiers."""
         env = {"GEMINI_API_KEY": "key1,key2"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
@@ -93,47 +93,45 @@ class TestGeminiRotation:
             assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
             assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key2"
             
-            # 2. Test medium tier does NOT rotate and stays on key1
+            # 2. Test medium tier ALSO rotates
             mock_run.reset_mock()
             mock_run.side_effect = [quota_error, success_result]
             
             # Reset index for clean test
             client._current_key_index = 0
             
-            # Medium tier call - should hit quota error but NOT rotate
-            # It will retry with the SAME key (index 0) because tier != "heavy"
-            # Since mock_run.side_effect has 2 items, the retry will succeed on 2nd attempt
+            # Medium tier call - should hit quota error AND rotate
             response = client.invoke("Prompt", tier="medium")
             
             assert response == "Success"
-            assert client._current_key_index == 0 # Should still be 0
+            assert client._current_key_index == 1 # Should have rotated to 1
             assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
-            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key1"
+            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key2"
 
     @patch("subprocess.run")
     @patch("time.sleep")
-    def test_tier_isolation_after_rotation(self, mock_sleep, mock_run, rotation_config):
-        """Test that non-heavy tiers use index 0 even after heavy tier has rotated the index."""
+    def test_shared_rotation_index(self, mock_sleep, mock_run, rotation_config):
+        """Test that all tiers share the current index."""
         env = {"GEMINI_API_KEY": "key1,key2"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
             client._available = True
             
-            # 1. Manually set index to 1 (simulating a previous heavy rotation)
+            # 1. Manually set index to 1 (simulating a previous rotation)
             client._current_key_index = 1
             
             # 2. Call medium tier
             mock_run.return_value = MagicMock(returncode=0, stdout='{"response": "Success"}')
             client.invoke("Prompt", tier="medium")
             
-            # 3. Verify it used key1 (index 0) despite client._current_key_index being 1
+            # 3. Verify it used key2 (index 1)
             last_env = mock_run.call_args[1]['env']
-            assert last_env["GEMINI_API_KEY"] == "key1"
+            assert last_env["GEMINI_API_KEY"] == "key2"
             
             # 4. Call heavy tier
             client.invoke("Prompt", tier="heavy")
             
-            # 5. Verify heavy tier DID use key2 (index 1)
+            # 5. Verify heavy tier also used key2 (index 1)
             last_env = mock_run.call_args[1]['env']
             assert last_env["GEMINI_API_KEY"] == "key2"
 

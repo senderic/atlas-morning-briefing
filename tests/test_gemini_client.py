@@ -155,3 +155,21 @@ class TestGeminiCLIClient:
         assert "| Heavy | 0 | 5 |" in summary
         assert "| Medium | 2 | 1 |" in summary
         assert "Failed calls are not charged" in summary
+
+    def test_get_usage_summary_with_key_rotation(self, mock_config):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "key1,key2"}):
+            client = GeminiCLIClient(mock_config)
+            # Simulate some usage in stats so the summary isn't empty
+            client.usage_stats["medium"]["calls"] = 1
+            # Simulate key usage
+            client.key_usage_stats[0]["success"] = 10
+            client.key_usage_stats[0]["failure"] = 2
+            client.key_usage_stats[1]["success"] = 5
+            client.key_usage_stats[1]["failure"] = 1
+            
+            summary = client.get_usage_summary()
+            
+            assert "### API Key Rotation Summary" in summary
+            assert "| Key Index | Preview | Success | Quota/Failures |" in summary
+            assert "| 0 | `key1...key1` | 10 | 2 |" in summary
+            assert "| 1 | `key2...key2` | 5 | 1 |" in summary
