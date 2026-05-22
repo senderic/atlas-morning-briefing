@@ -8,16 +8,20 @@ jobs:
     name: pytest
     runs-on: ubuntu-latest
 
-    # Standard astral-sh uv container with Python preinstalled. Single
-    # version (3.12) because this is a personal tool, not a library —
-    # the cron runs on one Python version and that's the only one that
-    # needs to be green. Bump the tag when you upgrade the cron host.
-    container:
-      image: ghcr.io/astral-sh/uv:python3.12-bookworm
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # astral-sh/setup-uv installs uv and (optionally) Python in one
+      # step. We use it instead of the ghcr.io/astral-sh/uv container
+      # because `act` (local GHA emulator) chokes on the container's
+      # network=host volume mounting, and the setup-uv path works
+      # identically in both `act` and real GitHub Actions.
+      - name: Install uv + Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
 
       - name: Sync dependencies (project + dev extras)
         run: uv sync --all-extras --dev
