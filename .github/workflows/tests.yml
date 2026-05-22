@@ -9,17 +9,15 @@ on:
 
 jobs:
   pytest:
-    name: pytest (Python ${{ matrix.python-version }})
+    name: pytest
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
 
-    # Standard astral-sh uv container with the matrix Python preinstalled.
-    # See https://github.com/astral-sh/uv/pkgs/container/uv for tags.
+    # Standard astral-sh uv container with Python preinstalled. Single
+    # version (3.12) because this is a personal tool, not a library —
+    # the cron runs on one Python version and that's the only one that
+    # needs to be green. Bump the tag when you upgrade the cron host.
     container:
-      image: ghcr.io/astral-sh/uv:python${{ matrix.python-version }}-bookworm
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm
 
     steps:
       - name: Checkout
