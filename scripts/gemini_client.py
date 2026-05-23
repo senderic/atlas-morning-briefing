@@ -108,7 +108,8 @@ class GeminiCLIClient:
 
     # Cost constants — Gemini paid-tier rates, audited 2026-05-22 against
     # https://ai.google.dev/gemini-api/docs/pricing. CLI aliases resolve as
-    # verified by scripts/audit_gemini.py (logs/gemini-audit-20260522-225038.txt):
+    # verified by scripts/audit_gemini.py (re-run it to refresh after CLI
+    # updates shift the alias pointers):
     #   heavy  -> "pro"        -> gemini-3.x-pro-preview ($2/$12 for prompts
     #             <=200k; $4/$18 above). In practice this row stays $0: Pro has
     #             no free tier, so free-tier keys can't serve it at all, and the
