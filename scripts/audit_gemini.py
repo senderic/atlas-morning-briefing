@@ -179,7 +179,13 @@ def probe_alias(alias: str, timeout: int, api_key: Optional[str], out: TextIO) -
     if result.returncode != 0:
         out.write(f"  CLI exited {result.returncode}\n")
         if result.stderr:
-            out.write(f"  stderr (first 200 chars): {result.stderr[:200]!r}\n")
+            # Dump full stderr verbatim — the previous 200-char cap chopped
+            # off the actual error message right after the "256-color" /
+            # "YOLO mode" warnings. Redact any accidental key echoes.
+            stderr = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "AIza<REDACTED>", result.stderr)
+            out.write(f"  stderr:\n")
+            for line in stderr.rstrip().splitlines():
+                out.write(f"    {line}\n")
 
     raw = result.stdout.strip()
     if not raw:
@@ -190,7 +196,8 @@ def probe_alias(alias: str, timeout: int, api_key: Optional[str], out: TextIO) -
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         out.write(f"  parse error: {e}\n")
-        out.write(f"  raw stdout (first 200 chars): {raw[:200]!r}\n")
+        raw_redacted = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "AIza<REDACTED>", raw)
+        out.write(f"  raw stdout (first 2000 chars): {raw_redacted[:2000]!r}\n")
         return
 
     models = data.get("stats", {}).get("models", {})
