@@ -43,6 +43,9 @@ Usage
     # you saw a parse error on pro in the previous run):
     uv run scripts/audit_gemini.py --timeout 180
 
+    # pick a specific key when earlier ones in rotation are quota'd:
+    uv run scripts/audit_gemini.py --key-var GEMINI_API_KEY_3
+
 Cost
 ----
 
@@ -74,21 +77,38 @@ from typing import Optional, TextIO
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_api_key() -> Optional[str]:
-    """Find a Gemini API key via env vars or .env. Returns None if
-    nothing usable is found."""
-    for var in ("GEMINI_API_KEY", "GEMINI_API_KEY_0"):
+def load_api_key(name: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """Find a Gemini API key via env vars or .env.
+
+    If `name` is given (e.g. "GEMINI_API_KEY_3"), only that specific
+    variable is consulted — first in os.environ, then in .env. Otherwise
+    the legacy fallback order is used: GEMINI_API_KEY, GEMINI_API_KEY_0,
+    then the first GEMINI_API_KEY[_N] match in .env.
+
+    Returns (key, source_var) so the caller can log which variable won —
+    important when the user is debugging quota/key-rotation issues."""
+    candidates = [name] if name else ["GEMINI_API_KEY", "GEMINI_API_KEY_0"]
+
+    for var in candidates:
         v = os.environ.get(var)
         if v:
-            return v.strip().strip('"').strip("'")
+            return v.strip().strip('"').strip("'"), var
 
     env_path = REPO_ROOT / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
-            m = re.match(r"^\s*(GEMINI_API_KEY(?:_\d+)?)\s*=\s*(.+?)\s*$", line)
-            if m and not line.strip().startswith("#"):
-                return m.group(2).strip().strip('"').strip("'")
-    return None
+            if line.strip().startswith("#"):
+                continue
+            if name:
+                pattern = rf"^\s*{re.escape(name)}\s*=\s*(.+?)\s*$"
+                m = re.match(pattern, line)
+                if m:
+                    return m.group(1).strip().strip('"').strip("'"), name
+            else:
+                m = re.match(r"^\s*(GEMINI_API_KEY(?:_\d+)?)\s*=\s*(.+?)\s*$", line)
+                if m:
+                    return m.group(2).strip().strip('"').strip("'"), m.group(1)
+    return None, None
 
 
 def redact_key(key: str) -> str:
@@ -121,9 +141,16 @@ def list_available_models(api_key: str, out: TextIO) -> None:
         out.write(f"  {name}\n")
 
 
-def probe_alias(alias: str, timeout: int, out: TextIO) -> None:
+def probe_alias(alias: str, timeout: int, api_key: Optional[str], out: TextIO) -> None:
     """Run one gemini-cli call for the alias and dump what the CLI
-    resolved it to + the token accounting."""
+    resolved it to + the token accounting.
+
+    `api_key` is forced into the subprocess env as GEMINI_API_KEY, with
+    competing Google auth (GOOGLE_API_KEY, ADC, gcloud token) blanked
+    out to prevent silent fallback — same hardening as
+    gemini_client._execute_command. Without this, the CLI would pick
+    whichever key happens to be in the caller's shell, defeating the
+    `--key-var` selection."""
     out.write(f"--- gemini --model {alias} ---\n")
     cmd = [
         "gemini", "--model", alias,
@@ -132,9 +159,15 @@ def probe_alias(alias: str, timeout: int, out: TextIO) -> None:
         "--raw-output", "--accept-raw-output-risk",
         "--output-format", "json",
     ]
+    probe_env = os.environ.copy()
+    if api_key:
+        probe_env["GEMINI_API_KEY"] = api_key
+    probe_env["GOOGLE_API_KEY"] = ""
+    probe_env["GOOGLE_APPLICATION_CREDENTIALS"] = ""
+    probe_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = ""
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, timeout=timeout, env=probe_env
         )
     except subprocess.TimeoutExpired:
         out.write(f"  TIMEOUT after {timeout}s — try --timeout {timeout*2}\n")
@@ -146,7 +179,13 @@ def probe_alias(alias: str, timeout: int, out: TextIO) -> None:
     if result.returncode != 0:
         out.write(f"  CLI exited {result.returncode}\n")
         if result.stderr:
-            out.write(f"  stderr (first 200 chars): {result.stderr[:200]!r}\n")
+            # Dump full stderr verbatim — the previous 200-char cap chopped
+            # off the actual error message right after the "256-color" /
+            # "YOLO mode" warnings. Redact any accidental key echoes.
+            stderr = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "AIza<REDACTED>", result.stderr)
+            out.write(f"  stderr:\n")
+            for line in stderr.rstrip().splitlines():
+                out.write(f"    {line}\n")
 
     raw = result.stdout.strip()
     if not raw:
@@ -157,7 +196,8 @@ def probe_alias(alias: str, timeout: int, out: TextIO) -> None:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         out.write(f"  parse error: {e}\n")
-        out.write(f"  raw stdout (first 200 chars): {raw[:200]!r}\n")
+        raw_redacted = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "AIza<REDACTED>", raw)
+        out.write(f"  raw stdout (first 2000 chars): {raw_redacted[:2000]!r}\n")
         return
 
     models = data.get("stats", {}).get("models", {})
@@ -189,11 +229,26 @@ def main() -> int:
         default=60,
         help="Per-CLI-probe timeout in seconds (raise if Pro times out)",
     )
+    parser.add_argument(
+        "--key-var",
+        default=None,
+        help="Specific env / .env variable to read the API key from "
+             "(e.g. GEMINI_API_KEY_3). Useful when earlier keys in "
+             "rotation are quota-exhausted. Default: GEMINI_API_KEY, "
+             "then GEMINI_API_KEY_0, then first .env match.",
+    )
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    api_key = load_api_key()
+    api_key, key_source = load_api_key(args.key_var)
+    if args.key_var and not api_key:
+        print(
+            f"error: --key-var {args.key_var} requested but not found "
+            f"in os.environ or .env",
+            file=sys.stderr,
+        )
+        return 1
 
     with args.output.open("w") as out:
         out.write("=== ENV ===\n")
@@ -207,6 +262,7 @@ def main() -> int:
         out.write(f"gemini version: {ver or 'MISSING'}\n")
         out.write(f"Date:           {datetime.datetime.now().astimezone().isoformat()}\n")
         out.write(f"API key:        {redact_key(api_key) if api_key else 'NOT FOUND'}\n")
+        out.write(f"Key source:     {key_source or 'n/a'}\n")
         out.write(f"Probe timeout:  {args.timeout}s\n")
 
         out.write("\n=== Available models via Gemini REST API ===\n")
@@ -217,7 +273,7 @@ def main() -> int:
 
         out.write("\n=== CLI alias resolution (one invocation per tier) ===\n")
         for alias in ("pro", "flash", "flash-lite"):
-            probe_alias(alias, args.timeout, out)
+            probe_alias(alias, args.timeout, api_key, out)
 
     print(f"Audit written to: {args.output}")
     print()

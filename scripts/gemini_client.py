@@ -19,12 +19,14 @@ Override the auto-detection by setting `gemini.cli_binary` in config.yaml
 to "agy" or "gemini" — useful when both binaries exist or for testing.
 """
 
+import datetime
 import json
 import logging
 import os
 import random
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from tenacity import (
     retry,
@@ -36,6 +38,11 @@ from tenacity import (
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    """Local-timezone ISO 8601 timestamp for per-call log records."""
+    return datetime.datetime.now().astimezone().isoformat()
 
 
 def _build_agy_cmd(model_id: str, prompt: str) -> List[str]:
@@ -99,6 +106,51 @@ class GeminiCLIClient:
         "light": "flash-lite",
     }
 
+    # Cost constants — Gemini paid-tier rates, audited 2026-05-22 against
+    # https://ai.google.dev/gemini-api/docs/pricing. CLI aliases resolve as
+    # verified by scripts/audit_gemini.py (re-run it to refresh after CLI
+    # updates shift the alias pointers):
+    #   heavy  -> "pro"        -> gemini-3.x-pro-preview ($2/$12 for prompts
+    #             <=200k; $4/$18 above). In practice this row stays $0: Pro has
+    #             no free tier, so free-tier keys can't serve it at all, and the
+    #             paid key 429'd ("exhausted capacity") in the audit too, with
+    #             its monthly budget cap nearly used up. The exact alias (3-pro
+    #             vs 3.1-pro) is therefore still unverified, but both share the
+    #             <=200k rate and briefing prompts run well under 200k, so the
+    #             figure holds either way.
+    #   medium -> "flash"      -> gemini-3-flash-preview  ($0.50 in / $3.00 out)
+    #   light  -> "flash-lite" -> gemini-3.1-flash-lite   ($0.25 in / $1.50 out)
+    PRICING = {
+        "heavy": {"in": 2.00 / 1_000_000, "out": 12.00 / 1_000_000},
+        "medium": {"in": 0.50 / 1_000_000, "out": 3.00 / 1_000_000},
+        "light": {"in": 0.25 / 1_000_000, "out": 1.50 / 1_000_000},
+    }
+
+    # Cached input tokens bill at a fraction of the normal input rate. Gemini
+    # implicit context caching is ~75% off → 25% of the input price. Verify on
+    # the pricing page if Google changes the cache discount.
+    CACHED_INPUT_DISCOUNT = 0.25
+
+    @classmethod
+    def _cost_for(
+        cls, tier: str, fresh_in: int, cached_in: int, out_text: int, thoughts: int
+    ) -> float:
+        """Estimated USD for one call's token usage.
+
+        Cached input bills at CACHED_INPUT_DISCOUNT x the input rate; thinking
+        ("thoughts") tokens bill at the OUTPUT rate alongside the visible answer
+        (candidates). Tool tokens are tracked for visibility but not charged
+        here — the CLI's `total` excludes them, so they're either zero or already
+        subsumed in prompt/candidates."""
+        p = cls.PRICING.get(tier)
+        if not p:
+            return 0.0
+        return (
+            fresh_in * p["in"]
+            + cached_in * p["in"] * cls.CACHED_INPUT_DISCOUNT
+            + (out_text + thoughts) * p["out"]
+        )
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         Initialize GeminiCLIClient.
@@ -139,6 +191,7 @@ class GeminiCLIClient:
         self._available = None
         self._api_keys = self._load_api_keys()
         self._current_key_index = 0
+        self._exhausted_keys = set()  # indices of keys that hit hard quotas (RPD)
 
         # Key usage tracking
         self.key_usage_stats = {
@@ -146,12 +199,50 @@ class GeminiCLIClient:
             for i, k in enumerate(self._api_keys)
         }
 
-        # Usage tracking
+        # Usage tracking. Token fields mirror the CLI's stats.models breakdown:
+        #   in_tokens      = fresh (uncached) input  — full input rate
+        #   cached_tokens  = cached input            — discounted input rate
+        #   out_tokens     = output text (candidates)
+        #   thought_tokens = thinking tokens         — billed at the output rate
+        #   tool_tokens    = tool tokens             — tracked, not charged
+        def _empty_tier_stats() -> Dict[str, int]:
+            return {
+                "calls": 0, "failed_attempts": 0,
+                "in_tokens": 0, "cached_tokens": 0,
+                "out_tokens": 0, "thought_tokens": 0, "tool_tokens": 0,
+                "in_chars": 0, "out_chars": 0,
+            }
         self.usage_stats = {
-            "heavy": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
-            "medium": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
-            "light": {"calls": 0, "failed_attempts": 0, "in_tokens": 0, "out_tokens": 0, "in_chars": 0, "out_chars": 0},
+            "heavy": _empty_tier_stats(),
+            "medium": _empty_tier_stats(),
+            "light": _empty_tier_stats(),
         }
+
+        # Optional per-call JSONL log (one record per LLM call). Disabled unless
+        # `call_log_path` is configured; relative paths resolve against the repo
+        # root so cron jobs running from any CWD land the log in the same place.
+        log_path = config.get("call_log_path")
+        if log_path:
+            p = Path(log_path).expanduser()
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent.parent / p
+            self.call_log_path: Optional[Path] = p
+        else:
+            self.call_log_path = None
+
+    def _log_call(self, record: Dict[str, Any]) -> None:
+        """Append one JSON line to the per-call log, if configured.
+
+        Best-effort: a logging failure must never break the LLM call, so all
+        errors are swallowed (logged at debug)."""
+        if not self.call_log_path:
+            return
+        try:
+            self.call_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.call_log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.debug(f"Could not write call-log record: {e}")
 
     def _load_api_keys(self) -> List[str]:
         """
@@ -203,9 +294,24 @@ class GeminiCLIClient:
         jitter = random.uniform(0, 10)
         total_delay = self.key_swap_delay + jitter
         
-        logger.info(f"🔄 ROTATING API KEY: Moving from index {self._current_key_index} to {(self._current_key_index + 1) % len(self._api_keys)}")
+        # Determine the next available (non-exhausted) key
+        next_index = (self._current_key_index + 1) % len(self._api_keys)
+        attempts = 0
+        while next_index in self._exhausted_keys and attempts < len(self._api_keys):
+            next_index = (next_index + 1) % len(self._api_keys)
+            attempts += 1
+
+        if attempts >= len(self._api_keys) or next_index in self._exhausted_keys:
+            logger.error("All available API keys are exhausted for this run.")
+            return False
+
+        # User requirement: Key 3 (Index 2) is last resort
+        if next_index == 2 and self._current_key_index < 2:
+            logger.warning("⚠️ LAST RESORT: Free keys (Index 0, 1) exhausted. Rotating to PAID key (Index 2).")
         
-        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        logger.info(f"🔄 ROTATING API KEY: Moving from index {self._current_key_index} to {next_index}")
+        
+        self._current_key_index = next_index
         new_key = self._get_current_key()
         key_preview = new_key[:6] + "..." + new_key[-4:] if new_key else "None"
         
@@ -283,7 +389,6 @@ class GeminiCLIClient:
         """Execute the active CLI binary with a sandboxed config dir."""
         import tempfile
         import shutil
-        from pathlib import Path
 
         # `binary` falls back to override / preferred default when detection
         # hasn't run, so this is always defined for an enabled client.
@@ -350,6 +455,7 @@ class GeminiCLIClient:
 
             cmd = profile["build_cmd"](model_id, prompt)
 
+            t0 = time.monotonic()
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, check=True,
@@ -361,38 +467,88 @@ class GeminiCLIClient:
                 self.usage_stats[tier]["failed_attempts"] += 1
                 if key_index in self.key_usage_stats:
                     self.key_usage_stats[key_index]["failure"] += 1
+                # Capture stderr too — it carries the actionable message
+                # (e.g. "exhausted capacity"), which str(e) alone omits.
+                err = str(e)
+                if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                    err += f" | stderr: {e.stderr.strip()}"
+                self._log_call({
+                    "ts": _now_iso(), "tier": tier, "model_id": model_id,
+                    "key_index": key_index,
+                    "latency_s": round(time.monotonic() - t0, 3),
+                    "status": "error", "error": err[:500],
+                })
                 raise e
-            
+
+            latency = round(time.monotonic() - t0, 3)
+
             try:
                 # Parse JSON output from gemini-cli
                 data = json.loads(result.stdout)
                 output = data.get("response", "").strip()
-                
-                # Extract stats if available
+
+                # Locate this model's token stats. The CLI keys stats.models by
+                # the resolved model ID (e.g. "gemini-3-flash-preview"), not the
+                # alias we passed in ("flash"), so match loosely then fall back
+                # to the first entry.
                 stats = data.get("stats", {}).get("models", {})
-                model_stats = {}
+                resolved_model, model_stats = model_id, {}
                 for k, v in stats.items():
                     if model_id in k or k in model_id:
-                        model_stats = v.get("tokens", {})
+                        resolved_model, model_stats = k, v.get("tokens", {})
                         break
                 if not model_stats and stats:
-                    model_stats = next(iter(stats.values())).get("tokens", {})
+                    resolved_model, first = next(iter(stats.items()))
+                    model_stats = first.get("tokens", {})
+
+                # Token breakdown. The CLI reports:
+                #   prompt = total input = input(fresh) + cached
+                #   total  = prompt + candidates + thoughts
+                # `input` is the full-price (uncached) portion; prefer it, else
+                # derive it as prompt - cached for older CLIs that omit `input`.
+                cached_tokens = model_stats.get("cached", 0)
+                prompt_tokens = model_stats.get("prompt", 0)
+                fresh_in = model_stats.get("input")
+                if fresh_in is None:
+                    fresh_in = max(prompt_tokens - cached_tokens, 0)
+                out_tokens = model_stats.get("candidates", 0)
+                thought_tokens = model_stats.get("thoughts", 0)
+                tool_tokens = model_stats.get("tool", 0)
 
                 # Update usage metrics
                 self.usage_stats[tier]["calls"] += 1
-                in_tokens = model_stats.get("input", 0) or model_stats.get("prompt", 0)
-                out_tokens = model_stats.get("candidates", 0)
-                
-                self.usage_stats[tier]["in_tokens"] += in_tokens
+                self.usage_stats[tier]["in_tokens"] += fresh_in
+                self.usage_stats[tier]["cached_tokens"] += cached_tokens
                 self.usage_stats[tier]["out_tokens"] += out_tokens
-                
+                self.usage_stats[tier]["thought_tokens"] += thought_tokens
+                self.usage_stats[tier]["tool_tokens"] += tool_tokens
                 self.usage_stats[tier]["in_chars"] += len(prompt)
                 self.usage_stats[tier]["out_chars"] += len(output)
 
+                self._log_call({
+                    "ts": _now_iso(), "tier": tier, "model_id": model_id,
+                    "resolved_model": resolved_model, "key_index": key_index,
+                    "latency_s": latency,
+                    "status": "ok" if output else "empty",
+                    "tokens": {
+                        "input": fresh_in, "cached": cached_tokens,
+                        "candidates": out_tokens, "thoughts": thought_tokens,
+                        "tool": tool_tokens, "prompt": prompt_tokens,
+                        "total": model_stats.get("total", 0),
+                    },
+                    "cost_usd": round(
+                        self._cost_for(tier, fresh_in, cached_tokens, out_tokens, thought_tokens), 6
+                    ),
+                    "response_chars": len(output),
+                })
+
                 if not output:
                     raise ValueError(f"Empty response from {tier}")
-                    
-                logger.info(f"Gemini response received ({len(output)} chars, {out_tokens} tokens) from {tier}")
+
+                logger.info(
+                    f"Gemini response received ({len(output)} chars, "
+                    f"{out_tokens}+{thought_tokens} out tok, {latency}s) from {tier}"
+                )
                 return output
 
             except (json.JSONDecodeError, KeyError) as e:
@@ -401,6 +557,11 @@ class GeminiCLIClient:
                 self.usage_stats[tier]["calls"] += 1
                 self.usage_stats[tier]["in_chars"] += len(prompt)
                 self.usage_stats[tier]["out_chars"] += len(output)
+                self._log_call({
+                    "ts": _now_iso(), "tier": tier, "model_id": model_id,
+                    "key_index": key_index, "latency_s": latency,
+                    "status": "ok_unparsed", "response_chars": len(output),
+                })
                 return output
         
         finally:
@@ -429,11 +590,27 @@ class GeminiCLIClient:
             logger.warning(f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}.")
             return None
 
+        # Always try to start from the first non-exhausted key to prefer free tiers.
+        # This ensures we don't 'stick' to a paid key (like Index 2) if a free one
+        # might have reset its RPM (Requests Per Minute) quota.
+        start_index = 0
+        while start_index in self._exhausted_keys and start_index < len(self._api_keys) - 1:
+            start_index += 1
+        
+        if self._current_key_index != start_index:
+            logger.debug(f"Resetting key index from {self._current_key_index} to {start_index} to prefer free tiers.")
+            self._current_key_index = start_index
+
+        # Track attempts on the CURRENT key within this invoke() call.
+        # This allows us to retry the same key multiple times before rotating.
+        self._attempts_on_current_key = 0
+        max_attempts_per_key = 3 
+
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         # Ultra-persistence for the Heavy (Pro) model
-        # 12 attempts with longer wait can span ~1 hour
+        # 12 attempts total (spread across keys)
         max_attempts = 12 if tier == "heavy" else 4
 
         def is_transient_error(exception):
@@ -456,13 +633,30 @@ class GeminiCLIClient:
                 # Keywords for typical transient errors
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
                 # Keywords that usually mean a hard daily stop
-                hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
+                hard_quota_keywords = ["daily", "rpd", "limit reached"]
                 
                 is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
                 
                 if is_quota:
-                    if self._rotate_key():
-                        logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
+                    # If it's a hard quota, mark this key as exhausted for the rest of the run
+                    if any(kw in error_msg for kw in hard_quota_keywords):
+                        logger.warning(f"Hard quota (Daily/RPD) reached for key {self._current_key_index}. Marking as exhausted.")
+                        self._exhausted_keys.add(self._current_key_index)
+                        self._attempts_on_current_key = 0 # reset for new key
+                        return self._rotate_key()
+
+                    # For soft quotas, retry the same key multiple times first
+                    self._attempts_on_current_key += 1
+                    if self._attempts_on_current_key >= max_attempts_per_key:
+                        logger.info(f"Key {self._current_key_index} hit quota {self._attempts_on_current_key} times. Rotating...")
+                        self._attempts_on_current_key = 0 # reset for new key
+                        if self._rotate_key():
+                            return True
+                    else:
+                        logger.info(
+                            f"Key {self._current_key_index} hit soft quota (attempt {self._attempts_on_current_key}/{max_attempts_per_key}). "
+                            "Retrying same key after backoff..."
+                        )
                         return True
                     
                     if any(kw in error_msg for kw in hard_quota_keywords):
@@ -523,38 +717,36 @@ class GeminiCLIClient:
         return None
 
     def get_usage_summary(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
-        """Generate a formatted markdown summary of Gemini API usage and estimated costs."""
-        # Cost constants (Gemini 3.1 Pay-as-you-go pricing, Audited May 2026)
-        # Pro: $5.00/1M in, $18.00/1M out (Adjusted to match actual $0.03/call observed)
-        # Flash: $1.00/1M in, $4.00/1M out
-        # Flash-Lite: $0.20/1M in, $0.80/1M out
-        PRICING = {
-            "heavy": {"in": 5.00 / 1_000_000, "out": 18.00 / 1_000_000},
-            "medium": {"in": 1.00 / 1_000_000, "out": 4.00 / 1_000_000},
-            "light": {"in": 0.20 / 1_000_000, "out": 0.80 / 1_000_000},
-        }
+        """Generate a formatted markdown summary of Gemini API usage and estimated costs.
 
+        Pricing constants and the cost formula live on the class (PRICING,
+        CACHED_INPUT_DISCOUNT, _cost_for) so this summary and the per-call log
+        agree to the cent. Cached input is billed at a discount and thinking
+        ("thoughts") tokens at the output rate — see _cost_for."""
         total_cost = 0.0
         lines = ["\n---\n\n## Gemini Usage Summary\n\n"]
-        lines.append("| Tier | Success | Failures | Input (Tok/Char) | Output (Tok/Char) | Est. Cost |\n")
+        lines.append("| Tier | Success | Failures | Input (fresh/cached) | Output (text/think) | Est. Cost |\n")
         lines.append("| :--- | :---: | :---: | :--- | :--- | :--- |\n")
 
         for tier in ["heavy", "medium", "light"]:
             stats = self.usage_stats[tier]
             if stats["calls"] == 0 and stats["failed_attempts"] == 0:
                 continue
-            
-            # Estimate tokens if they were missing (3.5 chars per token for Gemini 1.5+)
+
+            # Estimate tokens from chars if the CLI didn't report any
+            # (~3.5 chars/token for Gemini). Cached/thinking have no char proxy.
             in_tok = stats["in_tokens"] or int(stats["in_chars"] / 3.5)
             out_tok = stats["out_tokens"] or int(stats["out_chars"] / 3.5)
-            
-            cost = (in_tok * PRICING[tier]["in"]) + (out_tok * PRICING[tier]["out"])
+            cached_tok = stats.get("cached_tokens", 0)
+            think_tok = stats.get("thought_tokens", 0)
+
+            cost = self._cost_for(tier, in_tok, cached_tok, out_tok, think_tok)
             total_cost += cost
-            
+
             lines.append(
                 f"| {tier.capitalize()} | {stats['calls']} | {stats['failed_attempts']} | "
-                f"{in_tok:,} / {stats['in_chars']:,} | "
-                f"{out_tok:,} / {stats['out_chars']:,} | "
+                f"{in_tok:,} / {cached_tok:,} | "
+                f"{out_tok:,} / {think_tok:,} | "
                 f"${cost:.4f} |\n"
             )
 
@@ -576,7 +768,13 @@ class GeminiCLIClient:
                 lines.append(f"| {idx} | `{stats['preview']}` | {stats['success']} | {stats['failure']} |\n")
             lines.append("\n")
 
-        lines.append(f"*Note: Costs are estimated based on Gemini 3.1 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n\n")
+        lines.append(
+            f"*Note: Costs are estimated from Gemini paid-tier rates (audited May 2026): "
+            f"Pro $2/$12, Flash $0.50/$3, Flash-Lite $0.25/$1.50 per 1M input/output tokens. "
+            f"Thinking tokens bill at the output rate; cached input at "
+            f"{int(self.CACHED_INPUT_DISCOUNT * 100)}% of the input rate. "
+            f"Failed calls are not charged but represent retries/rotations.*\n\n"
+        )
         
         # Add timing information if provided
         if start_time and end_time:
