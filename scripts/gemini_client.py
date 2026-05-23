@@ -524,14 +524,21 @@ class GeminiCLIClient:
 
     def get_usage_summary(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
         """Generate a formatted markdown summary of Gemini API usage and estimated costs."""
-        # Cost constants (Gemini 3.1 Pay-as-you-go pricing, Audited May 2026)
-        # Pro: $5.00/1M in, $18.00/1M out (Adjusted to match actual $0.03/call observed)
-        # Flash: $1.00/1M in, $4.00/1M out
-        # Flash-Lite: $0.20/1M in, $0.80/1M out
+        # Cost constants — Gemini paid-tier rates, audited 2026-05-22 against
+        # https://ai.google.dev/gemini-api/docs/pricing. CLI aliases resolve as
+        # verified by scripts/audit_gemini.py (logs/gemini-audit-20260522-225038.txt):
+        #   heavy  -> "pro"        -> gemini-3.x-pro-preview ($2/$12 for prompts
+        #             <=200k; $4/$18 above). PAID-TIER ONLY — free-tier keys 429
+        #             with "exhausted capacity", so in practice this row stays $0.
+        #             The exact alias (3-pro vs 3.1-pro) can't be probed on a free
+        #             key, but both share the <=200k rate and briefing prompts are
+        #             well under 200k, so the figure holds either way.
+        #   medium -> "flash"      -> gemini-3-flash-preview  ($0.50 in / $3.00 out)
+        #   light  -> "flash-lite" -> gemini-3.1-flash-lite   ($0.25 in / $1.50 out)
         PRICING = {
-            "heavy": {"in": 5.00 / 1_000_000, "out": 18.00 / 1_000_000},
-            "medium": {"in": 1.00 / 1_000_000, "out": 4.00 / 1_000_000},
-            "light": {"in": 0.20 / 1_000_000, "out": 0.80 / 1_000_000},
+            "heavy": {"in": 2.00 / 1_000_000, "out": 12.00 / 1_000_000},
+            "medium": {"in": 0.50 / 1_000_000, "out": 3.00 / 1_000_000},
+            "light": {"in": 0.25 / 1_000_000, "out": 1.50 / 1_000_000},
         }
 
         total_cost = 0.0
@@ -576,7 +583,7 @@ class GeminiCLIClient:
                 lines.append(f"| {idx} | `{stats['preview']}` | {stats['success']} | {stats['failure']} |\n")
             lines.append("\n")
 
-        lines.append(f"*Note: Costs are estimated based on Gemini 3.1 Pay-as-you-go pricing. Failed calls are not charged but represent retries/rotations.*\n\n")
+        lines.append(f"*Note: Costs are estimated from Gemini paid-tier rates (audited May 2026): Pro $2/$12, Flash $0.50/$3, Flash-Lite $0.25/$1.50 per 1M input/output tokens. Failed calls are not charged but represent retries/rotations.*\n\n")
         
         # Add timing information if provided
         if start_time and end_time:
