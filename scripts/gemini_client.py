@@ -190,6 +190,7 @@ class GeminiCLIClient:
         self._available = None
         self._api_keys = self._load_api_keys()
         self._current_key_index = 0
+        self._exhausted_keys = set()  # indices of keys that hit hard quotas (RPD)
 
         # Key usage tracking
         self.key_usage_stats = {
@@ -292,9 +293,24 @@ class GeminiCLIClient:
         jitter = random.uniform(0, 10)
         total_delay = self.key_swap_delay + jitter
         
-        logger.info(f"🔄 ROTATING API KEY: Moving from index {self._current_key_index} to {(self._current_key_index + 1) % len(self._api_keys)}")
+        # Determine the next available (non-exhausted) key
+        next_index = (self._current_key_index + 1) % len(self._api_keys)
+        attempts = 0
+        while next_index in self._exhausted_keys and attempts < len(self._api_keys):
+            next_index = (next_index + 1) % len(self._api_keys)
+            attempts += 1
+
+        if attempts >= len(self._api_keys) or next_index in self._exhausted_keys:
+            logger.error("All available API keys are exhausted for this run.")
+            return False
+
+        # User requirement: Key 3 (Index 2) is last resort
+        if next_index == 2 and self._current_key_index < 2:
+            logger.warning("⚠️ LAST RESORT: Free keys (Index 0, 1) exhausted. Rotating to PAID key (Index 2).")
         
-        self._current_key_index = (self._current_key_index + 1) % len(self._api_keys)
+        logger.info(f"🔄 ROTATING API KEY: Moving from index {self._current_key_index} to {next_index}")
+        
+        self._current_key_index = next_index
         new_key = self._get_current_key()
         key_preview = new_key[:6] + "..." + new_key[-4:] if new_key else "None"
         
@@ -573,11 +589,27 @@ class GeminiCLIClient:
             logger.warning(f"LLM call budget exhausted ({self._call_count}/{self.max_calls}). Skipping {tier}.")
             return None
 
+        # Always try to start from the first non-exhausted key to prefer free tiers.
+        # This ensures we don't 'stick' to a paid key (like Index 2) if a free one
+        # might have reset its RPM (Requests Per Minute) quota.
+        start_index = 0
+        while start_index in self._exhausted_keys and start_index < len(self._api_keys) - 1:
+            start_index += 1
+        
+        if self._current_key_index != start_index:
+            logger.debug(f"Resetting key index from {self._current_key_index} to {start_index} to prefer free tiers.")
+            self._current_key_index = start_index
+
+        # Track attempts on the CURRENT key within this invoke() call.
+        # This allows us to retry the same key multiple times before rotating.
+        self._attempts_on_current_key = 0
+        max_attempts_per_key = 3 
+
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         # Ultra-persistence for the Heavy (Pro) model
-        # 12 attempts with longer wait can span ~1 hour
+        # 12 attempts total (spread across keys)
         max_attempts = 12 if tier == "heavy" else 4
 
         def is_transient_error(exception):
@@ -600,13 +632,30 @@ class GeminiCLIClient:
                 # Keywords for typical transient errors
                 quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
                 # Keywords that usually mean a hard daily stop
-                hard_quota_keywords = ["daily", "rpd", "limit reached", "quota exceeded"]
+                hard_quota_keywords = ["daily", "rpd", "limit reached"]
                 
                 is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
                 
                 if is_quota:
-                    if self._rotate_key():
-                        logger.info(f"Quota error detected for tier {tier}. Rotated API key and retrying...")
+                    # If it's a hard quota, mark this key as exhausted for the rest of the run
+                    if any(kw in error_msg for kw in hard_quota_keywords):
+                        logger.warning(f"Hard quota (Daily/RPD) reached for key {self._current_key_index}. Marking as exhausted.")
+                        self._exhausted_keys.add(self._current_key_index)
+                        self._attempts_on_current_key = 0 # reset for new key
+                        return self._rotate_key()
+
+                    # For soft quotas, retry the same key multiple times first
+                    self._attempts_on_current_key += 1
+                    if self._attempts_on_current_key >= max_attempts_per_key:
+                        logger.info(f"Key {self._current_key_index} hit quota {self._attempts_on_current_key} times. Rotating...")
+                        self._attempts_on_current_key = 0 # reset for new key
+                        if self._rotate_key():
+                            return True
+                    else:
+                        logger.info(
+                            f"Key {self._current_key_index} hit soft quota (attempt {self._attempts_on_current_key}/{max_attempts_per_key}). "
+                            "Retrying same key after backoff..."
+                        )
                         return True
                     
                     if any(kw in error_msg for kw in hard_quota_keywords):
