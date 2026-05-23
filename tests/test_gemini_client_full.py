@@ -352,9 +352,10 @@ class TestQuotaDetection:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_quota_keyword_triggers_rotation(self, mock_sleep, mock_run, cfg):
-        # First fails with 429, second succeeds; should rotate key.
+        # Must fail 3 times with 429 on first key to trigger rotation.
+        quota_err = subprocess.CalledProcessError(1, ["gemini"], stderr="HTTP 429 rate limit")
         mock_run.side_effect = [
-            subprocess.CalledProcessError(1, ["gemini"], stderr="HTTP 429 rate limit"),
+            quota_err, quota_err, quota_err,
             MagicMock(returncode=0, stdout='{"response":"ok"}'),
         ]
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
