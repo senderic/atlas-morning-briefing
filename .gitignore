@@ -33,6 +33,7 @@ logs/*.log
 *.log
 logs/alignment-report-*.txt
 logs/mock-briefing.md
+logs/gemini-calls*.jsonl
 
 # IDE and Tools
 .vscode/

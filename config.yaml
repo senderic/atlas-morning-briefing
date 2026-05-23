@@ -191,6 +191,10 @@ gemini:
   max_calls_per_run: 50
   retry_wait_seconds: 61
   key_swap_delay: 5
+  # Per-call usage log: appends one JSON line per LLM call (tier, resolved
+  # model, key index, full token breakdown, estimated cost, latency) here.
+  # Relative paths resolve against the repo root. Comment out to disable.
+  call_log_path: "logs/gemini-calls.jsonl"
   models:
     heavy: "pro"
     medium: "flash"

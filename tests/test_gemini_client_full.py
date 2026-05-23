@@ -84,6 +84,22 @@ class TestUsageSummary:
         summary = client.get_usage_summary()
         assert "Costs are estimated" in summary
 
+    def test_summary_charges_thoughts_as_output(self, client):
+        # 1M output text + 1M thinking tokens, both at medium out rate ($3/1M).
+        client.usage_stats["medium"]["calls"] = 1
+        client.usage_stats["medium"]["out_tokens"] = 1_000_000
+        client.usage_stats["medium"]["thought_tokens"] = 1_000_000
+        summary = client.get_usage_summary()
+        assert "$6.0000" in summary  # (1M + 1M) * $3/1M
+
+    def test_summary_applies_cached_discount(self, client):
+        # 1M fresh + 1M cached input at medium in rate ($0.50/1M); cached at 25%.
+        client.usage_stats["medium"]["calls"] = 1
+        client.usage_stats["medium"]["in_tokens"] = 1_000_000
+        client.usage_stats["medium"]["cached_tokens"] = 1_000_000
+        summary = client.get_usage_summary()
+        assert "$0.6250" in summary  # 0.50 + 0.50*0.25
+
     def test_key_rotation_summary_present(self, cfg):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
             client = GeminiCLIClient(cfg)
@@ -268,6 +284,47 @@ class TestParseResponse:
         assert client.usage_stats["medium"]["out_tokens"] == 5
 
     @patch("subprocess.run")
+    def test_extracts_full_token_breakdown(self, mock_run, cfg):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "response": "ok",
+                "stats": {"models": {"gemini-3-flash-preview": {"tokens": {
+                    "input": 14123, "prompt": 21753, "cached": 7630,
+                    "candidates": 70, "thoughts": 57, "tool": 0, "total": 21880,
+                }}}},
+            }),
+        )
+        client = GeminiCLIClient(cfg)
+        client._available = True
+        client.invoke("p", tier="medium")
+        s = client.usage_stats["medium"]
+        assert s["in_tokens"] == 14123      # fresh = input field
+        assert s["cached_tokens"] == 7630
+        assert s["out_tokens"] == 70        # candidates
+        assert s["thought_tokens"] == 57
+        assert s["tool_tokens"] == 0
+
+    @patch("subprocess.run")
+    def test_derives_fresh_input_when_input_field_absent(self, mock_run, cfg):
+        # Older CLI shape: no `input`, only prompt + cached → fresh = prompt - cached
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "response": "ok",
+                "stats": {"models": {"x": {"tokens": {
+                    "prompt": 1000, "cached": 400, "candidates": 50,
+                }}}},
+            }),
+        )
+        client = GeminiCLIClient(cfg)
+        client._available = True
+        client.invoke("p", tier="medium")
+        s = client.usage_stats["medium"]
+        assert s["in_tokens"] == 600   # 1000 - 400
+        assert s["cached_tokens"] == 400
+
+    @patch("subprocess.run")
     def test_falls_back_to_raw_stdout_on_invalid_json(self, mock_run, cfg):
         mock_run.return_value = MagicMock(
             returncode=0, stdout="Plain non-JSON output\n"
@@ -340,3 +397,78 @@ class TestQuotaDetection:
                        return_value=lambda x: 0.001):
                 result = client.invoke("p", tier="medium")
             assert result == "finally"
+
+
+class TestCostFormula:
+    def test_cost_includes_thoughts_and_cached_discount(self, client):
+        # medium: in $0.50/1M, out $3.00/1M; cached at 25% of input.
+        cost = client._cost_for(
+            "medium", fresh_in=1_000_000, cached_in=1_000_000,
+            out_text=1_000_000, thoughts=1_000_000,
+        )
+        # fresh 0.50 + cached 0.50*0.25=0.125 + output (1M+1M)*3/1M=6.00
+        assert abs(cost - (0.50 + 0.125 + 6.00)) < 1e-9
+
+    def test_unknown_tier_costs_zero(self, client):
+        assert client._cost_for("bogus", 1, 1, 1, 1) == 0.0
+
+
+class TestPerCallLog:
+    def _ok_stdout(self):
+        return json.dumps({
+            "response": "hi",
+            "stats": {"models": {"gemini-3-flash-preview": {"tokens": {
+                "input": 100, "cached": 0, "candidates": 10, "thoughts": 5,
+                "prompt": 100, "total": 115,
+            }}}},
+        })
+
+    def test_disabled_by_default_writes_nothing(self, cfg, tmp_path):
+        # cfg has no call_log_path → logging off; nothing should be written.
+        sentinel = tmp_path / "should-not-exist.jsonl"
+        client = GeminiCLIClient(cfg)
+        assert client.call_log_path is None
+        client._log_call({"x": 1})
+        assert not sentinel.exists()
+
+    @patch("subprocess.run")
+    def test_writes_record_when_configured(self, mock_run, cfg, tmp_path):
+        log = tmp_path / "calls.jsonl"
+        cfg = {**cfg, "call_log_path": str(log)}
+        mock_run.return_value = MagicMock(returncode=0, stdout=self._ok_stdout())
+        client = GeminiCLIClient(cfg)
+        client._available = True
+        client.invoke("p", tier="medium")
+
+        assert log.exists()
+        rec = json.loads(log.read_text().strip().splitlines()[-1])
+        assert rec["tier"] == "medium"
+        assert rec["status"] == "ok"
+        assert rec["resolved_model"] == "gemini-3-flash-preview"
+        assert rec["tokens"]["thoughts"] == 5
+        assert rec["cost_usd"] > 0
+        assert "latency_s" in rec
+
+    @patch("subprocess.run")
+    def test_logs_error_record_on_failure(self, mock_run, cfg, tmp_path):
+        log = tmp_path / "calls.jsonl"
+        cfg = {**cfg, "call_log_path": str(log)}
+        mock_run.side_effect = subprocess.CalledProcessError(
+            1, ["gemini"], stderr="boom"
+        )
+        client = GeminiCLIClient(cfg)
+        client._available = True
+        with patch("scripts.gemini_client.wait_random_exponential",
+                   return_value=lambda x: 0.001):
+            client.invoke("p", tier="medium", allow_fallback=False)
+
+        records = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert records and all(r["status"] == "error" for r in records)
+        assert "boom" in records[-1]["error"]
+
+    def test_relative_path_resolves_against_repo_root(self, cfg):
+        cfg = {**cfg, "call_log_path": "logs/gemini-calls.jsonl"}
+        client = GeminiCLIClient(cfg)
+        assert client.call_log_path.is_absolute()
+        assert client.call_log_path.name == "gemini-calls.jsonl"
+        assert client.call_log_path.parent.name == "logs"
