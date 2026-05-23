@@ -31,6 +31,10 @@ scored_papers.json
 stocks.json
 logs/*.log
 *.log
+logs/alignment-report-*.txt
+logs/mock-briefing.md
+logs/gemini-calls*.jsonl
+logs/gemini-audit-*.txt
 
 # IDE and Tools
 .vscode/
@@ -40,6 +44,9 @@ logs/*.log
 
 # Test cache
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Markdown files (except docs)
 *.md
@@ -48,6 +55,7 @@ logs/*.log
 !SKILL.md
 !GEMINI.md
 !SECURITY_FIXES.md
+!CHANGELOG.md
 !examples/*.md
 !references/*.md
 !skills/*.md

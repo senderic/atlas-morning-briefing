@@ -3,8 +3,9 @@
 """
 Intelligence layer for morning briefing.
 
-Uses Amazon Bedrock models to add reasoning, synthesis, and summarization
-to the briefing pipeline. Falls back gracefully when Amazon Bedrock is unavailable.
+Uses Gemini CLI models (via GeminiCLIClient) to add reasoning, synthesis,
+and summarization to the briefing pipeline. Falls back gracefully when the
+Gemini CLI is unavailable.
 """
 
 import logging
@@ -198,7 +199,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=2000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             logger.warning("Stage 1 filtering failed, returning all papers")
@@ -287,7 +288,7 @@ class BriefingIntelligence:
             "- Multi-agent orchestration frameworks release"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", max_tokens=300)
+        result = self.gemini.invoke(prompt, tier="light")
         if not result:
             logger.info("Dynamic query generation failed, using static queries only")
             return static_queries
@@ -334,7 +335,7 @@ class BriefingIntelligence:
             f"<topics>\n{topic_list}\n</topics>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", max_tokens=256)
+        result = self.gemini.invoke(prompt, tier="light")
         if not result:
             return topics
 
@@ -438,7 +439,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return items
@@ -511,7 +512,7 @@ class BriefingIntelligence:
             f"<items>\n" + "\n\n".join(item_texts) + "\n</items>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", max_tokens=500)
+        result = self.gemini.invoke(prompt, tier="light")
         if not result:
             return items
 
@@ -561,7 +562,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -611,7 +612,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -696,7 +697,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -798,7 +799,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=1000, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return news[:5]
@@ -825,7 +826,7 @@ class BriefingIntelligence:
         retry_result = self.gemini.invoke(
             f"From these articles, pick the 5 most important for an AI researcher. "
             f"Format EXACTLY as: [number] summary sentence.\n\n{articles_block}",
-            tier="medium", max_tokens=800, system_prompt=SYSTEM_PROMPT
+            tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if retry_result:
             parsed_retry = self._parse_ranked_response(retry_result)
@@ -886,7 +887,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="light", max_tokens=800, system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return blogs[:5]
@@ -980,7 +981,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", max_tokens=500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
@@ -1046,7 +1047,7 @@ class BriefingIntelligence:
             "respond with NONE."
         )
 
-        result = self.gemini.invoke(prompt, tier="light", max_tokens=300)
+        result = self.gemini.invoke(prompt, tier="light")
         if not result or "NONE" in result.upper():
             return []
 
@@ -1195,7 +1196,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="heavy", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return {}
@@ -1274,7 +1275,7 @@ class BriefingIntelligence:
             "[5] NEW claude-3.5-haiku\n"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", max_tokens=800, system_prompt=SYSTEM_PROMPT)
+        result = self.gemini.invoke(prompt, tier="light", system_prompt=SYSTEM_PROMPT)
         if not result:
             logger.info("Trending tracking skipped (LLM unavailable)")
             return state, papers, blogs, news
@@ -1484,7 +1485,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="heavy", max_tokens=1500, system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
 
         if result:

@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # astral-sh/setup-uv installs uv and (optionally) Python in one
+      # step. We use it instead of the ghcr.io/astral-sh/uv container
+      # because `act` (local GHA emulator) chokes on the container's
+      # network=host volume mounting, and the setup-uv path works
+      # identically in both `act` and real GitHub Actions.
+      - name: Install uv + Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies (project + dev extras)
+        run: uv sync --all-extras --dev
+
+      - name: Run pytest
+        run: uv run pytest -v --tb=short
+
+      # Sanity check that no live-only diagnostics accidentally got picked
+      # up by pytest. scripts/test_briefing_alignment.py needs gemini-cli +
+      # API keys and would fail in CI, but it lives in scripts/ and the
+      # pyproject's testpaths is "tests/" so it shouldn't be discovered.
+      # This step makes the implicit contract explicit and visible.
+      - name: Confirm live-only diagnostics are excluded
+        run: |
+          if uv run pytest --collect-only -q 2>&1 | grep -q "test_briefing_alignment"; then
+            echo "ERROR: scripts/test_briefing_alignment.py was discovered "
+            echo "by pytest. That test needs gemini-cli + API keys and "
+            echo "must not run in CI. Restore testpaths='tests' in "
+            echo "pyproject.toml."
+            exit 1
+          fi
