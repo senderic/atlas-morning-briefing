@@ -163,6 +163,7 @@ class GeminiCLIClient:
         config = config or {}
         self.enabled = config.get("enabled", True)
         self.ignore_hard_quota = config.get("ignore_hard_quota", False)
+        self.track_hard_quotas = config.get("track_hard_quotas", False) # Flag to permanently skip keys
         self.internal_max_attempts = config.get("internal_max_attempts", 1)
 
         # Explicit binary override (e.g. "agy" or "gemini"); None = auto-detect.
@@ -297,11 +298,12 @@ class GeminiCLIClient:
         # Determine the next available (non-exhausted) key
         next_index = (self._current_key_index + 1) % len(self._api_keys)
         attempts = 0
-        while next_index in self._exhausted_keys and attempts < len(self._api_keys):
-            next_index = (next_index + 1) % len(self._api_keys)
-            attempts += 1
-
-        if attempts >= len(self._api_keys) or next_index in self._exhausted_keys:
+        if self.track_hard_quotas:
+            while next_index in self._exhausted_keys and attempts < len(self._api_keys):
+                next_index = (next_index + 1) % len(self._api_keys)
+                attempts += 1
+        
+        if attempts >= len(self._api_keys) and self.track_hard_quotas:
             logger.error("All available API keys are exhausted for this run.")
             return False
 
@@ -594,8 +596,9 @@ class GeminiCLIClient:
         # This ensures we don't 'stick' to a paid key (like Index 2) if a free one
         # might have reset its RPM (Requests Per Minute) quota.
         start_index = 0
-        while start_index in self._exhausted_keys and start_index < len(self._api_keys) - 1:
-            start_index += 1
+        if self.track_hard_quotas:
+            while start_index in self._exhausted_keys and start_index < len(self._api_keys) - 1:
+                start_index += 1
         
         if self._current_key_index != start_index:
             logger.debug(f"Resetting key index from {self._current_key_index} to {start_index} to prefer free tiers.")
@@ -640,8 +643,12 @@ class GeminiCLIClient:
                 if is_quota:
                     # If it's a hard quota, mark this key as exhausted for the rest of the run
                     if any(kw in error_msg for kw in hard_quota_keywords):
-                        logger.warning(f"Hard quota (Daily/RPD) reached for key {self._current_key_index}. Marking as exhausted.")
-                        self._exhausted_keys.add(self._current_key_index)
+                        if self.track_hard_quotas:
+                            logger.warning(f"Hard quota (Daily/RPD) reached for key {self._current_key_index}. Marking as exhausted.")
+                            self._exhausted_keys.add(self._current_key_index)
+                        else:
+                            logger.info(f"Potential hard quota hit for key {self._current_key_index}, but track_hard_quotas is False. Rotating but NOT exhausting.")
+                        
                         self._attempts_on_current_key = 0 # reset for new key
                         return self._rotate_key()
 

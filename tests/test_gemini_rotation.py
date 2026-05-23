@@ -149,9 +149,11 @@ class TestGeminiRotation:
     @patch("time.sleep")
     def test_exhausted_key_skipping(self, mock_sleep, mock_run, rotation_config):
         """Test that keys hitting hard quotas are skipped in subsequent calls."""
+        cfg = rotation_config.copy()
+        cfg["track_hard_quotas"] = True
         env = {"GEMINI_API_KEY": "key1,key2,key3"}
         with patch.dict(os.environ, env, clear=True):
-            client = GeminiCLIClient(rotation_config)
+            client = GeminiCLIClient(cfg)
             client._available = True
             
             # First call hits a HARD quota on key1
