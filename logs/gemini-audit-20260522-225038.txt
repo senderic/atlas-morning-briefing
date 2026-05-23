@@ -1,0 +1,95 @@
+=== ENV ===
+gemini version: 0.43.0
+Date:           2026-05-22T22:50:40.217416-07:00
+API key:        AIzaSy...wWnI
+Key source:     GEMINI_API_KEY_3
+Probe timeout:  360s
+
+=== Available models via Gemini REST API ===
+  gemini-2.0-flash
+  gemini-2.0-flash-001
+  gemini-2.0-flash-lite
+  gemini-2.0-flash-lite-001
+  gemini-2.5-computer-use-preview-10-2025
+  gemini-2.5-flash
+  gemini-2.5-flash-image
+  gemini-2.5-flash-lite
+  gemini-2.5-flash-native-audio-latest
+  gemini-2.5-flash-native-audio-preview-09-2025
+  gemini-2.5-flash-native-audio-preview-12-2025
+  gemini-2.5-flash-preview-tts
+  gemini-2.5-pro
+  gemini-2.5-pro-preview-tts
+  gemini-3-flash-preview
+  gemini-3-pro-image-preview
+  gemini-3-pro-preview
+  gemini-3.1-flash-image-preview
+  gemini-3.1-flash-lite
+  gemini-3.1-flash-lite-preview
+  gemini-3.1-flash-live-preview
+  gemini-3.1-flash-tts-preview
+  gemini-3.1-pro-preview
+  gemini-3.1-pro-preview-customtools
+  gemini-3.5-flash
+  gemini-embedding-001
+  gemini-embedding-2
+  gemini-embedding-2-preview
+  gemini-flash-latest
+  gemini-flash-lite-latest
+  gemini-pro-latest
+  gemini-robotics-er-1.5-preview
+  gemini-robotics-er-1.6-preview
+
+=== CLI alias resolution (one invocation per tier) ===
+--- gemini --model pro ---
+  CLI exited 1
+  stderr:
+    Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.
+    YOLO mode is enabled. All tool calls will be automatically approved.
+    YOLO mode is enabled. All tool calls will be automatically approved.
+    Ripgrep is not available. Falling back to GrepTool.
+    Attempt 1 failed: You have exhausted your capacity on this model.. Retrying after 10701ms...
+    Attempt 2 failed: You have exhausted your capacity on this model.. Retrying after 20309ms...
+    Attempt 3 failed: You have exhausted your capacity on this model.. Retrying after 30323ms...
+    Attempt 4 failed: You have exhausted your capacity on this model.. Retrying after 34090ms...
+    Attempt 5 failed: You have exhausted your capacity on this model.. Retrying after 33663ms...
+    Attempt 6 failed: You have exhausted your capacity on this model.. Retrying after 32015ms...
+    Attempt 7 failed: You have exhausted your capacity on this model.. Retrying after 31239ms...
+    Attempt 8 failed: You have exhausted your capacity on this model.. Retrying after 31392ms...
+    Attempt 9 failed: You have exhausted your capacity on this model.. Retrying after 32227ms...
+    Attempt 10 failed: You have exhausted your capacity on this model.. Max attempts reached
+    Error when talking to Gemini API Full report available at: /tmp/gemini-client-error-Turn.run-sendMessageStream-2026-05-23T05-55-05-000Z.json RetryableQuotaError: You have exhausted your capacity on this model.
+        at classifyGoogleError (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:270135:18)
+        at retryWithBackoff (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:270791:31)
+        at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+        at async GeminiChat.makeApiCallAndProcessStream (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:293823:28)
+        at async GeminiChat.streamWithRetries (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:293641:29)
+        at async Turn.run (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:294311:24)
+        at async GeminiClient.processTurn (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:307643:22)
+        at async GeminiClient.sendMessageStream (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/chunk-U6X4OPT5.js:307740:14)
+        at async file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/gemini-YQATFAPB.js:10880:26
+        at async main (file:///mnt/fast_scratch/nvm_fast/.nvm/versions/node/v20.19.5/lib/node_modules/@google/gemini-cli/bundle/gemini-YQATFAPB.js:16237:5) {
+      cause: {
+        code: 429,
+        message: 'You have exhausted your capacity on this model.',
+        details: [ [Object], [Object] ]
+      },
+      retryDelayMs: 10000
+    }
+    {
+      "session_id": "d5cbda70-3c8e-43d4-b184-dba848e087c5",
+      "error": {
+        "type": "Error",
+        "message": "You have exhausted your capacity on this model.",
+        "code": 1
+      }
+    }
+  empty stdout (CLI returned nothing — likely auth or quota issue)
+--- gemini --model flash ---
+  resolved_model: gemini-3-flash-preview
+  tokens:         {'input': 3182, 'prompt': 10826, 'candidates': 1, 'total': 10854, 'cached': 7644, 'thoughts': 27, 'tool': 0}
+  response_chars: 2
+--- gemini --model flash-lite ---
+  resolved_model: gemini-3.1-flash-lite
+  tokens:         {'input': 10826, 'prompt': 10826, 'candidates': 1, 'total': 10827, 'cached': 0, 'thoughts': 0, 'tool': 0}
+  response_chars: 2
