@@ -18,7 +18,6 @@ import feedparser
 import yaml
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -55,7 +54,47 @@ class BlogScanner:
             feed = feedparser.parse(feed_url)
 
             if feed.bozo:
-                logger.warning(f"Feed parsing issue for {feed_name}: {feed.bozo_exception}")
+                # feed.bozo_exception is usually an xml.sax.SAXParseException
+                # carrying line/col info, or a urllib error. Surface the
+                # details so the run log is actionable instead of just
+                # "not well-formed (invalid token)".
+                exc = feed.bozo_exception
+                details = []
+                # HTTP status if feedparser reached the server.
+                status = getattr(feed, "status", None)
+                if status is not None:
+                    details.append(f"http_status={status}")
+                # Resolved URL (after redirects) if different from input.
+                href = getattr(feed, "href", None)
+                if href and href != feed_url:
+                    details.append(f"resolved_url={href}")
+                # SAX line/column for XML parse errors.
+                lineno = getattr(exc, "getLineNumber", lambda: None)()
+                if lineno is None:
+                    lineno = getattr(exc, "lineno", None)
+                colno = getattr(exc, "getColumnNumber", lambda: None)()
+                if colno is None:
+                    colno = getattr(exc, "colno", None)
+                if lineno is not None:
+                    details.append(f"line={lineno}")
+                if colno is not None:
+                    details.append(f"col={colno}")
+                # Content-Type tells us whether we got HTML instead of XML.
+                content_type = (getattr(feed, "headers", {}) or {}).get("content-type")
+                if content_type:
+                    details.append(f"content_type={content_type}")
+                # First chars of the raw payload, when feedparser kept it.
+                raw = getattr(feed, "raw", None) or b""
+                if isinstance(raw, bytes):
+                    raw = raw[:200].decode("utf-8", errors="replace")
+                snippet = raw.replace("\n", " ")[:200] if raw else ""
+                detail_str = ", ".join(details) if details else "no details"
+                logger.warning(
+                    f"Feed parsing issue for {feed_name} ({feed_url}): "
+                    f"{type(exc).__name__}: {exc} [{detail_str}]"
+                )
+                if snippet:
+                    logger.debug(f"Feed payload prefix for {feed_name}: {snippet!r}")
 
             # Calculate cutoff date
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
@@ -89,7 +128,10 @@ class BlogScanner:
             return articles
 
         except Exception as e:
-            logger.error(f"Failed to scan feed '{feed_name}': {e}")
+            logger.error(
+                f"Failed to scan feed '{feed_name}' ({feed_url}): "
+                f"{type(e).__name__}: {e}"
+            )
             return []
 
     def scan_all_feeds(self) -> List[Dict[str, Any]]:
@@ -178,8 +220,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Set log level
-    logger.setLevel(getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
 
     # Load config
     config = load_config(args.config)

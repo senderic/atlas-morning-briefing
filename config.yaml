@@ -183,15 +183,51 @@ pdf:
 # Gemini CLI configuration
 gemini:
   enabled: true
-  ignore_hard_quota: true
+  # When false (recommended), retries STOP on hard daily-quota errors
+  # (RPD reached). When true, the client keeps retrying past the daily
+  # cap — useful only if your error wording produces false positives,
+  # since real RPD won't recover until midnight PT.
+  ignore_hard_quota: false
   internal_max_attempts: 1
   max_calls_per_run: 50
   retry_wait_seconds: 61
   key_swap_delay: 5
+  # Heavy-tier retry budget. With 90-450s backoff, 20 attempts ≈ up to 2-3h
+  # of patient retrying — appropriate for unattended 4am cron runs that
+  # prefer eventual success over fast failure.
+  heavy_max_attempts: 20
   models:
     heavy: "pro"
     medium: "flash"
     light: "flash-lite"
+  # When true, queries the Gemini models.list endpoint
+  # (GET v1beta/models?key=...) on first use and auto-populates
+  # fallback_models for any tier you didn't manually fill in. Default
+  # false — stick with just pro/flash/flash-lite and let tenacity's
+  # exponential backoff ride out 429s. Flip to true if you want the
+  # client to also walk alternate model variants on persistent quota.
+  auto_discover_models: false
+  # Alternate models tried IN ORDER when the primary model for a tier
+  # exhausts its retries, before falling to the next tier. Empty by
+  # default — only fill in with verified model IDs (or set
+  # auto_discover_models: true above to fill them in automatically).
+  fallback_models:
+    heavy: []
+    medium: []
+    light: []
+  # Strikes-per-key on quota errors before rotating to the next key. With
+  # tenacity's 90-450s exponential backoff between strikes, 3 strikes ≈
+  # 5-22 min of patient retries on the same key before we move on. After
+  # rotating through every key max_strikes_per_key times, we give up on
+  # the current model and try the next one in fallback_models (then tier).
+  max_strikes_per_key: 3
+  # Minimum seconds between successive calls per tier. Defaults are sized for
+  # Pro free tier (~2 RPM heavy, looser on Flash). Lower if you have paid
+  # quota or multiple keys; raise if you're seeing 429s. Set to 0 to disable.
+  tier_min_interval_seconds:
+    heavy: 30
+    medium: 5
+    light: 2
 
 # Amazon Bedrock configuration
 # Set enabled: false to run in deterministic mode (no LLM, zero cost)

@@ -16,28 +16,26 @@ from typing import Any, Dict
 # Ensure scripts directory is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import create_scanner
 from scripts.paper_scorer import PaperScorer
-from scripts.bedrock_client import BedrockClient
-from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s)")
 logger = logging.getLogger(__name__)
 
 
 class PapersWorker(BaseWorker):
     """Fetches and enriches ArXiv papers independently."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], llm_client: Any = None):
         """
         Initialize PapersWorker.
 
         Args:
             config: Full configuration dictionary
+            llm_client: Optional shared LLM client; see BaseWorker.
         """
-        super().__init__(config, "papers_worker")
+        super().__init__(config, "papers_worker", llm_client=llm_client)
         self.topics = config.get("arxiv_topics", [])
         self.days_back = config.get("arxiv_days_back", 3)
         self.max_papers = config.get("max_papers", 30)
@@ -55,11 +53,11 @@ class PapersWorker(BaseWorker):
         try:
             logger.info(f"[{self.worker_name}] Starting ArXiv paper scan")
 
-            # Step 1: Fetch papers from ArXiv
-            scanner = ArxivScanner(
+            # Step 1: Fetch papers from ArXiv (DeepXiv when available + tokened)
+            scanner = create_scanner(
                 topics=self.topics,
                 days_back=self.days_back,
-                max_results=self.max_papers
+                max_results=self.max_papers,
             )
             papers = scanner.scan_all_topics()
             items_found = len(papers)
@@ -73,20 +71,19 @@ class PapersWorker(BaseWorker):
                     items_found=0
                 )
 
-            # Step 2: Initialize intelligence layer for enrichment
-            gemini_config = self.config.get("gemini", {})
-            if gemini_config.get("enabled", False):
-                llm = GeminiCLIClient(gemini_config)
-            else:
-                llm = BedrockClient(self.config.get("bedrock", {}))
-                
+            # Step 2: Initialize intelligence layer for enrichment.
+            # Reuse the coordinator's shared client when available so call
+            # budgets and Gemini key-rotation state are honored once per run.
+            llm = self._get_llm_client()
             intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:
                 logger.warning(f"[{self.worker_name}] Intelligence layer unavailable, skipping enrichment")
                 # Fallback: basic TF-IDF scoring only
-                scorer = PaperScorer(self.config)
-                papers = scorer.score_papers(papers, self.topics)
+                weights = self.config.get("paper_scoring", {})
+                num_picks = self.config.get("num_paper_picks", 3)
+                scorer = PaperScorer(topics=self.topics, weights=weights, num_picks=num_picks)
+                papers = scorer.score_papers(papers)
                 return self._create_finding(
                     status="success",
                     items=papers,
@@ -103,11 +100,10 @@ class PapersWorker(BaseWorker):
 
             # Step 4: Semantic scoring and summarization
             logger.info(f"[{self.worker_name}] Enriching papers with LLM")
+            tokens_before = self._count_client_tokens(llm)
             papers = intelligence.summarize_papers(papers)
             papers = intelligence.score_papers_semantically(papers, self.topics)
-
-            # Estimate token usage (rough): ~500 tokens per paper for summarization
-            token_count = len(papers) * 500
+            token_count = max(0, self._count_client_tokens(llm) - tokens_before)
 
             # Step 5: Final scoring (combines TF-IDF + semantic)
             weights = self.config.get("paper_scoring", {})

@@ -22,6 +22,7 @@ dependencies = [
     "markdown>=3.5.0",
     "nh3>=0.2.14",
     "defusedxml>=0.7.1",
+    "tenacity>=8.0.0",
 ]
 
 [project.optional-dependencies]

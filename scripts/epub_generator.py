@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 
 import markdown
 
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -73,9 +72,13 @@ class EPUBGenerator:
         html_content = re.sub(r'&(?!(amp|lt|gt|quot|apos|#\d+|#x[a-fA-F\d]+);)', '&amp;', html_content)
         
         # 2. Remove any emoji or characters outside Basic Multilingual Plane
-        # Kindle conversion service sometimes chokes on 4-byte UTF-8
-        html_content = "".join(c for c in html_content if ord(c) <= 0xFFFF)
-        
+        # (Kindle conversion sometimes chokes on 4-byte UTF-8). Log the count
+        # so silent loss of emoji / non-BMP CJK is at least visible.
+        dropped = sum(1 for c in html_content if ord(c) > 0xFFFF)
+        if dropped:
+            logger.warning(f"Dropped {dropped} non-BMP characters from EPUB content")
+            html_content = "".join(c for c in html_content if ord(c) <= 0xFFFF)
+
         return html_content
 
     def generate_epub(self, markdown_content: str, output_path: str) -> None:
@@ -184,6 +187,8 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="Output EPUB path")
     parser.add_argument("--title", default="Morning Briefing", help="Book title")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     try:
         with open(args.input, "r", encoding="utf-8") as f:

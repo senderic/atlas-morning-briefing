@@ -26,14 +26,14 @@ import yaml
 # Ensure scripts directory is on path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.arxiv_scanner import ArxivScanner
+from scripts.arxiv_scanner import create_scanner
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
 from scripts.news_aggregator import NewsAggregator
 from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.email_distributor import EmailDistributor
-from scripts.config_validator import validate_config, check_environment
+from scripts.config_validator import validate_config, check_environment, expand_env_vars
 from scripts.bedrock_client import BedrockClient
 from scripts.intelligence import BriefingIntelligence
 
@@ -94,7 +94,7 @@ class BriefingRunner:
                 logger.warning("No arxiv_topics configured, skipping")
                 return []
 
-            scanner = ArxivScanner(
+            scanner = create_scanner(
                 topics=topics,
                 days_back=days_back,
                 max_results=max_papers,
@@ -1053,6 +1053,17 @@ class BriefingRunner:
         self.status["elapsed_seconds"] = round(elapsed, 1)
         self.save_status()
 
+        # Emit a consistent token-count line so benchmark scripts can scrape it.
+        # BedrockClient doesn't track tokens, so this is best-effort against
+        # whichever client exposes usage_stats.
+        total_tokens = 0
+        stats = getattr(self.bedrock, "usage_stats", None)
+        if isinstance(stats, dict):
+            for tier in stats.values():
+                if isinstance(tier, dict):
+                    total_tokens += tier.get("in_tokens", 0) + tier.get("out_tokens", 0)
+        logger.info(f"Total LLM tokens used: {total_tokens}")
+
         logger.info(f"=== Briefing Complete in {elapsed:.1f}s ===")
 
         if self.errors:
@@ -1105,6 +1116,8 @@ def main() -> int:
 
     # Load config
     config = load_config(args.config)
+    # Expand ${VAR} / ${VAR:-default} placeholders BEFORE validation.
+    config = expand_env_vars(config)
 
     # Validate config
     is_valid, messages = validate_config(config)

@@ -25,3 +25,6 @@ nh3>=0.2.14
 # XML security (optional, falls back to stdlib)
 defusedxml>=0.7.1
 
+# Retry logic for Gemini CLI client (transient errors, key rotation)
+tenacity>=8.0.0
+

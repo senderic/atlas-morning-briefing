@@ -19,26 +19,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.news_aggregator import NewsAggregator
 from scripts.stock_fetcher import StockFetcher
-from scripts.bedrock_client import BedrockClient
-from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
 from scripts.workers.base_worker import BaseWorker
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
 class NewsMarketWorker(BaseWorker):
     """Fetches and enriches news + stock data independently."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], llm_client: Any = None):
         """
         Initialize NewsMarketWorker.
 
         Args:
             config: Full configuration dictionary
+            llm_client: Optional shared LLM client; see BaseWorker.
         """
-        super().__init__(config, "news_market_worker")
+        super().__init__(config, "news_market_worker", llm_client=llm_client)
         self.news_queries = config.get("news_queries", [])
         self.stocks = config.get("stocks", [])
         self.max_news = config.get("max_news", 15)
@@ -56,29 +54,38 @@ class NewsMarketWorker(BaseWorker):
         try:
             logger.info(f"[{self.worker_name}] Starting news and market data fetch")
 
-            # Get API keys from environment
+            # Get API keys from environment.
             brave_api_key = os.environ.get("BRAVE_API_KEY", "")
             finnhub_api_key = os.environ.get("FINNHUB_API_KEY", "")
 
-            # Step 1: Fetch news articles
-            news_aggregator = NewsAggregator(brave_api_key, self.news_queries, self.max_news)
-            news = news_aggregator.aggregate_all_queries()
+            # Step 1: Fetch news articles. Skip the call entirely if no key —
+            # NewsAggregator/Brave does not gate on an empty key and would
+            # produce one 401 per query.
+            if brave_api_key and self.news_queries:
+                news_aggregator = NewsAggregator(brave_api_key, self.news_queries, self.max_news)
+                news = news_aggregator.aggregate_all_queries()
+            else:
+                if not brave_api_key:
+                    logger.warning(f"[{self.worker_name}] BRAVE_API_KEY not set; skipping news fetch")
+                news = []
             news_found = len(news)
             logger.info(f"[{self.worker_name}] Fetched {news_found} news articles")
 
-            # Step 2: Fetch stock data
-            stock_fetcher = StockFetcher(finnhub_api_key, self.stocks)
-            stocks = stock_fetcher.fetch_all_stocks()
+            # Step 2: Fetch stock data. Same guard — skip rather than 401.
+            if finnhub_api_key and self.stocks:
+                stock_fetcher = StockFetcher(finnhub_api_key, self.stocks)
+                stocks = stock_fetcher.fetch_all_stocks()
+            else:
+                if not finnhub_api_key:
+                    logger.warning(f"[{self.worker_name}] FINNHUB_API_KEY not set; skipping stock fetch")
+                stocks = []
             stocks_found = len(stocks)
             logger.info(f"[{self.worker_name}] Fetched {stocks_found} stock prices")
 
-            # Step 3: Initialize intelligence layer for enrichment
-            gemini_config = self.config.get("gemini", {})
-            if gemini_config.get("enabled", False):
-                llm = GeminiCLIClient(gemini_config)
-            else:
-                llm = BedrockClient(self.config.get("bedrock", {}))
-                
+            # Step 3: Initialize intelligence layer for enrichment.
+            # Reuse the coordinator's shared client when available so call
+            # budgets and Gemini key-rotation state are honored once per run.
+            llm = self._get_llm_client()
             intelligence = BriefingIntelligence(llm, self.config)
 
             if not intelligence.available:
@@ -93,17 +100,18 @@ class NewsMarketWorker(BaseWorker):
             # Step 4: Rank and summarize news with LLM
             logger.info(f"[{self.worker_name}] Enriching news with LLM")
             topics = self.config.get("arxiv_topics", [])
+            tokens_before = self._count_client_tokens(llm)
             news = intelligence.rank_and_summarize_news(news, topics)
-            token_count += len(news) * 400  # ~400 tokens per news item
 
             # Step 5: Correlate stocks and news
             logger.info(f"[{self.worker_name}] Correlating stocks with news")
             stocks = intelligence.correlate_stocks_and_news(stocks, news)
-            token_count += len(stocks) * 300  # ~300 tokens per stock correlation
+            token_count = max(0, self._count_client_tokens(llm) - tokens_before)
 
-            # Step 6: Filter to top news
-            news = [n for n in news if n.get("llm_score", 0) >= 3]
-            news = sorted(news, key=lambda n: n.get("llm_score", 0), reverse=True)[:self.max_news]
+            # Step 6: Trim to top news. rank_and_summarize_news already returns the
+            # LLM's top picks in ranked order and does not assign a numeric score,
+            # so we trust that ordering and just cap the count.
+            news = news[:self.max_news]
 
             # Step 7: Generate synthesis
             synthesis = self._generate_synthesis(news, stocks)
