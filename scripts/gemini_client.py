@@ -528,11 +528,13 @@ class GeminiCLIClient:
         # https://ai.google.dev/gemini-api/docs/pricing. CLI aliases resolve as
         # verified by scripts/audit_gemini.py (logs/gemini-audit-20260522-225038.txt):
         #   heavy  -> "pro"        -> gemini-3.x-pro-preview ($2/$12 for prompts
-        #             <=200k; $4/$18 above). PAID-TIER ONLY — free-tier keys 429
-        #             with "exhausted capacity", so in practice this row stays $0.
-        #             The exact alias (3-pro vs 3.1-pro) can't be probed on a free
-        #             key, but both share the <=200k rate and briefing prompts are
-        #             well under 200k, so the figure holds either way.
+        #             <=200k; $4/$18 above). In practice this row stays $0: Pro has
+        #             no free tier, so free-tier keys can't serve it at all, and the
+        #             paid key 429'd ("exhausted capacity") in the audit too, with
+        #             its monthly budget cap nearly used up. The exact alias (3-pro
+        #             vs 3.1-pro) is therefore still unverified, but both share the
+        #             <=200k rate and briefing prompts run well under 200k, so the
+        #             figure holds either way.
         #   medium -> "flash"      -> gemini-3-flash-preview  ($0.50 in / $3.00 out)
         #   light  -> "flash-lite" -> gemini-3.1-flash-lite   ($0.25 in / $1.50 out)
         PRICING = {
