@@ -56,10 +56,10 @@ def test_deduplication_within_single_call(intelligence, mock_gemini):
     assert result[1]["author_blurb"] == "Blurb for TechCrunch."
     assert result[2]["author_blurb"] == "Blurb for The Verge."
 
-    # Verify LLM medium tier was called with only 2 items
+    # Verify LLM light tier was called with only 2 items
     calls = mock_gemini.invoke.call_args_list
     assert len(calls) == 2
-    assert calls[1].kwargs["tier"] == "medium"
+    assert calls[1].kwargs["tier"] == "light"
     prompt = calls[1].args[0]
     assert "[1]" in prompt
     assert "[2]" in prompt
