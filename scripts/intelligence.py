@@ -455,7 +455,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return items
@@ -1012,7 +1012,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
