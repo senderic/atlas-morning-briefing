@@ -20,7 +20,7 @@ def intelligence(mock_gemini):
 def test_caching_across_calls(intelligence, mock_gemini):
     """Test that blurbs are cached and reused across different calls."""
     items1 = [{"title": "News 1", "source": "TechCrunch"}]
-    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (medium)
+    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (light)
     mock_gemini.invoke.side_effect = ["TechCrunch", "[1] TechCrunch is a leading technology news website."]
 
     # First call: should fetch from LLM
@@ -43,7 +43,7 @@ def test_deduplication_within_single_call(intelligence, mock_gemini):
         {"title": "News 2", "source": "TechCrunch"},
         {"title": "News 3", "source": "The Verge"}
     ]
-    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (medium)
+    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (light)
     mock_gemini.invoke.side_effect = [
         "TechCrunch\nTechCrunch\nThe Verge",
         "[1] Blurb for TechCrunch.\n[2] Blurb for The Verge."
