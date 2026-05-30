@@ -50,6 +50,7 @@ htmlcov/
 
 # Markdown files (except docs)
 *.md
+!CLAUDE.md
 !CONTRIBUTING.md
 !README.md
 !SKILL.md
