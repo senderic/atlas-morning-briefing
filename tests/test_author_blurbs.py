@@ -30,10 +30,10 @@ def test_generate_author_blurbs_papers(intelligence, mock_gemini):
     assert result[0]["author_blurb"] == "Blurb for Paper 1."
     assert result[1]["author_blurb"] == "Blurb for Paper 2."
 
-    # Check if correct tier was used
+    # Check if correct tier was used (light: blurbs are trivial factual lookups)
     mock_gemini.invoke.assert_called_once()
     args, kwargs = mock_gemini.invoke.call_args
-    assert kwargs["tier"] == "medium"
+    assert kwargs["tier"] == "light"
     assert "reputable sources" in args[0]
     assert "PBS, NPR, NYT" in args[0]
 
@@ -84,7 +84,7 @@ def test_extract_missing_authors_blogs(intelligence, mock_gemini):
     items = [
         {"title": "Missing Author Blog", "source": "TechCrunch", "summary": "An article by John Doe about AI."}
     ]
-    # First call is extract_missing_authors (light), second is generate_author_blurbs (medium)
+    # First call is extract_missing_authors (light), second is generate_author_blurbs (light)
     mock_gemini.invoke.side_effect = ["[1] John Doe", "[1] Blurb for John Doe."]
 
     result = intelligence.generate_author_blurbs(items, "blogs")
@@ -96,4 +96,4 @@ def test_extract_missing_authors_blogs(intelligence, mock_gemini):
     # Verify tiers used
     calls = mock_gemini.invoke.call_args_list
     assert calls[0].kwargs["tier"] == "light"
-    assert calls[1].kwargs["tier"] == "medium"
+    assert calls[1].kwargs["tier"] == "light"

@@ -29,7 +29,7 @@ def test_caching_across_calls(intelligence, mock_gemini):
     assert mock_gemini.invoke.call_count == 2
 
     # Second call with same source: should use cache
-    # It still calls extract_missing_authors, but generate_author_blurbs should skip medium tier call
+    # It still calls extract_missing_authors, but generate_author_blurbs should skip the light tier call for cached sources
     items2 = [{"title": "News 2", "source": "TechCrunch"}]
     mock_gemini.invoke.side_effect = ["TechCrunch"]
     result2 = intelligence.generate_author_blurbs(items2, "news")
