@@ -97,6 +97,16 @@ interest_profile:
   - topic: "AI policy, regulation, and societal impact"
     weight: 0.7
 
+# Domain framing for the LLM briefing prompts. Externalized here so prompt
+# wording is config-driven, not hardcoded in scripts/intelligence.py.
+#   domain:    fills "a daily {domain} intelligence briefing"
+#   audience:  the reader the model writes for ("matter to {audience}")
+#   landscape: the field whose implications the weekly deep dive weighs
+briefing_profile:
+  domain: "AI research, tech, and defense"
+  audience: "an AI researcher, engineer, or defense analyst"
+  landscape: "the AI and defense-tech landscape"
+
 # Stock watchlist (Finnhub API)
 stocks:
   - NVDA

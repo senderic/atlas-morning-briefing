@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are the senior editor of a sharp, well-respected daily intelligence "
-    "briefing read by busy technical, research, and defense professionals. Your "
+    "briefing read by busy professionals who need the signal, not the noise. Your "
     "standard is A+ senior-level journalism: lead with the most important thing, "
     "surface the non-obvious insight, and always answer 'so what?'. "
     "Write in plain, vigorous, active-voice prose. Be specific and concrete -- "
@@ -68,6 +68,14 @@ class BriefingIntelligence:
         self.gemini = gemini
         self.config = config
         self.topics = config.get("arxiv_topics", [])
+        # Domain framing for prompts is config-driven, never hardcoded here.
+        # Generic defaults keep the prompts sensible when briefing_profile is omitted.
+        profile = config.get("briefing_profile", {}) or {}
+        self.briefing_domain = profile.get("domain", "AI and technology")
+        self.briefing_audience = profile.get("audience", "an AI researcher or engineer")
+        self.briefing_landscape = profile.get(
+            "landscape", "the AI and technology landscape"
+        )
         self.source_blurb_cache: Dict[str, str] = {}
 
     @property
@@ -803,10 +811,11 @@ class BriefingIntelligence:
 
         articles_block = "\n".join(news_lines)
         prompt = (
-            "You are curating a daily AI/tech/defense intelligence briefing. From "
-            "these news articles, select the TOP 5 that genuinely matter to an AI "
-            "researcher/engineer -- prioritize real signal (shipped capabilities, "
-            "deals, policy, money, hard numbers) over press-release noise.\n\n"
+            f"You are curating a daily {self.briefing_domain} intelligence briefing. "
+            f"From these news articles, select the TOP 5 that genuinely matter to "
+            f"{self.briefing_audience} -- prioritize real signal (shipped "
+            "capabilities, deals, policy, money, hard numbers) over press-release "
+            "noise.\n\n"
             f"<interests>{', '.join(topics[:5])}</interests>\n\n"
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
@@ -894,8 +903,8 @@ class BriefingIntelligence:
 
         blogs_block = "\n".join(blog_lines)
         prompt = (
-            "You are curating a daily AI/tech briefing. From these blog posts, "
-            "select the TOP 5 most relevant for an AI researcher/engineer.\n\n"
+            f"You are curating a daily {self.briefing_domain} briefing. From these "
+            f"blog posts, select the TOP 5 most relevant for {self.briefing_audience}.\n\n"
             f"<interests>{', '.join(topics[:5])}</interests>\n\n"
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
@@ -1206,7 +1215,7 @@ class BriefingIntelligence:
 
         prompt = (
             "You are writing the lead editorial -- the Executive Summary -- for "
-            "today's AI research and defense-tech intelligence briefing. This is "
+            f"today's {self.briefing_domain} intelligence briefing. This is "
             "the one section every reader reads, so it must earn an A+ in a senior "
             "journalism seminar.\n\n"
             "Your job is NOT to list what happened. It is to CONNECT THE DOTS: "
@@ -1218,7 +1227,7 @@ class BriefingIntelligence:
             "would lead with?\n"
             "2. What non-obvious connection ties two or more sources together? "
             "(e.g., a paper that explains a market move, a blog that contradicts "
-            "the headlines, a new capability that shifts the defense calculus.)\n"
+            "the headlines, a new capability that shifts the strategic calculus.)\n"
             "3. What is the second-order implication -- the 'so what' a casual "
             "reader would miss?\n\n"
             "Then write a tight 4-6 sentence editorial:\n"
@@ -1525,8 +1534,8 @@ class BriefingIntelligence:
             "Your essay should:\n"
             "1. Identify the 3 biggest themes of the week and name the through-line "
             "that links them.\n"
-            "2. Explain why each matters -- the concrete implications for "
-            "researchers, engineers, and the defense-tech landscape.\n"
+            f"2. Explain why each matters -- the concrete implications for "
+            f"readers and {self.briefing_landscape}.\n"
             "3. Call your shot: predict what to watch next week, and what would "
             "confirm or kill the trend.\n\n"
             "Write 500-800 words. Open with a strong lede that frames the week -- "

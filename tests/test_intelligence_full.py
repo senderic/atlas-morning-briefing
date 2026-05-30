@@ -837,3 +837,44 @@ class TestSystemPromptUsage:
         kwargs = mock_gemini.invoke.call_args.kwargs
         assert kwargs.get("system_prompt") == SYSTEM_PROMPT
         assert kwargs.get("tier") == "heavy"
+
+
+# ---------- domain framing is config-driven, not hardcoded ----------
+
+
+class TestBriefingProfile:
+    def _prompt_arg(self, mock_gemini):
+        call = mock_gemini.invoke.call_args
+        return call.args[0] if call.args else call.kwargs.get("prompt", "")
+
+    def test_defaults_when_profile_absent(self, mock_gemini, default_config):
+        intel = BriefingIntelligence(mock_gemini, default_config)
+        assert intel.briefing_domain == "AI and technology"
+        assert intel.briefing_audience == "an AI researcher or engineer"
+        assert intel.briefing_landscape == "the AI and technology landscape"
+
+    def test_profile_flows_into_news_prompt(self, mock_gemini, default_config):
+        config = dict(default_config)
+        config["briefing_profile"] = {
+            "domain": "biotech and pharma",
+            "audience": "a research clinician",
+        }
+        intel = BriefingIntelligence(mock_gemini, config)
+        mock_gemini.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
+        )
+        prompt = self._prompt_arg(mock_gemini)
+        assert "biotech and pharma" in prompt
+        assert "a research clinician" in prompt
+        assert "defense" not in prompt
+
+    def test_profile_flows_into_synthesis_prompt(self, mock_gemini, default_config):
+        config = dict(default_config)
+        config["briefing_profile"] = {"domain": "climate science"}
+        intel = BriefingIntelligence(mock_gemini, config)
+        mock_gemini.invoke.return_value = "out"
+        intel.synthesize_briefing(
+            papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+        assert "climate science" in self._prompt_arg(mock_gemini)
