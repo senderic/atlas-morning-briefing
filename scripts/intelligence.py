@@ -19,9 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
-    "You are an AI research analyst generating a daily morning briefing. "
-    "Be concise, insightful, and factual. Use markdown formatting. "
-    "Do not invent facts or citations. If information is insufficient, say so."
+    "You are the senior editor of a sharp, well-respected daily intelligence "
+    "briefing read by busy professionals who need the signal, not the noise. Your "
+    "standard is A+ senior-level journalism: lead with the most important thing, "
+    "surface the non-obvious insight, and always answer 'so what?'. "
+    "Write in plain, vigorous, active-voice prose. Be specific and concrete -- "
+    "name the model, the number, the company, the consequence. "
+    "Prize insight over erudition: never use a long word where a short one will "
+    "do, cut hedging and throat-clearing, and never pad with jargon to sound "
+    "smart. Be factual and skeptical: do not invent facts, numbers, or "
+    "citations, and if the evidence is thin, say so plainly. "
+    "Use markdown formatting."
 )
 
 
@@ -60,6 +68,14 @@ class BriefingIntelligence:
         self.gemini = gemini
         self.config = config
         self.topics = config.get("arxiv_topics", [])
+        # Domain framing for prompts is config-driven, never hardcoded here.
+        # Generic defaults keep the prompts sensible when briefing_profile is omitted.
+        profile = config.get("briefing_profile", {}) or {}
+        self.briefing_domain = profile.get("domain", "AI and technology")
+        self.briefing_audience = profile.get("audience", "an AI researcher or engineer")
+        self.briefing_landscape = profile.get(
+            "landscape", "the AI and technology landscape"
+        )
         self.source_blurb_cache: Dict[str, str] = {}
 
     @property
@@ -432,6 +448,11 @@ class BriefingIntelligence:
             "Base your assessment of trustworthiness on reputable sources such as PBS, NPR, NYT, "
             "or university publications. If the author is an organization or if an individual author "
             "cannot be definitively determined, provide a blurb about the organization's reputation.\n\n"
+            "Make each blurb specific to THIS source: lead with a concrete detail "
+            "(a notable product, beat, founder, ownership, or known slant) rather "
+            "than a generic 'is a leading organization known for...' opener. The "
+            "reader should learn something they could not have guessed from the "
+            "name alone. Vary sentence structure across items -- no template.\n\n"
             f"<items>\n{items_block}\n</items>\n\n"
             "Respond ONLY with a numbered list matching the input numbering. "
             "Do not include any introductory text, thought process, or preamble. "
@@ -439,7 +460,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return items
@@ -555,9 +576,15 @@ class BriefingIntelligence:
 
         papers_block = "\n\n".join(paper_texts)
         prompt = (
-            "For each paper below, write a 1-2 sentence summary that captures "
-            "the key contribution. Return as a numbered list matching the input "
-            "numbering. Be factual -- do not add information not in the abstract.\n\n"
+            "For each paper below, write a 1-2 sentence summary that extracts the "
+            "GEM -- the single most important, non-obvious thing the paper "
+            "delivers and why a researcher should care. Lead with the result or "
+            "new capability, not the methodology, and cite the concrete number or "
+            "benchmark if the abstract gives one. Plain, active voice -- skip the "
+            "academic throat-clearing ('In this paper, we...'). "
+            "Return a numbered list matching the input numbering. "
+            "Be factual -- use only what the abstract states; do not invent "
+            "results.\n\n"
             f"<papers>\n{papers_block}\n</papers>"
         )
 
@@ -789,13 +816,19 @@ class BriefingIntelligence:
 
         articles_block = "\n".join(news_lines)
         prompt = (
-            "You are curating a daily AI/tech briefing. From these news articles, "
-            "select the TOP 5 most important for an AI researcher/engineer.\n\n"
+            f"You are curating a daily {self.briefing_domain} intelligence briefing. "
+            f"From these news articles, select the TOP 5 that genuinely matter to "
+            f"{self.briefing_audience} -- prioritize real signal (shipped "
+            "capabilities, deals, policy, money, hard numbers) over press-release "
+            "noise.\n\n"
             f"<interests>{', '.join(topics[:5])}</interests>\n\n"
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
-            "[original_number] 2-3 sentence summary explaining why this matters.\n\n"
-            "Rank by importance. Be factual. Do not invent details."
+            "[original_number] 2-3 sentence summary.\n\n"
+            "In each summary, lead with what actually happened and the concrete "
+            "stakes, then deliver the 'so what' -- the implication or what it "
+            "signals. Active voice, specific names and numbers, no hype, no "
+            "filler. Rank by importance. Be factual. Do not invent details."
         )
 
         result = self.gemini.invoke(
@@ -875,12 +908,21 @@ class BriefingIntelligence:
 
         blogs_block = "\n".join(blog_lines)
         prompt = (
-            "You are curating a daily AI/tech briefing. From these blog posts, "
-            "select the TOP 5 most relevant for an AI researcher/engineer.\n\n"
+            f"You are curating a daily {self.briefing_domain} briefing. From these "
+            f"blog posts, select the TOP 5 most relevant for {self.briefing_audience}.\n\n"
             f"<interests>{', '.join(topics[:5])}</interests>\n\n"
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
-            "[original_number] SCORE:X/5 1-2 sentence summary of what the post covers.\n\n"
+            "[original_number] SCORE:X/5 1-2 sentence summary.\n\n"
+            "In the summary, name the specific thing the post is about and state "
+            "what it concretely claims, builds, or shows -- the actual takeaway a "
+            "reader would quote. Lead with the subject (the product, method, or "
+            "finding), not an abstraction.\n"
+            "BANNED: hollow 'X is critical/essential/important for Y' framings and "
+            "any sentence that would read the same for a dozen different posts. If "
+            "the provided text is too thin to say anything specific, summarize the "
+            "headline plainly rather than inflating it into a generic principle.\n"
+            "Specific, plainspoken, active voice.\n"
             "SCORE is a combined rating (1-5) of impact, complexity, and innovation. "
             "5 = groundbreaking, 1 = routine.\n"
             "Rank by relevance. Be concise."
@@ -981,7 +1023,7 @@ class BriefingIntelligence:
         )
 
         result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
@@ -1183,14 +1225,39 @@ class BriefingIntelligence:
             )
 
         prompt = (
-            "You are writing a daily AI research + market briefing. "
-            "Based on today's data below, write a 3-5 sentence executive summary "
-            "highlighting today's key theme, most notable findings, and connections "
-            "across papers, news, and blogs. "
-            "If emerging themes or multi-day trends are present, mention them. "
-            "IMPORTANT: Topics appearing in cross-source signals should be emphasized "
-            "as they represent strong multi-source confirmation. "
-            "Be specific. Only reference items from the data provided below.\n\n"
+            "You are writing the lead editorial -- the Executive Summary -- for "
+            f"today's {self.briefing_domain} intelligence briefing. This is "
+            "the one section every reader reads, so it must earn an A+ in a senior "
+            "journalism seminar.\n\n"
+            "Your job is NOT to list what happened. It is to CONNECT THE DOTS: "
+            "find the single most important through-line across today's papers, "
+            "news, blogs, and market moves, and tell the reader what it means and "
+            "why it matters now.\n\n"
+            "Reason it through before you write:\n"
+            "1. What is the biggest story in this data -- the thing a sharp analyst "
+            "would lead with?\n"
+            "2. What non-obvious connection ties two or more sources together? "
+            "(e.g., a paper that explains a market move, a blog that contradicts "
+            "the headlines, a new capability that shifts the strategic calculus.)\n"
+            "3. What is the second-order implication -- the 'so what' a casual "
+            "reader would miss?\n\n"
+            "Then write a tight 4-6 sentence editorial:\n"
+            "- Open with a strong, specific lede that states the day's main theme. "
+            "No throat-clearing, no 'Today's briefing covers...'.\n"
+            "- Make at least one genuine cross-source connection, naming the "
+            "specifics.\n"
+            "- Land on the implication or the single thing worth watching next.\n"
+            "- Plain, vigorous, active voice. Concrete nouns and numbers. No "
+            "hedging, no jargon for its own sake, no bullet list -- flowing prose.\n"
+            "- GROUNDING (critical): every fact, number, dollar figure, company, "
+            "and product name must appear verbatim in the data below. Do NOT add "
+            "specifics from memory or infer figures that are not shown. If you "
+            "lack a concrete number, describe the move qualitatively rather than "
+            "inventing one. A vaguer true sentence beats a precise fabricated one.\n\n"
+            "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
+            "independent sources -- treat them as the strongest signal and build "
+            "your through-line around them where they fit. If emerging themes or "
+            "multi-day trends are present, work them in.\n\n"
             f"<data>\n{all_data}\n</data>"
             f"{cross_source_note}"
         )
@@ -1474,13 +1541,31 @@ class BriefingIntelligence:
         context_str = "\n\n".join(context_parts)
 
         prompt = (
-            "You are writing a 'This Week in AI' section for a weekly research briefing. "
-            "Based on this week's papers, blogs, and news below, synthesize a narrative that:\n\n"
-            "1. Identifies the 3 biggest themes of the week\n"
-            "2. Explains why they matter (implications for researchers/engineers)\n"
-            "3. Predicts what to watch next week\n\n"
-            "Write 500-800 words. Be analytical, opinionated, and forward-looking. "
-            "Focus on connections and patterns across the week.\n\n"
+            "You are writing the 'This Week in AI' essay for a weekly intelligence "
+            "briefing -- the marquee long-form piece, held to A+ senior-journalism "
+            "standards. Based on this week's papers, blogs, and news below, do not "
+            "summarize -- SYNTHESIZE. Connect the dots across the week into a real "
+            "argument with a point of view.\n\n"
+            "Your essay should:\n"
+            "1. Identify the 3 biggest themes of the week and name the through-line "
+            "that links them.\n"
+            f"2. Explain why each matters -- the concrete implications for "
+            f"readers and {self.briefing_landscape}.\n"
+            "3. Call your shot: predict what to watch next week, and what would "
+            "confirm or kill the trend.\n\n"
+            "Write 500-800 words. Open with a strong lede that frames the week -- "
+            "no 'This week saw...'. Be analytical, opinionated, and "
+            "forward-looking. Plain, vigorous, active-voice prose; insight over "
+            "erudition.\n\n"
+            "GROUNDING (critical): the items below are headlines/titles ONLY -- "
+            "you do not have the article bodies. Build your argument strictly from "
+            "what these titles state. Do NOT invent or recall specific dollar "
+            "figures, funding amounts, percentages, contract values, product "
+            "names, or company names that do not appear verbatim in the titles "
+            "below; fabricated precision (e.g. an '$80B' or '1,775%' that is not "
+            "shown) is the worst failure mode here. When a title implies a trend "
+            "but gives no number, describe it qualitatively. A vaguer true "
+            "sentence beats a precise invented one.\n\n"
             f"<week_items>\n{context_str}\n</week_items>"
         )
 

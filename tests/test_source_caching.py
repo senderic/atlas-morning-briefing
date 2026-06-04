@@ -20,7 +20,7 @@ def intelligence(mock_gemini):
 def test_caching_across_calls(intelligence, mock_gemini):
     """Test that blurbs are cached and reused across different calls."""
     items1 = [{"title": "News 1", "source": "TechCrunch"}]
-    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (medium)
+    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (light)
     mock_gemini.invoke.side_effect = ["TechCrunch", "[1] TechCrunch is a leading technology news website."]
 
     # First call: should fetch from LLM
@@ -29,7 +29,7 @@ def test_caching_across_calls(intelligence, mock_gemini):
     assert mock_gemini.invoke.call_count == 2
 
     # Second call with same source: should use cache
-    # It still calls extract_missing_authors, but generate_author_blurbs should skip medium tier call
+    # It still calls extract_missing_authors, but generate_author_blurbs should skip the light tier call for cached sources
     items2 = [{"title": "News 2", "source": "TechCrunch"}]
     mock_gemini.invoke.side_effect = ["TechCrunch"]
     result2 = intelligence.generate_author_blurbs(items2, "news")
@@ -43,7 +43,7 @@ def test_deduplication_within_single_call(intelligence, mock_gemini):
         {"title": "News 2", "source": "TechCrunch"},
         {"title": "News 3", "source": "The Verge"}
     ]
-    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (medium)
+    # 1st call: extract_missing_authors (light), 2nd call: generate_author_blurbs (light)
     mock_gemini.invoke.side_effect = [
         "TechCrunch\nTechCrunch\nThe Verge",
         "[1] Blurb for TechCrunch.\n[2] Blurb for The Verge."
@@ -56,10 +56,10 @@ def test_deduplication_within_single_call(intelligence, mock_gemini):
     assert result[1]["author_blurb"] == "Blurb for TechCrunch."
     assert result[2]["author_blurb"] == "Blurb for The Verge."
 
-    # Verify LLM medium tier was called with only 2 items
+    # Verify LLM light tier was called with only 2 items
     calls = mock_gemini.invoke.call_args_list
     assert len(calls) == 2
-    assert calls[1].kwargs["tier"] == "medium"
+    assert calls[1].kwargs["tier"] == "light"
     prompt = calls[1].args[0]
     assert "[1]" in prompt
     assert "[2]" in prompt
