@@ -16,6 +16,11 @@ arxiv_topics:
   - "On-device AI Inference"
   - "Offline Machine Learning"
   - "Embedded AI for Restricted Environments"
+  - "Lunar resource extraction and mining"
+  - "Asteroid mining robotics and techniques"
+  - "Orbital data center architecture and thermal management"
+  - "Space-based AI inference and edge computing"
+  - "In-situ resource utilization (ISRU) for lunar bases"
 
 # RSS feeds to monitor
 blog_feeds:
@@ -96,6 +101,12 @@ interest_profile:
     weight: 0.8
   - topic: "AI policy, regulation, and societal impact"
     weight: 0.7
+  - topic: "Space mining and lunar resource development"
+    weight: 0.9
+  - topic: "Orbital data centers and space-based compute infrastructure"
+    weight: 0.8
+  - topic: "Space-tech market analysis and startup innovation"
+    weight: 0.7
 
 # Domain framing for the LLM briefing prompts. Externalized here so prompt
 # wording is config-driven, not hardcoded in scripts/intelligence.py.
@@ -103,28 +114,36 @@ interest_profile:
 #   audience:  the reader the model writes for ("matter to {audience}")
 #   landscape: the field whose implications the weekly deep dive weighs
 briefing_profile:
-  domain: "AI research, tech, and defense"
+  domain: "AI research, tech, defense, and space infrastructure"
   audience: "an AI researcher, engineer, or defense analyst"
-  landscape: "the AI and defense-tech landscape"
+  landscape: "the AI, defense-tech, and space exploration landscape"
 
 # Stock watchlist (Finnhub API)
 stocks:
-  - NVDA
-  - MSFT
-  - PLTR
-  - GOOGL
   - AMZN
-  - META
-  - VRT
   - ANET
+  - BKSY
   - EQIX
-  - LMT
-  - RTX
-  - NOC
   - GD
-  - SPY
-  - VGT
+  - GOOGL
+  - LITE
+  - LMT
+  - LUNR
+  - META
+  - MSFT
+  - NOC
+  - NVDA
+  - PL
+  - PLTR
   - QQQ
+  - RDW
+  - RKLB
+  - RTX
+  - SPCX
+  - SPY
+  - SUUN
+  - VGT
+  - VRT
 
 # News search queries (Brave Search API)
 news_queries:
@@ -143,6 +162,13 @@ news_queries:
   - "NVIDIA GPU based AI systems for off-grid operations"
   - "Local LLM deployment on single-node workstations for specialized tasks"
   - "tactical edge AI hardware and offline model execution"
+  - "Lunar mining and resource extraction commercial projects"
+  - "Asteroid mining startup funding and technology"
+  - "Orbital data centers and space-based AI infrastructure"
+  - "SpaceX Starshield and military space applications"
+  - "Intuitive Machines lunar infrastructure updates"
+  - "Rocket Lab orbital services and satellite manufacturing"
+  - "NASA Artemis program commercial partnerships"
 
 # Paper scoring weights
 paper_scoring:
@@ -197,6 +223,7 @@ gemini:
   enabled: true
   # cli_binary: "agy"   # uncomment to force Antigravity even if both exist
   ignore_hard_quota: true
+  track_hard_quotas: true
   internal_max_attempts: 1
   max_calls_per_run: 50
   retry_wait_seconds: 61
@@ -220,27 +247,39 @@ log_level: "DEBUG"
 
 # Tracked entities for competitive intelligence
 tracked_entities:
-  - name: "Palantir"
-    type: "company"
   - name: "Anduril"
+    type: "company"
+  - name: "Anthropic"
+    type: "company"
+  - name: "AstroForge"
+    type: "company"
+  - name: "DARPA"
+    type: "agency"
+  - name: "Department of Defense"
+    type: "agency"
+  - name: "DIU"
+    type: "agency"
+  - name: "Google DeepMind"
+    type: "company"
+  - name: "Intuitive Machines"
+    type: "company"
+  - name: "ispace"
     type: "company"
   - name: "Lockheed Martin"
     type: "company"
   - name: "Northrop Grumman"
     type: "company"
+  - name: "OpenAI"
+    type: "company"
+  - name: "Palantir"
+    type: "company"
   - name: "Raytheon"
+    type: "company"
+  - name: "Redwire"
+    type: "company"
+  - name: "Rocket Lab"
     type: "company"
   - name: "Shield AI"
     type: "company"
-  - name: "Anthropic"
+  - name: "SpaceX"
     type: "company"
-  - name: "Google DeepMind"
-    type: "company"
-  - name: "OpenAI"
-    type: "company"
-  - name: "Department of Defense"
-    type: "agency"
-  - name: "DARPA"
-    type: "agency"
-  - name: "DIU"
-    type: "agency"
