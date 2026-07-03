@@ -399,6 +399,18 @@ class BriefingRunner:
             md.append("## Executive Summary\n\n")
             md.append(f"{intro}\n\n")
 
+            # Solo Founder Angle (1-man company idea of the day)
+            solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
+            if solo_angle:
+                md.append("## 💡 Solo Founder Angle\n\n")
+                md.append(f"{solo_angle}\n\n")
+
+            # Agent Cost-Optimization Play
+            cost_play = synthesis.get("agent_cost_play", "") if synthesis else ""
+            if cost_play:
+                md.append("## 💰 Agent Cost-Optimization Play\n\n")
+                md.append(f"{cost_play}\n\n")
+
             # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
             # Only show if an entity has a spike (e.g., 5+ mentions).
             # entity_mentions = synthesis.get("entity_mentions", [])
@@ -665,12 +677,21 @@ class BriefingRunner:
             difficulty = paper.get("reproduction_difficulty", "")
 
             score_tag = f" {self._render_stars(score)}" if score else ""
+            pdf_link = paper.get("pdf_link", "")
             if arxiv_url:
                 md.append(f"### {i}. [{paper_title}]({arxiv_url}){score_tag}\n")
             else:
                 md.append(f"### {i}. {paper_title}{score_tag}\n")
             if authors:
                 md.append(f"*{', '.join(authors[:3])}*\n\n")
+            # Link row: abstract + PDF
+            link_parts = []
+            if arxiv_url:
+                link_parts.append(f"[abs]({arxiv_url})")
+            if pdf_link:
+                link_parts.append(f"[📄 PDF]({pdf_link})")
+            if link_parts:
+                md.append("🔗 " + " · ".join(link_parts) + "\n\n")
 
             if brief_summary:
                 md.append(f"{brief_summary}\n\n")
@@ -961,6 +982,28 @@ class BriefingRunner:
                 emerging_themes=emerging_themes,
                 previous_state=previous_state,
             )
+
+            # Solo-founder startup angle (1-man company idea of the day)
+            try:
+                solo_angle = self.intelligence.generate_solo_startup_angle(
+                    papers, blogs[:6], news[:6], top_papers[:3],
+                    emerging_themes=emerging_themes,
+                )
+                if solo_angle:
+                    synthesis["solo_startup"] = solo_angle
+            except Exception as e:
+                logger.warning(f"Solo-startup angle generation failed: {e}")
+
+            # Agent cost-optimization play of the day
+            try:
+                cost_play = self.intelligence.generate_agent_cost_optimization(
+                    papers, blogs[:6], news[:6], top_papers[:3],
+                    emerging_themes=emerging_themes,
+                )
+                if cost_play:
+                    synthesis["agent_cost_play"] = cost_play
+            except Exception as e:
+                logger.warning(f"Agent cost-optimization generation failed: {e}")
 
             # Feature 3: Competitive Intelligence (entity tracking)
             tracked_entities = self.config.get("tracked_entities", [])

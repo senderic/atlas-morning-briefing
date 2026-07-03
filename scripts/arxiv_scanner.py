@@ -28,7 +28,14 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # Try DeepXiv SDK first, fall back to legacy ArXiv API
+# 2026-07-03: DeepXiv index is stale (returns 0 papers on all queries since ~mid-June 2026).
+# Force-disable DeepXiv and use legacy arxiv.org API directly — reliable in cron path.
+# Re-enable when DeepXiv confirms index refresh.
+FORCE_DISABLE_DEEPXIV = True
+
 try:
+    if FORCE_DISABLE_DEEPXIV:
+        raise ImportError("DeepXiv force-disabled (stale index, see 2026-07-03 fix)")
     from deepxiv_sdk import Reader as DeepXivReader
     HAS_DEEPXIV = True
     logger.info("Using DeepXiv SDK for paper search")
@@ -77,13 +84,16 @@ class DeepXivScanner:
                 date_from=date_from,
             )
 
-            # DeepXiv returns {"total": N, "results": [...], "took": ms}
-            if isinstance(response, dict) and "results" in response:
+            # DeepXiv API contract (2026-06): {"status":"success","backend":"qdrant","total_count":N,"result":[...]}
+            # Note: singular 'result', not 'results'. Older spec used 'results'.
+            if isinstance(response, dict) and "result" in response:
+                raw_papers = response["result"]
+            elif isinstance(response, dict) and "results" in response:
                 raw_papers = response["results"]
             elif isinstance(response, list):
                 raw_papers = response
             else:
-                logger.warning(f"Unexpected response type: {type(response)}")
+                logger.warning(f"Unexpected response type: {type(response)}, keys: {list(response.keys()) if isinstance(response, dict) else 'n/a'}")
                 raw_papers = []
 
             papers = []
@@ -180,6 +190,27 @@ class DeepXivScanner:
                     seen_ids.add(pid)
 
         logger.info(f"Total unique papers: {len(all_papers)}")
+
+        # 2026-06-27: DeepXiv index appears to be stale (no papers indexed past ~early June 2026).
+        # If we got nothing, fall back to direct arxiv.org API.
+        if len(all_papers) == 0:
+            logger.warning("DeepXiv returned 0 papers across all topics — falling back to legacy arxiv.org API")
+            try:
+                legacy = _OriginalArxivScanner(
+                    topics=self.topics, days_back=self.days_back, max_results=self.max_results
+                ) if '_OriginalArxivScanner' in globals() else None
+                if legacy is None:
+                    # _OriginalArxivScanner is set at module bottom after class rebind; reach into module
+                    import sys as _sys
+                    legacy = _sys.modules[__name__]._OriginalArxivScanner(
+                        topics=self.topics, days_back=self.days_back, max_results=self.max_results
+                    )
+                fallback_papers = legacy.scan_all_topics()
+                logger.info(f"Legacy ArXiv fallback returned {len(fallback_papers)} papers")
+                return fallback_papers
+            except Exception as e:
+                logger.error(f"Legacy ArXiv fallback failed: {e}")
+                return []
 
         # Enrich top 10 papers with briefs (save API budget)
         top_papers = sorted(all_papers, key=lambda p: p.get("deepxiv_score", 0), reverse=True)[:10]
