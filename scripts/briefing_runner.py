@@ -659,9 +659,10 @@ class BriefingRunner:
         return papers
 
     def _render_top_papers(self, top_papers: List[Dict[str, Any]]) -> str:
-        """Render top papers section (top 3, with summaries, scores, and repro assessment)."""
+        """Render top papers section (top N per config.num_paper_picks, with summaries, scores, and repro assessment)."""
         md = ["## Top Papers\n\n"]
-        sorted_papers = sorted(top_papers[:3], key=lambda x: x.get("score_combined", 0), reverse=True)
+        num_picks = self.config.get("num_paper_picks", 5)
+        sorted_papers = sorted(top_papers[:num_picks], key=lambda x: x.get("score_combined", 0), reverse=True)
         # Only filter by score when scores are present (Bedrock enabled)
         if any(p.get("score_combined") for p in sorted_papers):
             sorted_papers = [p for p in sorted_papers if p.get("score_combined", 0) >= 3]
@@ -974,8 +975,9 @@ class BriefingRunner:
         if self.intelligence.available:
             top_papers = self.intelligence.assess_reproduction_feasibility(top_papers)
 
-            # Ensure top 3 papers all have summaries (batched)
-            top_papers = self._ensure_paper_summaries(top_papers[:3]) + top_papers[3:]
+            # Ensure all display papers have summaries (batched)
+            display_n = self.config.get("num_paper_picks", 5)
+            top_papers = self._ensure_paper_summaries(top_papers[:display_n]) + top_papers[display_n:]
 
             synthesis = self.intelligence.synthesize_briefing(
                 papers, blogs[:5], stocks, news[:5], top_papers[:3],
