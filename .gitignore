@@ -20,6 +20,12 @@ dist/
 *.pdf
 *.epub
 
+# Snapshot data (raw API responses for sender-trades)
+snapshots/
+
+# Output briefings
+briefings/
+
 # Runtime data
 .atlas-state.json
 state.json

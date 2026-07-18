@@ -191,6 +191,14 @@ output_format: "kindle"
 email_recipients:
   - "${RECIPIENT_EMAIL:-your-email@example.com}"
 
+# Output directory for generated briefings
+output_dir: briefings
+
+# Snapshot settings (saves raw API data for sender-trades to source from)
+snapshot:
+  enabled: true
+  dir: snapshots
+
 # File naming pattern
 file_naming: "Atlas-Briefing-{yyyy}.{mm}.{dd}"
 

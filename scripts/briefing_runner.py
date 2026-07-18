@@ -33,6 +33,7 @@ load_dotenv(dotenv_path=env_path, override=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.arxiv_scanner import ArxivScanner, create_scanner
+from scripts.snapshot_manager import SnapshotManager
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
 from scripts.news_aggregator import NewsAggregator
@@ -94,6 +95,12 @@ class BriefingRunner:
             self.llm_client = GeminiCLIClient(gemini_config)
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
+
+        snapshot_cfg = config.get("snapshot", {})
+        self.snapshot_manager = SnapshotManager(
+            snapshot_dir=snapshot_cfg.get("dir", "snapshots"),
+            enabled=snapshot_cfg.get("enabled", True),
+        )
 
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Run arxiv paper scan."""
@@ -996,6 +1003,14 @@ class BriefingRunner:
 
         news = self.run_news_aggregation(queries=news_queries)
 
+        # --- Save raw data snapshots ---
+        logger.info("=== Saving raw data snapshots ===")
+        self.snapshot_manager.save_stocks(stocks)
+        self.snapshot_manager.save_news(news)
+        self.snapshot_manager.save_blogs(blogs)
+        self.snapshot_manager.save_papers(papers)
+        self.snapshot_manager.save_manifest()
+
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
 
@@ -1126,6 +1141,10 @@ class BriefingRunner:
             self.save_status()
             return 2
 
+        # --- Ensure output directory ---
+        output_dir = self.config.get("output_dir", "briefings")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
         # --- Generate markdown briefing ---
         filename = self._format_filename(now)
         self._briefing_title = filename
@@ -1138,7 +1157,7 @@ class BriefingRunner:
         )
 
         # --- Save markdown ---
-        md_path = f"{filename}.md"
+        md_path = f"{output_dir}/{filename}.md"
         try:
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(markdown_content)
@@ -1149,11 +1168,11 @@ class BriefingRunner:
         # --- Generate PDF ---
         pdf_config = self.config.get("pdf", {})
         pdf_enabled = pdf_config.get("enabled", True)
-        pdf_path = f"{filename}.pdf" if pdf_enabled else None
+        pdf_path = f"{output_dir}/{filename}.pdf" if pdf_enabled else None
         pdf_success = self.generate_pdf(markdown_content, pdf_path) if pdf_enabled else True
 
         # --- Generate EPUB (Reflowable for Kindle) ---
-        epub_path = f"{filename}.epub"
+        epub_path = f"{output_dir}/{filename}.epub"
         epub_success = self.generate_epub(markdown_content, epub_path)
 
         if pdf_enabled and not pdf_success and not epub_success:
