@@ -27,6 +27,15 @@ DEFAULT_MODELS = {
     "light": "opencode/deepseek-v4-flash-free",
 }
 
+# Free-tier backup models tried in order if the primary model for a tier
+# fails (non-zero exit, empty response, or timeout). Keep glm-5.2 first
+# since it has the largest free quota on the opencode-go Zen provider.
+DEFAULT_FALLBACK_MODELS = {
+    "heavy": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
+    "medium": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
+    "light": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
+}
+
 DEFAULT_PRICING = {
     "input_per_million": 0.14,
     "output_per_million": 0.28,
@@ -53,6 +62,14 @@ class OpencodeClient(BaseLLMClient):
             "medium": models_config.get("medium", DEFAULT_MODELS["medium"]),
             "light": models_config.get("light", DEFAULT_MODELS["light"]),
         }
+        # Per-tier fallback chain. The primary model is always tried first;
+        # if it fails (rc != 0, empty NDJSON, or timeout) we walk this list.
+        # Set to an empty list to disable fallback for a tier.
+        fallback_config = config.get("fallback_models", {})
+        self.fallback_models: Dict[str, list] = {
+            tier: list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
+            for tier in ("heavy", "medium", "light")
+        }
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 600)
         self._call_count = 0
@@ -64,6 +81,14 @@ class OpencodeClient(BaseLLMClient):
         self._tier_input_chars: Dict[str, int] = {"heavy": 0, "medium": 0, "light": 0}
         self._tier_output_chars: Dict[str, int] = {"heavy": 0, "medium": 0, "light": 0}
         self._tier_time: Dict[str, float] = {"heavy": 0.0, "medium": 0.0, "light": 0.0}
+        # Track which model actually served each tier's last successful call,
+        # surfaced in the usage summary so we can see fallbacks in action.
+        self._tier_served_by: Dict[str, Optional[str]] = {
+            "heavy": None, "medium": None, "light": None,
+        }
+        self._tier_fallback_hits: Dict[str, int] = {
+            "heavy": 0, "medium": 0, "light": 0,
+        }
 
         pricing_config = config.get("pricing", {})
         self._pricing = {
@@ -99,6 +124,13 @@ class OpencodeClient(BaseLLMClient):
         """
         Send a prompt via `opencode run --format json` and parse the response.
 
+        The primary model for the tier is tried first. If it fails (non-zero
+        exit, empty NDJSON response, or timeout), each model in
+        `self.fallback_models[tier]` is tried in order until one succeeds or
+        the chain is exhausted. This guards against free-tier quota / token
+        exhaustion on the primary model — e.g. falling back from
+        opencode/deepseek-v4-flash-free to opencode-go/glm-5.2.
+
         Args:
             prompt: The user prompt.
             tier: Model tier ("light", "medium", "heavy") — maps to model ID.
@@ -118,70 +150,113 @@ class OpencodeClient(BaseLLMClient):
             )
             return None
 
-        model = self.models.get(tier, self.models["medium"])
+        primary = self.models.get(tier, self.models["medium"])
+        # De-dup the chain while preserving order: primary first, then any
+        # fallbacks that aren't already the primary.
+        chain = [primary] + [
+            m for m in self.fallback_models.get(tier, []) if m != primary
+        ]
+
         if system_prompt:
             full_prompt = f"{system_prompt}\n\nUser Request: {prompt}"
         else:
             full_prompt = prompt
 
-        cmd = [
-            "opencode", "run",
-            "-m", model,
-            "--format", "json",
-            "--auto",
-            "--dir", "/tmp",
-            "--pure",
-            full_prompt,
-        ]
+        full_prompt_len = len(full_prompt.encode("utf-8"))
+        last_error_snippet = ""
 
-        try:
-            logger.debug(
-                "Invoking opencode (tier=%s, model=%s, call=%d/%d)",
-                tier, model, self._call_count + 1, self.max_calls,
-            )
-            t0 = time.monotonic()
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-            )
+        for idx, model in enumerate(chain):
+            is_fallback = idx > 0
+            if is_fallback:
+                logger.info(
+                    "Opencode falling back to %s for tier=%s (primary %s failed)",
+                    model, tier, primary,
+                )
 
-            if result.returncode != 0:
-                self._tier_failures[tier] += 1
-                logger.debug(
-                    "opencode run failed (rc=%d): %s",
-                    result.returncode,
-                    result.stderr[:300],
+            if self._call_count >= self.max_calls:
+                logger.warning(
+                    "Opencode call budget exhausted during fallback (%d / %d)",
+                    self._call_count, self.max_calls,
                 )
                 return None
 
-            self._call_count += 1
-            self._tier_calls[tier] += 1
-            response = self._parse_ndjson_response(result.stdout)
-            elapsed = time.monotonic() - t0
-            self._tier_time[tier] += elapsed
+            cmd = [
+                "opencode", "run",
+                "-m", model,
+                "--format", "json",
+                "--auto",
+                "--dir", "/tmp",
+                "--pure",
+                full_prompt,
+            ]
 
-            # Track input/output character counts for cost estimation
-            full_prompt_len = len(full_prompt.encode("utf-8"))
-            self._tier_input_chars[tier] += full_prompt_len
+            try:
+                logger.debug(
+                    "Invoking opencode (tier=%s, model=%s, call=%d/%d%s)",
+                    tier, model, self._call_count + 1, self.max_calls,
+                    ", fallback" if is_fallback else "",
+                )
+                t0 = time.monotonic()
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                )
 
-            if response:
+                if result.returncode != 0:
+                    last_error_snippet = (result.stderr or "")[:300]
+                    logger.debug(
+                        "opencode run failed (model=%s, rc=%d): %s",
+                        model, result.returncode, last_error_snippet,
+                    )
+                    continue
+
+                response = self._parse_ndjson_response(result.stdout)
+                elapsed = time.monotonic() - t0
+                self._tier_time[tier] += elapsed
+
+                if not response:
+                    logger.debug(
+                        "opencode returned empty NDJSON response (model=%s)",
+                        model,
+                    )
+                    continue
+
+                # Success: bookkeeping
+                self._call_count += 1
+                self._tier_calls[tier] += 1
+                self._tier_input_chars[tier] += full_prompt_len
                 self._tier_output_chars[tier] += len(response.encode("utf-8"))
+                self._tier_served_by[tier] = model
+                if is_fallback:
+                    self._tier_fallback_hits[tier] += 1
                 return response
 
-            logger.debug("opencode returned empty NDJSON response")
-            self._tier_failures[tier] += 1
-            return None
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "opencode run timed out after %ds (tier=%s, model=%s)",
+                    self._timeout, tier, model,
+                )
+                continue
+            except Exception as e:
+                logger.debug("opencode run exception (model=%s): %s", model, e)
+                continue
 
-        except subprocess.TimeoutExpired:
-            self._tier_failures[tier] += 1
-            logger.warning("opencode run timed out after %ds (tier=%s)", self._timeout, tier)
-            return None
-        except Exception as e:
-            self._tier_failures[tier] += 1
-            logger.debug("opencode run exception: %s", e)
-            return None
+        # All models in the chain failed
+        self._tier_failures[tier] += 1
+        if last_error_snippet:
+            logger.warning(
+                "All opencode models failed for tier=%s (primary=%s, tried %d models). "
+                "Last error: %s",
+                tier, primary, len(chain), last_error_snippet,
+            )
+        else:
+            logger.warning(
+                "All opencode models failed for tier=%s (primary=%s, tried %d models)",
+                tier, primary, len(chain),
+            )
+        return None
 
     @staticmethod
     def _parse_ndjson_response(stdout: str) -> str:
@@ -278,6 +353,27 @@ class OpencodeClient(BaseLLMClient):
             f"This run used the free `opencode/deepseek-v4-flash-free` model "
             f"via the opencode CLI — actual cost was $0.00.*\n\n"
         )
+
+        # Surface which models actually served each tier so fallback activity
+        # is visible at a glance.
+        served_lines = []
+        for tier in ["heavy", "medium", "light"]:
+            served = self._tier_served_by[tier]
+            hits = self._tier_fallback_hits[tier]
+            if self._tier_calls[tier] == 0 and hits == 0:
+                continue
+            if served and served != self.models[tier]:
+                served_lines.append(
+                    f"- **{tier}**: served by `{served}` (fallback, {hits} fallback hit(s))"
+                )
+            elif hits > 0:
+                served_lines.append(
+                    f"- **{tier}**: {hits} fallback hit(s), last served by `{served or 'n/a'}`"
+                )
+        if served_lines:
+            lines.append("**Model fallback activity:**\n\n")
+            lines.extend(f"{l}\n" for l in served_lines)
+            lines.append("\n")
 
         if start_time and end_time:
             duration = end_time - start_time

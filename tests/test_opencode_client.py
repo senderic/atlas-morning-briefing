@@ -299,3 +299,179 @@ class TestDefaults:
     def test_explicitly_disabled(self):
         client = OpencodeClient({"enabled": False})
         assert client.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# TestFallback
+# ---------------------------------------------------------------------------
+
+class TestFallback:
+    """Validate the per-tier fallback-model chain."""
+
+    def test_default_fallback_models_set(self):
+        client = OpencodeClient({})
+        for tier in ("heavy", "medium", "light"):
+            assert client.fallback_models[tier] == ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"]
+
+    def test_custom_fallback_models(self):
+        client = OpencodeClient({
+            "fallback_models": {
+                "heavy": ["opencode-go/glm-5.2"],
+                "medium": [],
+                "light": ["opencode-go/glm-5.2", "opencode/x"],
+            },
+        })
+        assert client.fallback_models["heavy"] == ["opencode-go/glm-5.2"]
+        assert client.fallback_models["medium"] == []
+        assert client.fallback_models["light"] == ["opencode-go/glm-5.2", "opencode/x"]
+
+    def test_fallback_after_nonzero_exit(self):
+        # Primary fails (rc=1), first fallback succeeds.
+        side_effects = [
+            make_mock_run(1, "", "quota exceeded"),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+        ):
+            client = OpencodeClient({})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._call_count == 1
+        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        assert client._tier_fallback_hits["heavy"] == 1
+        # Primary then first fallback were tried
+        assert mock_run.call_count == 2
+        first_cmd = mock_run.call_args_list[0][0][0]
+        second_cmd = mock_run.call_args_list[1][0][0]
+        assert first_cmd[first_cmd.index("-m") + 1] == "opencode/deepseek-v4-flash-free"
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/glm-5.2"
+
+    def test_fallback_after_empty_ndjson(self):
+        # Primary returns rc=0 but empty NDJSON; fallback succeeds.
+        side_effects = [
+            make_mock_run(0, ""),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects),
+        ):
+            client = OpencodeClient({"fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+
+    def test_fallback_after_timeout(self):
+        side_effects = [
+            subprocess.TimeoutExpired(cmd=["opencode"], timeout=300),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects),
+        ):
+            client = OpencodeClient({"fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+
+    def test_all_models_fail_returns_none(self):
+        # Default chain after dedup: [deepseek-v4-flash-free, glm-5.2]
+        # (the second default fallback duplicates the primary, so only 2
+        # distinct models are tried).
+        side_effects = [
+            make_mock_run(1, "", "fail1"),
+            make_mock_run(1, "", "fail2"),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+        ):
+            client = OpencodeClient({})
+            result = client.invoke("test", tier="heavy")
+        assert result is None
+        assert client._call_count == 0
+        assert client._tier_failures["heavy"] == 1
+        # primary + 1 unique fallback = 2 invocations
+        assert mock_run.call_count == 2
+
+    def test_all_models_fail_with_distinct_fallbacks(self):
+        # Three distinct models: primary + two unique fallbacks.
+        side_effects = [
+            make_mock_run(1, "", "fail1"),
+            make_mock_run(1, "", "fail2"),
+            make_mock_run(1, "", "fail3"),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+        ):
+            client = OpencodeClient({
+                "models": {"heavy": "opencode/deepseek-v4-flash-free"},
+                "fallback_models": {"heavy": ["opencode-go/glm-5.2", "opencode/mimo-v2.5-free"]},
+            })
+            result = client.invoke("test", tier="heavy")
+        assert result is None
+        assert mock_run.call_count == 3
+
+    def test_fallback_disabled_when_empty_list(self):
+        # fallback_models: [] disables fallback; primary failure → None.
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", return_value=make_mock_run(1, "", "err")) as mock_run,
+        ):
+            client = OpencodeClient({"fallback_models": {"heavy": []}})
+            result = client.invoke("test", tier="heavy")
+        assert result is None
+        assert mock_run.call_count == 1
+
+    def test_chain_dedupes_primary(self):
+        # If primary appears in fallback list, it's only tried once.
+        side_effects = [
+            make_mock_run(1, "", "fail"),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+        ):
+            client = OpencodeClient({
+                "models": {"heavy": "opencode/deepseek-v4-flash-free"},
+                "fallback_models": {"heavy": [
+                    "opencode/deepseek-v4-flash-free",  # duplicates primary
+                    "opencode-go/glm-5.2",
+                ]},
+            })
+            client.invoke("test", tier="heavy")
+        # Primary dedup'd, so only 2 calls (primary + glm-5.2)
+        assert mock_run.call_count == 2
+        second_cmd = mock_run.call_args_list[1][0][0]
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/glm-5.2"
+
+    def test_no_fallback_invoked_when_primary_succeeds(self):
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", return_value=make_mock_run(0, SAMPLE_NDJSON)) as mock_run,
+        ):
+            client = OpencodeClient({})
+            result = client.invoke("test", tier="medium")
+        assert result == "Hello there"
+        assert mock_run.call_count == 1
+        assert client._tier_fallback_hits["medium"] == 0
+        assert client._tier_served_by["medium"] == "opencode/deepseek-v4-flash-free"
+
+    def test_budget_check_applies_during_fallback(self):
+        # Burn budget on the primary attempt; even if fallback would succeed,
+        # budget exhaustion prevents it.
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", return_value=make_mock_run(1, "", "quota")) as mock_run,
+        ):
+            client = OpencodeClient({"max_calls_per_run": 1})
+            client._call_count = 1  # already at budget
+            result = client.invoke("test", tier="heavy")
+        assert result is None
+        assert mock_run.call_count == 0

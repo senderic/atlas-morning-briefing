@@ -164,6 +164,14 @@ opencode:
     heavy: "opencode/deepseek-v4-flash-free"
     medium: "opencode/deepseek-v4-flash-free"
     light: "opencode/deepseek-v4-flash-free"
+  # Fallback chain tried (in order) when the primary model for a tier fails
+  # (non-zero exit, empty NDJSON response, or timeout) — e.g. when the free
+  # opencode quota is exhausted. opencode-go/glm-5.2 has the largest free
+  # quota on OpenCode Zen, so it goes first. Set to `[]` to disable.
+  fallback_models:
+    heavy: ["opencode-go/glm-5.2"]
+    medium: ["opencode-go/glm-5.2"]
+    light: ["opencode-go/glm-5.2"]
   max_calls_per_run: 50
   # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
   # instead of the free opencode model. Used in the usage summary footer.
