@@ -3,16 +3,15 @@
 """
 Intelligence layer for morning briefing.
 
-Uses Gemini CLI models (via GeminiCLIClient) to add reasoning, synthesis,
-and summarization to the briefing pipeline. Falls back gracefully when the
-Gemini CLI is unavailable.
+Uses an LLM client to add reasoning, synthesis, and summarization to the
+briefing pipeline. Falls back gracefully when the LLM client is unavailable.
 """
 
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from scripts.gemini_client import GeminiCLIClient
+from scripts.llm_client import BaseLLMClient
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,15 +56,15 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, gemini: GeminiCLIClient, config: Dict[str, Any]):
+    def __init__(self, client: BaseLLMClient, config: Dict[str, Any]):
         """
         Initialize BriefingIntelligence.
 
         Args:
-            gemini: GeminiCLIClient instance.
+            client: BaseLLMClient instance.
             config: Full config dictionary.
         """
-        self.gemini = gemini
+        self.client = client
         self.config = config
         self.topics = config.get("arxiv_topics", [])
         # Domain framing for prompts is config-driven, never hardcoded here.
@@ -81,7 +80,7 @@ class BriefingIntelligence:
     @property
     def available(self) -> bool:
         """Check if intelligence features are available."""
-        return self.gemini.available
+        return self.client.available
 
     @staticmethod
     def extract_score(text: str) -> Tuple[int, str]:
@@ -214,7 +213,7 @@ class BriefingIntelligence:
             "Be selective. Only include papers that strongly match the profile."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -304,7 +303,7 @@ class BriefingIntelligence:
             "- Multi-agent orchestration frameworks release"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             logger.info("Dynamic query generation failed, using static queries only")
             return static_queries
@@ -351,7 +350,7 @@ class BriefingIntelligence:
             f"<topics>\n{topic_list}\n</topics>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             return topics
 
@@ -459,7 +458,7 @@ class BriefingIntelligence:
             "Each item must start with [n] or n."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -533,7 +532,7 @@ class BriefingIntelligence:
             f"<items>\n" + "\n\n".join(item_texts) + "\n</items>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             return items
 
@@ -588,7 +587,7 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -638,7 +637,7 @@ class BriefingIntelligence:
             "Example: [1] 8 Directly addresses agent evaluation methodology"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -723,7 +722,7 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -831,7 +830,7 @@ class BriefingIntelligence:
             "filler. Rank by importance. Be factual. Do not invent details."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -856,7 +855,7 @@ class BriefingIntelligence:
 
         # Retry once with simpler prompt
         logger.warning(f"News ranking parse failed (attempt 1). LLM response: {result[:300]}")
-        retry_result = self.gemini.invoke(
+        retry_result = self.client.invoke(
             f"From these articles, pick the 5 most important for an AI researcher. "
             f"Format EXACTLY as: [number] summary sentence.\n\n{articles_block}",
             tier="medium", system_prompt=SYSTEM_PROMPT
@@ -928,7 +927,7 @@ class BriefingIntelligence:
             "Rank by relevance. Be concise."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -1022,7 +1021,7 @@ class BriefingIntelligence:
             "Every stock MUST have a driver. Never leave blank."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -1089,7 +1088,7 @@ class BriefingIntelligence:
             "respond with NONE."
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result or "NONE" in result.upper():
             return []
 
@@ -1262,7 +1261,7 @@ class BriefingIntelligence:
             f"{cross_source_note}"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -1342,7 +1341,7 @@ class BriefingIntelligence:
             "[5] NEW claude-3.5-haiku\n"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", system_prompt=SYSTEM_PROMPT)
+        result = self.client.invoke(prompt, tier="light", system_prompt=SYSTEM_PROMPT)
         if not result:
             logger.info("Trending tracking skipped (LLM unavailable)")
             return state, papers, blogs, news
@@ -1569,7 +1568,7 @@ class BriefingIntelligence:
             f"<week_items>\n{context_str}\n</week_items>"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
 

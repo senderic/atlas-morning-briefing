@@ -36,6 +36,8 @@ from tenacity import (
     before_sleep_log
 )
 
+from scripts.llm_client import BaseLLMClient
+
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ BINARY_PROFILES: Dict[str, Dict[str, Any]] = {
 _DETECTION_ORDER: List[str] = ["gemini", "agy"]
 
 
-class GeminiCLIClient:
+class GeminiCLIClient(BaseLLMClient):
     """Tiered LLM CLI client (auto-detects between `agy` and `gemini`)."""
 
     # Default model IDs for each tier — used by both agy and gemini.

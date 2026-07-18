@@ -527,7 +527,7 @@ class TestAnalyzeMarketTrend:
         # without mutating the BriefingIntelligence class itself.
         r.intelligence = MagicMock()
         r.intelligence.available = True
-        r.intelligence.gemini = mock_gem
+        r.intelligence.client = mock_gem
         result = r._analyze_market_trend([{
             "symbol": "X", "percent_change": 1.5, "news_correlation": "ok"
         }])

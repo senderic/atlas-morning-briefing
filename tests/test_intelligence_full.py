@@ -1,10 +1,10 @@
 # Copyright (c) 2026 Junjie Tang. MIT License. See LICENSE file for details.
 """Comprehensive tests for the intelligence layer.
 
-Mocks GeminiCLIClient so every code path is exercised without network access.
+Mocks BaseLLMClient so every code path is exercised without network access.
 Each LLM-calling method gets:
 - happy-path coverage (well-formed LLM response)
-- unavailable fallback (Gemini disabled / empty data)
+- unavailable fallback (LLM disabled / empty data)
 - malformed-response fallback
 """
 
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from scripts.gemini_client import GeminiCLIClient
+from scripts.llm_client import BaseLLMClient
 from scripts.intelligence import (
     BriefingIntelligence,
     SYSTEM_PROMPT,
@@ -25,15 +25,15 @@ from scripts.intelligence import (
 
 
 @pytest.fixture
-def mock_gemini():
-    client = MagicMock(spec=GeminiCLIClient)
+def mock_client():
+    client = MagicMock(spec=BaseLLMClient)
     client.available = True
     return client
 
 
 @pytest.fixture
-def gemini_unavailable():
-    client = MagicMock(spec=GeminiCLIClient)
+def client_unavailable():
+    client = MagicMock(spec=BaseLLMClient)
     client.available = False
     return client
 
@@ -51,13 +51,13 @@ def default_config():
 
 
 @pytest.fixture
-def intel(mock_gemini, default_config):
-    return BriefingIntelligence(mock_gemini, default_config)
+def intel(mock_client, default_config):
+    return BriefingIntelligence(mock_client, default_config)
 
 
 @pytest.fixture
-def intel_unavailable(gemini_unavailable, default_config):
-    return BriefingIntelligence(gemini_unavailable, default_config)
+def intel_unavailable(client_unavailable, default_config):
+    return BriefingIntelligence(client_unavailable, default_config)
 
 
 # ---------- pure helpers ----------
@@ -119,20 +119,20 @@ class TestFilterPapersByRelevance:
     def test_empty_papers_returns_empty(self, intel):
         assert intel.filter_papers_by_relevance([]) == []
 
-    def test_no_profile_falls_back(self, mock_gemini):
-        intel = BriefingIntelligence(mock_gemini, {"arxiv_topics": ["X"]})
+    def test_no_profile_falls_back(self, mock_client):
+        intel = BriefingIntelligence(mock_client, {"arxiv_topics": ["X"]})
         papers = [{"title": "P", "summary": "a"}]
         # No profile provided and none in config
         assert intel.filter_papers_by_relevance(papers, interest_profile=[]) == papers
-        mock_gemini.invoke.assert_not_called()
+        mock_client.invoke.assert_not_called()
 
-    def test_filters_by_score_threshold(self, intel, mock_gemini):
+    def test_filters_by_score_threshold(self, intel, mock_client):
         papers = [
             {"title": "Match", "summary": "agent eval"},
             {"title": "Skip", "summary": "irrelevant"},
             {"title": "Borderline", "summary": "maybe"},
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "[1] 9 highly relevant agent paper\n"
             "[2] 4 not relevant\n"
             "[3] 7 marginal but ok"
@@ -148,17 +148,17 @@ class TestFilterPapersByRelevance:
             assert "relevance_score" in r
             assert "relevance_reason" in r
 
-    def test_empty_llm_response_returns_papers(self, intel, mock_gemini):
+    def test_empty_llm_response_returns_papers(self, intel, mock_client):
         papers = [{"title": "P", "summary": "a"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         assert intel.filter_papers_by_relevance(papers) == papers
 
-    def test_malformed_lines_skipped(self, intel, mock_gemini):
+    def test_malformed_lines_skipped(self, intel, mock_client):
         papers = [
             {"title": "P1", "summary": "a"},
             {"title": "P2", "summary": "b"},
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "junk line\n"
             "[1] 8 good\n"
             "[notanint] 5 bad\n"
@@ -168,9 +168,9 @@ class TestFilterPapersByRelevance:
         assert len(result) == 1
         assert result[0]["title"] == "P1"
 
-    def test_no_matches_falls_back_to_top_30(self, intel, mock_gemini):
+    def test_no_matches_falls_back_to_top_30(self, intel, mock_client):
         papers = [{"title": f"P{i}", "summary": "x"} for i in range(40)]
-        mock_gemini.invoke.return_value = "[1] 3 too low\n[2] 2 too low"
+        mock_client.invoke.return_value = "[1] 3 too low\n[2] 2 too low"
         result = intel.filter_papers_by_relevance(papers)
         assert len(result) == 30  # fallback
 
@@ -191,13 +191,13 @@ class TestGenerateDynamicQueries:
     def test_no_static_returns_static(self, intel):
         assert intel.generate_dynamic_queries({"date": "x"}, []) == []
 
-    def test_no_context_returns_static(self, intel, mock_gemini):
+    def test_no_context_returns_static(self, intel, mock_client):
         # state has date but no titles
         result = intel.generate_dynamic_queries({"date": "2026-05-21"}, ["q1"])
         assert result == ["q1"]
-        mock_gemini.invoke.assert_not_called()
+        mock_client.invoke.assert_not_called()
 
-    def test_generates_and_dedupes(self, intel, mock_gemini):
+    def test_generates_and_dedupes(self, intel, mock_client):
         state = {
             "date": "2026-05-21",
             "top_paper_titles": ["Some Paper About Agents"],
@@ -206,7 +206,7 @@ class TestGenerateDynamicQueries:
             "emerging_themes": ["theme1"],
         }
         static = ["existing query about AI"]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "existing query about AI\n"
             "Claude 3.5 Sonnet benchmark results\n"
             "AWS Trainium chip adoption enterprise\n"
@@ -219,8 +219,8 @@ class TestGenerateDynamicQueries:
         assert "AWS Trainium chip adoption enterprise" in result
         assert "short" not in result
 
-    def test_llm_failure_returns_static(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = None
+    def test_llm_failure_returns_static(self, intel, mock_client):
+        mock_client.invoke.return_value = None
         state = {"date": "x", "top_paper_titles": ["A"]}
         assert intel.generate_dynamic_queries(state, ["q"]) == ["q"]
 
@@ -235,8 +235,8 @@ class TestExpandTopics:
     def test_empty_returns_empty(self, intel):
         assert intel.expand_topics([]) == []
 
-    def test_appends_unique_suggestions(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = (
+    def test_appends_unique_suggestions(self, intel, mock_client):
+        mock_client.invoke.return_value = (
             "Existing Topic\n"
             "New Topic A\n"
             "New Topic B\n"
@@ -250,8 +250,8 @@ class TestExpandTopics:
         # "ab" is too short (<= 3 chars)
         assert "ab" not in result
 
-    def test_llm_failure_returns_input(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = None
+    def test_llm_failure_returns_input(self, intel, mock_client):
+        mock_client.invoke.return_value = None
         assert intel.expand_topics(["T"]) == ["T"]
 
 
@@ -266,19 +266,19 @@ class TestSummarizePapers:
     def test_empty(self, intel):
         assert intel.summarize_papers([]) == []
 
-    def test_assigns_brief_summary(self, intel, mock_gemini):
+    def test_assigns_brief_summary(self, intel, mock_client):
         papers = [
             {"title": "Paper A", "summary": "Abstract A"},
             {"title": "Paper B", "summary": "Abstract B"},
         ]
-        mock_gemini.invoke.return_value = "[1] Summary A.\n[2] Summary B."
+        mock_client.invoke.return_value = "[1] Summary A.\n[2] Summary B."
         result = intel.summarize_papers(papers)
         assert result[0]["brief_summary"] == "Summary A."
         assert result[1]["brief_summary"] == "Summary B."
 
-    def test_llm_failure_returns_papers(self, intel, mock_gemini):
+    def test_llm_failure_returns_papers(self, intel, mock_client):
         papers = [{"title": "P", "summary": "a"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         result = intel.summarize_papers(papers)
         assert "brief_summary" not in result[0]
 
@@ -297,29 +297,29 @@ class TestScorePapersSemantically:
         result = intel.score_papers_semantically(papers, [])
         assert result == papers
 
-    def test_assigns_score_and_reason(self, intel, mock_gemini):
+    def test_assigns_score_and_reason(self, intel, mock_client):
         papers = [{"title": "P1", "summary": "x"}, {"title": "P2", "summary": "y"}]
-        mock_gemini.invoke.return_value = "[1] 8 great\n[2] 4 weak"
+        mock_client.invoke.return_value = "[1] 8 great\n[2] 4 weak"
         result = intel.score_papers_semantically(papers, ["topic"])
         assert result[0]["semantic_score"] == 8.0
         assert "great" in result[0]["relevance_reason"]
         assert result[1]["semantic_score"] == 4.0
 
-    def test_clamps_out_of_range_scores(self, intel, mock_gemini):
+    def test_clamps_out_of_range_scores(self, intel, mock_client):
         papers = [{"title": "P", "summary": "x"}]
-        mock_gemini.invoke.return_value = "[1] 15 too high"
+        mock_client.invoke.return_value = "[1] 15 too high"
         result = intel.score_papers_semantically(papers, ["t"])
         assert result[0]["semantic_score"] == 10.0
 
-    def test_clamps_negative(self, intel, mock_gemini):
+    def test_clamps_negative(self, intel, mock_client):
         papers = [{"title": "P", "summary": "x"}]
-        mock_gemini.invoke.return_value = "[1] -5 too low"
+        mock_client.invoke.return_value = "[1] -5 too low"
         result = intel.score_papers_semantically(papers, ["t"])
         assert result[0]["semantic_score"] == 0.0
 
-    def test_malformed_lines_skipped(self, intel, mock_gemini):
+    def test_malformed_lines_skipped(self, intel, mock_client):
         papers = [{"title": "P", "summary": "x"}]
-        mock_gemini.invoke.return_value = "garbage\n[oops] not_a_number reason"
+        mock_client.invoke.return_value = "garbage\n[oops] not_a_number reason"
         result = intel.score_papers_semantically(papers, ["t"])
         assert "semantic_score" not in result[0]
 
@@ -335,12 +335,12 @@ class TestAssessReproductionFeasibility:
     def test_empty(self, intel):
         assert intel.assess_reproduction_feasibility([]) == []
 
-    def test_parses_structured_scores(self, intel, mock_gemini):
+    def test_parses_structured_scores(self, intel, mock_client):
         papers = [
             {"title": "P1", "summary": "abs", "score_breakdown": {"has_code": True}},
             {"title": "P2", "summary": "abs", "score_breakdown": {"has_code": False}},
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "[1] code:5 data:4 infra:5 bedrock:5 effort:4 | Easy weekend repro\n"
             "[2] code:1 data:1 infra:1 bedrock:2 effort:1 | Skip"
         )
@@ -353,23 +353,23 @@ class TestAssessReproductionFeasibility:
         titles = [r["title"] for r in result]
         assert "P2" not in titles
 
-    def test_no_verdict_separator(self, intel, mock_gemini):
+    def test_no_verdict_separator(self, intel, mock_client):
         papers = [
             {"title": "P", "summary": "x", "score_breakdown": {"has_code": True}}
         ]
-        mock_gemini.invoke.return_value = "[1] code:5 data:5 infra:5 bedrock:5 effort:5"
+        mock_client.invoke.return_value = "[1] code:5 data:5 infra:5 bedrock:5 effort:5"
         result = intel.assess_reproduction_feasibility(papers)
         assert result[0]["repro_total"] == 25
 
-    def test_llm_failure_returns_papers(self, intel, mock_gemini):
+    def test_llm_failure_returns_papers(self, intel, mock_client):
         papers = [{"title": "P", "summary": "x"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         result = intel.assess_reproduction_feasibility(papers)
         assert "repro_total" not in result[0]
 
-    def test_malformed_line_skipped(self, intel, mock_gemini):
+    def test_malformed_line_skipped(self, intel, mock_client):
         papers = [{"title": "P", "summary": "x"}]
-        mock_gemini.invoke.return_value = "garbage line"
+        mock_client.invoke.return_value = "garbage line"
         result = intel.assess_reproduction_feasibility(papers)
         # No scores parsed → repro_total not set; unscored papers retained
         assert "repro_total" not in result[0]
@@ -387,52 +387,52 @@ class TestRankAndSummarizeNews:
     def test_empty(self, intel):
         assert intel.rank_and_summarize_news([], ["t"]) == []
 
-    def test_happy_path(self, intel, mock_gemini):
+    def test_happy_path(self, intel, mock_client):
         news = [
             {"title": f"News {i}", "source": f"src{i}", "description": "d"}
             for i in range(5)
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "[1] First summary.\n[2] Second summary.\n[3] Third summary."
         )
         result = intel.rank_and_summarize_news(news, ["topic"])
         assert len(result) <= 5
         assert any("First summary" in r["brief_summary"] for r in result)
 
-    def test_retry_on_parse_failure(self, intel, mock_gemini):
+    def test_retry_on_parse_failure(self, intel, mock_client):
         news = [{"title": f"n{i}", "source": "s", "description": "d"} for i in range(3)]
         # First call: garbage, second call: parseable
-        mock_gemini.invoke.side_effect = [
+        mock_client.invoke.side_effect = [
             "no valid items here",
             "[1] Retry summary."
         ]
         result = intel.rank_and_summarize_news(news, ["t"])
         assert any("Retry summary" in r["brief_summary"] for r in result)
-        assert mock_gemini.invoke.call_count == 2
+        assert mock_client.invoke.call_count == 2
 
-    def test_fallback_uses_description(self, intel, mock_gemini):
+    def test_fallback_uses_description(self, intel, mock_client):
         news = [
             {"title": "n1", "source": "s", "description": "desc text"}
         ]
         # First call returns unparseable junk → retry → retry also fails → fallback
-        mock_gemini.invoke.side_effect = ["no items here", None]
+        mock_client.invoke.side_effect = ["no items here", None]
         result = intel.rank_and_summarize_news(news, ["t"])
         assert result[0]["brief_summary"] == "desc text"
 
-    def test_llm_returns_none_early_returns_news(self, intel, mock_gemini):
+    def test_llm_returns_none_early_returns_news(self, intel, mock_client):
         """When LLM is None on first call, function returns news[:5] without summaries."""
         news = [{"title": f"n{i}", "source": "s", "description": "d"} for i in range(3)]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         result = intel.rank_and_summarize_news(news, ["t"])
         # No brief_summary added on this short-circuit path
         assert all("brief_summary" not in n for n in result)
         assert len(result) == 3
 
-    def test_enforces_source_diversity(self, intel, mock_gemini):
+    def test_enforces_source_diversity(self, intel, mock_client):
         news = [
             {"title": f"n{i}", "source": "same", "description": "d"} for i in range(5)
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "[1] s1\n[2] s2\n[3] s3\n[4] s4\n[5] s5"
         )
         result = intel.rank_and_summarize_news(news, ["t"])
@@ -451,23 +451,23 @@ class TestRankAndSummarizeBlogs:
     def test_empty(self, intel):
         assert intel.rank_and_summarize_blogs([], ["t"]) == []
 
-    def test_parses_score_and_summary(self, intel, mock_gemini):
+    def test_parses_score_and_summary(self, intel, mock_client):
         blogs = [
             {"title": "B1", "source": "src", "summary": "s"},
             {"title": "B2", "source": "src2", "summary": "s"},
         ]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "[1] SCORE:5/5 Top blog summary.\n[2] SCORE:3/5 Mid blog summary."
         )
         result = intel.rank_and_summarize_blogs(blogs, ["t"])
         assert any(b.get("score_combined") == 5 for b in result)
         assert any(b.get("score_combined") == 3 for b in result)
 
-    def test_fallback_when_llm_fails(self, intel, mock_gemini):
+    def test_fallback_when_llm_fails(self, intel, mock_client):
         blogs = [
             {"title": f"b{i}", "source": "s", "summary": "x"} for i in range(3)
         ]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         # On total LLM failure, we still get top 5 with diversity enforced
         result = intel.rank_and_summarize_blogs(blogs, ["t"])
         assert len(result) <= 5
@@ -510,30 +510,30 @@ class TestCorrelateStocksAndNews:
     def test_empty_stocks(self, intel):
         assert intel.correlate_stocks_and_news([], [{"title": "n"}]) == []
 
-    def test_skips_error_stocks(self, intel, mock_gemini):
+    def test_skips_error_stocks(self, intel, mock_client):
         stocks = [
             {"symbol": "GOOD", "name": "G", "percent_change": 1.0},
             {"symbol": "BAD", "error": "fail"},
         ]
         news = [{"title": "Some headline"}]
-        mock_gemini.invoke.return_value = "GOOD | strong earnings"
+        mock_client.invoke.return_value = "GOOD | strong earnings"
         result = intel.correlate_stocks_and_news(stocks, news)
         good = next(s for s in result if s["symbol"] == "GOOD")
         assert good["news_correlation"] == "strong earnings"
         bad = next(s for s in result if s["symbol"] == "BAD")
         assert "news_correlation" not in bad
 
-    def test_no_clear_driver_filtered(self, intel, mock_gemini):
+    def test_no_clear_driver_filtered(self, intel, mock_client):
         stocks = [{"symbol": "X", "name": "X", "percent_change": 0.5}]
         news = [{"title": "n"}]
-        mock_gemini.invoke.return_value = "X | no clear driver"
+        mock_client.invoke.return_value = "X | no clear driver"
         result = intel.correlate_stocks_and_news(stocks, news)
         assert "news_correlation" not in result[0]
 
-    def test_llm_failure(self, intel, mock_gemini):
+    def test_llm_failure(self, intel, mock_client):
         stocks = [{"symbol": "X", "name": "X", "percent_change": 1.0}]
         news = [{"title": "n"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         result = intel.correlate_stocks_and_news(stocks, news)
         assert "news_correlation" not in result[0]
 
@@ -548,23 +548,23 @@ class TestDetectEmergingThemes:
     def test_no_items(self, intel):
         assert intel.detect_emerging_themes([], [], []) == []
 
-    def test_parses_themes(self, intel, mock_gemini):
+    def test_parses_themes(self, intel, mock_client):
         papers = [{"title": "Paper Title"}]
-        mock_gemini.invoke.return_value = (
+        mock_client.invoke.return_value = (
             "THEME: AI safety research surge\nTHEME: Open weights debate"
         )
         themes = intel.detect_emerging_themes(papers, [], [])
         assert "AI safety research surge" in themes
         assert "Open weights debate" in themes
 
-    def test_none_response(self, intel, mock_gemini):
+    def test_none_response(self, intel, mock_client):
         papers = [{"title": "P"}]
-        mock_gemini.invoke.return_value = "NONE"
+        mock_client.invoke.return_value = "NONE"
         assert intel.detect_emerging_themes(papers, [], []) == []
 
-    def test_llm_failure(self, intel, mock_gemini):
+    def test_llm_failure(self, intel, mock_client):
         papers = [{"title": "P"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         assert intel.detect_emerging_themes(papers, [], []) == []
 
 
@@ -580,8 +580,8 @@ class TestSynthesizeBriefing:
         result = intel.synthesize_briefing([], [], [], [], [])
         assert result == {}
 
-    def test_happy_path(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = "Today's briefing highlights X, Y, and Z."
+    def test_happy_path(self, intel, mock_client):
+        mock_client.invoke.return_value = "Today's briefing highlights X, Y, and Z."
         result = intel.synthesize_briefing(
             papers=[{"title": "P1"}],
             blogs=[{"source": "s", "title": "B1"}],
@@ -592,19 +592,19 @@ class TestSynthesizeBriefing:
         assert "editorial_intro" in result
         assert "Today's briefing" in result["editorial_intro"]
 
-    def test_includes_emerging_themes(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = "Summary."
+    def test_includes_emerging_themes(self, intel, mock_client):
+        mock_client.invoke.return_value = "Summary."
         intel.synthesize_briefing(
             papers=[{"title": "P"}],
             blogs=[], stocks=[], news=[], top_papers=[],
             emerging_themes=["theme A", "theme B"],
         )
-        call_prompt = mock_gemini.invoke.call_args.args[0]
+        call_prompt = mock_client.invoke.call_args.args[0]
         assert "theme A" in call_prompt
         assert "theme B" in call_prompt
 
-    def test_includes_multi_day_trends(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = "S"
+    def test_includes_multi_day_trends(self, intel, mock_client):
+        mock_client.invoke.return_value = "S"
         intel.synthesize_briefing(
             papers=[], blogs=[],
             stocks=[{"symbol": "AMZN", "current_price": 220, "percent_change": 0}],
@@ -615,13 +615,13 @@ class TestSynthesizeBriefing:
                 "emerging_themes": ["yesterday-theme"],
             },
         )
-        prompt = mock_gemini.invoke.call_args.args[0]
+        prompt = mock_client.invoke.call_args.args[0]
         assert "Multi-day trends" in prompt
         assert "AMZN" in prompt
         assert "yesterday-theme" in prompt
 
-    def test_llm_failure_returns_empty(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = None
+    def test_llm_failure_returns_empty(self, intel, mock_client):
+        mock_client.invoke.return_value = None
         result = intel.synthesize_briefing(
             papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[],
         )
@@ -714,21 +714,21 @@ class TestGenerateWeeklyDeepDive:
     def test_empty_items(self, intel):
         assert intel.generate_weekly_deep_dive([]) == ""
 
-    def test_groups_by_date_and_invokes(self, intel, mock_gemini):
+    def test_groups_by_date_and_invokes(self, intel, mock_client):
         items = [
             {"date": "2026-05-19", "type": "paper", "title": "A"},
             {"date": "2026-05-20", "type": "news", "title": "B"},
             {"date": "2026-05-19", "type": "paper", "title": "C"},
         ]
-        mock_gemini.invoke.return_value = "Weekly synthesis: themes were X, Y, Z."
+        mock_client.invoke.return_value = "Weekly synthesis: themes were X, Y, Z."
         result = intel.generate_weekly_deep_dive(items)
         assert "Weekly synthesis" in result
-        prompt = mock_gemini.invoke.call_args.args[0]
+        prompt = mock_client.invoke.call_args.args[0]
         assert "2026-05-19" in prompt
         assert "2026-05-20" in prompt
 
-    def test_llm_failure(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = None
+    def test_llm_failure(self, intel, mock_client):
+        mock_client.invoke.return_value = None
         assert intel.generate_weekly_deep_dive([{"date": "d", "title": "t"}]) == ""
 
 
@@ -746,7 +746,7 @@ class TestTrackTrending:
         s2, p, b, n = intel.track_trending([], [], [], state)
         assert p == [] and b == [] and n == []
 
-    def test_match_increments_count(self, intel, mock_gemini):
+    def test_match_increments_count(self, intel, mock_client):
         from datetime import datetime, timedelta
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         state = {
@@ -759,20 +759,20 @@ class TestTrackTrending:
             }
         }
         papers = [{"title": "Flash Attention 4 results"}]
-        mock_gemini.invoke.return_value = "[1] MATCH flash-attention-4"
+        mock_client.invoke.return_value = "[1] MATCH flash-attention-4"
         s2, p2, b2, n2 = intel.track_trending(papers, [], [], state)
         assert s2["trending_topics"]["flash-attention-4"]["count"] == 2
         assert p2[0]["_trending_days"] == 2
 
-    def test_new_topic_added(self, intel, mock_gemini):
+    def test_new_topic_added(self, intel, mock_client):
         state = {"trending_topics": {}}
         papers = [{"title": "Some Paper"}]
-        mock_gemini.invoke.return_value = "[1] NEW some-paper"
+        mock_client.invoke.return_value = "[1] NEW some-paper"
         s2, _, _, _ = intel.track_trending(papers, [], [], state)
         assert "some-paper" in s2["trending_topics"]
         assert s2["trending_topics"]["some-paper"]["count"] == 1
 
-    def test_stale_topics_pruned(self, intel, mock_gemini):
+    def test_stale_topics_pruned(self, intel, mock_client):
         state = {
             "trending_topics": {
                 "old-topic": {
@@ -784,14 +784,14 @@ class TestTrackTrending:
         }
         papers = [{"title": "X"}]
         # Non-empty response (so we don't early-return) but no MATCH/NEW lines
-        mock_gemini.invoke.return_value = "[1] SKIP nothing matched"
+        mock_client.invoke.return_value = "[1] SKIP nothing matched"
         s2, _, _, _ = intel.track_trending(papers, [], [], state)
         assert "old-topic" not in s2["trending_topics"]
 
-    def test_llm_failure(self, intel, mock_gemini):
+    def test_llm_failure(self, intel, mock_client):
         state = {"trending_topics": {}}
         papers = [{"title": "X"}]
-        mock_gemini.invoke.return_value = None
+        mock_client.invoke.return_value = None
         s2, p, b, n = intel.track_trending(papers, [], [], state)
         assert s2 == state
 
@@ -805,36 +805,36 @@ class TestAuthorBlurbsExtras:
         result = intel_unavailable.generate_author_blurbs(items, "papers")
         assert result == items
 
-    def test_papers_without_authors_uses_unknown(self, intel, mock_gemini):
+    def test_papers_without_authors_uses_unknown(self, intel, mock_client):
         items = [{"title": "P with no authors"}]
         # extract_missing_authors will get called first (light)
-        mock_gemini.invoke.side_effect = [
+        mock_client.invoke.side_effect = [
             "Unknown",  # extract
             "[1] Blurb for unknown.",  # blurb
         ]
         result = intel.generate_author_blurbs(items, "papers")
         assert "author_blurb" in result[0]
 
-    def test_uses_cache_for_repeat_source(self, intel, mock_gemini):
+    def test_uses_cache_for_repeat_source(self, intel, mock_client):
         # Pre-populate cache for blog source
         intel.source_blurb_cache["author: alice, blog: techweekly"] = "cached blurb"
         items = [{"title": "x", "author": "Alice", "source": "TechWeekly"}]
         result = intel.generate_author_blurbs(items, "blogs")
         assert result[0]["author_blurb"] == "cached blurb"
         # No LLM call needed (no missing authors, all cached)
-        mock_gemini.invoke.assert_not_called()
+        mock_client.invoke.assert_not_called()
 
 
 # ---------- ensure system prompt actually used ----------
 
 
 class TestSystemPromptUsage:
-    def test_synthesis_uses_system_prompt(self, intel, mock_gemini):
-        mock_gemini.invoke.return_value = "out"
+    def test_synthesis_uses_system_prompt(self, intel, mock_client):
+        mock_client.invoke.return_value = "out"
         intel.synthesize_briefing(
             papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[]
         )
-        kwargs = mock_gemini.invoke.call_args.kwargs
+        kwargs = mock_client.invoke.call_args.kwargs
         assert kwargs.get("system_prompt") == SYSTEM_PROMPT
         assert kwargs.get("tier") == "heavy"
 
@@ -843,38 +843,38 @@ class TestSystemPromptUsage:
 
 
 class TestBriefingProfile:
-    def _prompt_arg(self, mock_gemini):
-        call = mock_gemini.invoke.call_args
+    def _prompt_arg(self, mock_client):
+        call = mock_client.invoke.call_args
         return call.args[0] if call.args else call.kwargs.get("prompt", "")
 
-    def test_defaults_when_profile_absent(self, mock_gemini, default_config):
-        intel = BriefingIntelligence(mock_gemini, default_config)
+    def test_defaults_when_profile_absent(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
         assert intel.briefing_domain == "AI and technology"
         assert intel.briefing_audience == "an AI researcher or engineer"
         assert intel.briefing_landscape == "the AI and technology landscape"
 
-    def test_profile_flows_into_news_prompt(self, mock_gemini, default_config):
+    def test_profile_flows_into_news_prompt(self, mock_client, default_config):
         config = dict(default_config)
         config["briefing_profile"] = {
             "domain": "biotech and pharma",
             "audience": "a research clinician",
         }
-        intel = BriefingIntelligence(mock_gemini, config)
-        mock_gemini.invoke.return_value = "[1] summary"
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "[1] summary"
         intel.rank_and_summarize_news(
             [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
         )
-        prompt = self._prompt_arg(mock_gemini)
+        prompt = self._prompt_arg(mock_client)
         assert "biotech and pharma" in prompt
         assert "a research clinician" in prompt
         assert "defense" not in prompt
 
-    def test_profile_flows_into_synthesis_prompt(self, mock_gemini, default_config):
+    def test_profile_flows_into_synthesis_prompt(self, mock_client, default_config):
         config = dict(default_config)
         config["briefing_profile"] = {"domain": "climate science"}
-        intel = BriefingIntelligence(mock_gemini, config)
-        mock_gemini.invoke.return_value = "out"
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "out"
         intel.synthesize_briefing(
             papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[]
         )
-        assert "climate science" in self._prompt_arg(mock_gemini)
+        assert "climate science" in self._prompt_arg(mock_client)

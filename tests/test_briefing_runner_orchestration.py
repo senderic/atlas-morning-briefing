@@ -237,8 +237,8 @@ class TestEnsurePaperSummaries:
         runner = BriefingRunner(base_config, dry_run=True)
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
-        runner.intelligence.gemini = MagicMock()
-        runner.intelligence.gemini.invoke.return_value = (
+        runner.intelligence.client = MagicMock()
+        runner.intelligence.client.invoke.return_value = (
             "[1] SCORE:4/5 Generated summary text."
         )
         runner.intelligence._parse_ranked_response = MagicMock(

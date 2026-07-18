@@ -4,8 +4,9 @@
 Morning briefing runner.
 
 Main orchestrator that runs all scanners, applies the intelligence layer,
-and generates the briefing. Uses the Gemini CLI for LLM-powered synthesis
-and summarization (with a deterministic fallback when unavailable).
+and generates the briefing. Uses an LLM client (GeminiCLIClient or
+OpencodeClient) for LLM-powered synthesis and summarization (with a
+deterministic fallback when unavailable).
 """
 
 import argparse
@@ -42,6 +43,7 @@ from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
+from scripts.llm_client import BaseLLMClient
 
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
@@ -83,10 +85,14 @@ class BriefingRunner:
             "elapsed_seconds": 0,
         }
 
-        # Initialize Gemini client and intelligence layer
-        gemini_config = config.get("gemini", config.get("bedrock", {}))
-        self.gemini = GeminiCLIClient(gemini_config)
-        self.intelligence = BriefingIntelligence(self.gemini, config)
+        # Initialize LLM client and intelligence layer
+        if config.get("opencode", {}).get("enabled"):
+            from scripts.opencode_client import OpencodeClient
+            self.llm_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}))
+        else:
+            gemini_config = config.get("gemini", config.get("bedrock", {}))
+            self.llm_client = GeminiCLIClient(gemini_config)
+        self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -473,8 +479,8 @@ class BriefingRunner:
             md.append("\n")
 
         # Gemini Usage Summary
-        if self.gemini:
-            md.append(self.gemini.get_usage_summary(start_time=start_time, end_time=end_time))
+        if self.llm_client:
+            md.append(self.llm_client.get_usage_summary(start_time=start_time, end_time=end_time))
 
         return "".join(md)
 
@@ -518,7 +524,7 @@ class BriefingRunner:
             "Be specific about which sectors/stocks moved and why.\n\n"
             f"<stock_data>\n{data_block}\n</stock_data>"
         )
-        result = self.intelligence.gemini.invoke(
+        result = self.intelligence.client.invoke(
             prompt, tier="light"
         )
         return result.strip() if result else ""
@@ -680,7 +686,7 @@ class BriefingRunner:
             "5 = groundbreaking, 1 = routine.\n"
             "Be factual. Do not add information not in the abstract."
         )
-        result = self.intelligence.gemini.invoke(
+        result = self.intelligence.client.invoke(
             prompt, tier="light"
         )
         if not result:
