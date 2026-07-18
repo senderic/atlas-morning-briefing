@@ -1137,17 +1137,29 @@ class BriefingIntelligence:
         sections = []
 
         if papers:
-            paper_titles = [p.get("title", "") for p in papers[:10]]
+            paper_items = []
+            for p in papers[:10]:
+                title = p.get("title", "")
+                summary = p.get("brief_summary", p.get("ai_summary", ""))
+                if summary:
+                    paper_items.append(f"- {title}: {summary}")
+                else:
+                    paper_items.append(f"- {title}")
             sections.append(
                 "PAPERS (" + str(len(papers)) + " total):\n"
-                + "\n".join(f"- {t}" for t in paper_titles)
+                + "\n".join(paper_items)
             )
 
         if blogs:
-            blog_items = [
-                f"- [{b.get('source', '')}] {b.get('title', '')}"
-                for b in blogs[:8]
-            ]
+            blog_items = []
+            for b in blogs[:8]:
+                source = b.get("source", "")
+                title = b.get("title", "")
+                summary = b.get("brief_summary", "")
+                if summary:
+                    blog_items.append(f"- [{source}] {title}: {summary}")
+                else:
+                    blog_items.append(f"- [{source}] {title}")
             sections.append("BLOGS:\n" + "\n".join(blog_items))
 
         if stocks:
@@ -1165,8 +1177,15 @@ class BriefingIntelligence:
                 sections.append("STOCKS:\n" + "\n".join(stock_items))
 
         if news:
-            news_titles = [n.get("title", "") for n in news[:10]]
-            sections.append("NEWS:\n" + "\n".join(f"- {t}" for t in news_titles))
+            news_items = []
+            for n in news[:10]:
+                title = n.get("title", "")
+                summary = n.get("brief_summary", "")
+                if summary:
+                    news_items.append(f"- {title}: {summary}")
+                else:
+                    news_items.append(f"- {title}")
+            sections.append("NEWS:\n" + "\n".join(news_items))
 
         if top_papers:
             top_items = []
@@ -1247,12 +1266,19 @@ class BriefingIntelligence:
             "specifics.\n"
             "- Land on the implication or the single thing worth watching next.\n"
             "- Plain, vigorous, active voice. Concrete nouns and numbers. No "
-            "hedging, no jargon for its own sake, no bullet list -- flowing prose.\n"
-            "- GROUNDING (critical): every fact, number, dollar figure, company, "
-            "and product name must appear verbatim in the data below. Do NOT add "
-            "specifics from memory or infer figures that are not shown. If you "
-            "lack a concrete number, describe the move qualitatively rather than "
-            "inventing one. A vaguer true sentence beats a precise fabricated one.\n\n"
+            "hedging, no jargon for its own sake, no bullet list -- flowing prose.\n\n"
+            "GROUNDING -- ZERO TOLERANCE FOR HALLUCINATION:\n"
+            "- Every assertion, number, dollar figure, percentage, company name, "
+            "product name, and personnel name MUST appear verbatim in the <data> "
+            "section below. You may paraphrase the analysis that follows each "
+            "headline (the text after the colon), but you MUST NOT add new factual "
+            "content from outside knowledge.\n"
+            "- Do NOT infer, extrapolate, or generate specifics. If a concrete "
+            "figure is not shown in <data>, describe the trend qualitatively. "
+            "A vaguer true sentence beats a precise fabricated one.\n"
+            "- This is not a creative writing exercise. Every claim you make "
+            "must be traceable to the data provided. If you cannot anchor a "
+            "statement in the data, do not make it.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
             "independent sources -- treat them as the strongest signal and build "
             "your through-line around them where they fit. If emerging themes or "
