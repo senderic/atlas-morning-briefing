@@ -264,10 +264,11 @@ opencode:
     medium: ["opencode-go/glm-5.2"]
     light: ["opencode-go/glm-5.2"]
   max_calls_per_run: 50
-  # Shorter timeout for tonight: DeepSeek free tier is hanging indefinitely
-  # on every call, so we want fast fallback to glm-5.2 instead of waiting
-  # the full 600s per call. Revert to default (600s) when DeepSeek recovers.
-  timeout: 60
+  # Per-call timeout. 120s is generous — fast failures (model not found,
+  # insufficient balance, rate limit) are detected immediately via NDJSON
+  # error events and skip straight to the fallback chain without waiting
+  # for the timeout.
+  timeout: 120
   # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
   # instead of the free opencode model. Used in the usage summary footer.
   pricing:

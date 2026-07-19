@@ -135,7 +135,7 @@ class TestInvoke:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", return_value=make_mock_run(1, "", "error")),
         ):
-            client = OpencodeClient({})
+            client = OpencodeClient({"max_retries_per_model": 0})
             result = client.invoke("test")
             assert result is None
             assert client._call_count == 0
@@ -145,7 +145,7 @@ class TestInvoke:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["opencode"], timeout=300)),
         ):
-            client = OpencodeClient({})
+            client = OpencodeClient({"max_retries_per_model": 0})
             result = client.invoke("test")
             assert result is None
             assert client._call_count == 0
@@ -229,23 +229,33 @@ class TestInvoke:
 
 class TestParseNDJSON:
     def test_empty_string(self):
-        assert OpencodeClient._parse_ndjson_response("") == ""
+        text, error = OpencodeClient._parse_ndjson_result("")
+        assert text == ""
+        assert error is None
 
     def test_non_json_lines_skipped(self):
         raw = "not json\n{\"type\":\"text\",\"part\":{\"text\":\"hi\"}}\n"
-        assert OpencodeClient._parse_ndjson_response(raw) == "hi"
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == "hi"
+        assert error is None
 
     def test_no_text_type(self):
         raw = '{"type":"step_start"}\n{"type":"step_finish"}\n'
-        assert OpencodeClient._parse_ndjson_response(raw) == ""
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == ""
+        assert error is None
 
     def test_missing_part_field(self):
         raw = '{"type":"text"}'
-        assert OpencodeClient._parse_ndjson_response(raw) == ""
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == ""
+        assert error is None
 
     def test_missing_text_in_part(self):
         raw = '{"type":"text","part":{"type":"text"}}'
-        assert OpencodeClient._parse_ndjson_response(raw) == ""
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == ""
+        assert error is None
 
     def test_multiple_mixed_types(self):
         raw = (
@@ -254,7 +264,64 @@ class TestParseNDJSON:
             'invalid json line\n'
             '{"type":"text","part":{"type":"text","text":"B"}}\n'
         )
-        assert OpencodeClient._parse_ndjson_response(raw) == "AB"
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == "AB"
+        assert error is None
+
+    def test_error_event_in_ndjson_result(self):
+        raw = '{"type":"error","error":{"name":"APIError","data":{"message":"Insufficient balance","isRetryable":false,"statusCode":401}}}\n'
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == ""
+        assert error == {
+            "name": "APIError",
+            "message": "Insufficient balance",
+            "isRetryable": False,
+            "statusCode": 401,
+        }
+
+    def test_text_and_error_together(self):
+        raw = (
+            '{"type":"text","part":{"type":"text","text":"partial"}}\n'
+            '{"type":"error","error":{"name":"APIError","data":{"message":"rate limit","isRetryable":true}}}\n'
+        )
+        text, error = OpencodeClient._parse_ndjson_result(raw)
+        assert text == "partial"
+        assert error == {
+            "name": "APIError",
+            "message": "rate limit",
+            "isRetryable": True,
+            "statusCode": None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# TestClassifyError
+# ---------------------------------------------------------------------------
+
+class TestClassifyError:
+    def test_non_retryable_api_error(self):
+        error = {"name": "APIError", "message": "Insufficient balance", "isRetryable": False}
+        assert OpencodeClient._classify_error(error) == "fallback"
+
+    def test_retryable_api_error(self):
+        error = {"name": "APIError", "message": "Rate limit", "isRetryable": True}
+        assert OpencodeClient._classify_error(error) == "retry"
+
+    def test_unknown_error_falls_back(self):
+        error = {"name": "UnknownError", "message": "Model not found"}
+        assert OpencodeClient._classify_error(error) == "fallback"
+
+    def test_status_code_429_is_retryable(self):
+        error = {"name": "APIError", "message": "Too Many Requests", "statusCode": 429}
+        assert OpencodeClient._classify_error(error) == "retry"
+
+    def test_status_code_503_is_retryable(self):
+        error = {"name": "APIError", "message": "Service Unavailable", "statusCode": 503}
+        assert OpencodeClient._classify_error(error) == "retry"
+
+    def test_empty_error_falls_back(self):
+        error = {}
+        assert OpencodeClient._classify_error(error) == "fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +402,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects) as mock_run,
         ):
-            client = OpencodeClient({})
+            client = OpencodeClient({"max_retries_per_model": 0})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._call_count == 1
@@ -358,7 +425,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects),
         ):
-            client = OpencodeClient({"fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
@@ -373,7 +440,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects),
         ):
-            client = OpencodeClient({"fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
@@ -390,7 +457,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects) as mock_run,
         ):
-            client = OpencodeClient({})
+            client = OpencodeClient({"max_retries_per_model": 0})
             result = client.invoke("test", tier="heavy")
         assert result is None
         assert client._call_count == 0
@@ -410,6 +477,7 @@ class TestFallback:
             patch("subprocess.run", side_effect=side_effects) as mock_run,
         ):
             client = OpencodeClient({
+                "max_retries_per_model": 0,
                 "models": {"heavy": "opencode/deepseek-v4-flash-free"},
                 "fallback_models": {"heavy": ["opencode-go/glm-5.2", "opencode/mimo-v2.5-free"]},
             })
@@ -423,7 +491,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", return_value=make_mock_run(1, "", "err")) as mock_run,
         ):
-            client = OpencodeClient({"fallback_models": {"heavy": []}})
+            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": []}})
             result = client.invoke("test", tier="heavy")
         assert result is None
         assert mock_run.call_count == 1
@@ -439,6 +507,7 @@ class TestFallback:
             patch("subprocess.run", side_effect=side_effects) as mock_run,
         ):
             client = OpencodeClient({
+                "max_retries_per_model": 0,
                 "models": {"heavy": "opencode/deepseek-v4-flash-free"},
                 "fallback_models": {"heavy": [
                     "opencode/deepseek-v4-flash-free",  # duplicates primary
@@ -470,8 +539,147 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", return_value=make_mock_run(1, "", "quota")) as mock_run,
         ):
-            client = OpencodeClient({"max_calls_per_run": 1})
+            client = OpencodeClient({"max_retries_per_model": 0, "max_calls_per_run": 1})
             client._call_count = 1  # already at budget
             result = client.invoke("test", tier="heavy")
         assert result is None
         assert mock_run.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# TestFastFallback
+# ---------------------------------------------------------------------------
+
+class TestFastFallback:
+    """Structured error events in NDJSON trigger immediate fallback."""
+
+    def test_fast_fallback_on_non_retryable_error(self):
+        # Primary returns rc=0 with NDJSON error event (isRetryable=False).
+        # Should skip straight to fallback without retry.
+        error_ndjson = (
+            '{"type":"error","error":{"name":"APIError","data":{"message":"Insufficient balance","isRetryable":false}}}\n'
+        )
+        side_effects = [
+            make_mock_run(0, error_ndjson),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        # Only 2 calls: primary (fast-fail) + fallback (success) — no retries
+        assert mock_run.call_count == 2
+
+    def test_fast_fallback_on_unknown_error(self):
+        # UnknownError (model not found) also triggers immediate fallback.
+        error_ndjson = (
+            '{"type":"error","error":{"name":"UnknownError","data":{"message":"Model not found: test"}}}\n'
+        )
+        side_effects = [
+            make_mock_run(0, error_ndjson),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects),
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestRetryThenFallback
+# ---------------------------------------------------------------------------
+
+class TestRetryThenFallback:
+    """Retryable errors get MAX_RETRIES retries before falling back."""
+
+    def test_retryable_error_retries_then_fallback(self):
+        # Primary returns retryable error 3 times (initial + 2 retries),
+        # then fallback succeeds.
+        error_ndjson = (
+            '{"type":"error","error":{"name":"APIError","data":{"message":"Rate limit","isRetryable":true}}}\n'
+        )
+        side_effects = [
+            make_mock_run(0, error_ndjson),  # initial
+            make_mock_run(0, error_ndjson),  # retry 1
+            make_mock_run(0, error_ndjson),  # retry 2 (exhausted)
+            make_mock_run(0, SAMPLE_NDJSON),  # fallback success
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+            patch("time.sleep"),  # don't actually sleep
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        # 3 primary attempts + 1 fallback = 4 total
+        assert mock_run.call_count == 4
+
+    def test_retryable_then_success_on_primary(self):
+        # First attempt gets rate limit, retry succeeds on the same model.
+        error_ndjson = (
+            '{"type":"error","error":{"name":"APIError","data":{"message":"Rate limit","isRetryable":true}}}\n'
+        )
+        side_effects = [
+            make_mock_run(0, error_ndjson),  # initial — retryable
+            make_mock_run(0, SAMPLE_NDJSON),  # retry — success
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+            patch("time.sleep"),
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 0  # no fallback
+        assert client._tier_served_by["heavy"] == "opencode/deepseek-v4-flash-free"
+        assert mock_run.call_count == 2  # initial + retry
+
+    def test_nonzero_exit_retries_then_fallback(self):
+        # Non-zero exit without NDJSON error text is retried, then falls back.
+        side_effects = [
+            make_mock_run(1, "", "overloaded"),
+            make_mock_run(1, "", "overloaded"),
+            make_mock_run(1, "", "overloaded"),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+            patch("time.sleep"),
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+        assert mock_run.call_count == 4
+
+    def test_timeout_retries_then_fallback(self):
+        side_effects = [
+            subprocess.TimeoutExpired(cmd=["opencode"], timeout=120),
+            subprocess.TimeoutExpired(cmd=["opencode"], timeout=120),
+            subprocess.TimeoutExpired(cmd=["opencode"], timeout=120),
+            make_mock_run(0, SAMPLE_NDJSON),
+        ]
+        with (
+            patch("shutil.which", return_value="/usr/bin/opencode"),
+            patch("subprocess.run", side_effect=side_effects) as mock_run,
+            patch("time.sleep"),
+        ):
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            result = client.invoke("test", tier="heavy")
+        assert result == "Hello there"
+        assert client._tier_fallback_hits["heavy"] == 1
+        assert mock_run.call_count == 4

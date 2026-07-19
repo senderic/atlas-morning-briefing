@@ -10,11 +10,12 @@ event stream to extract response text. Uses free-tier OpenCode Zen models
 
 import json
 import logging
+import random
 import shutil
 import subprocess
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
 
@@ -40,6 +41,13 @@ DEFAULT_PRICING = {
     "input_per_million": 0.14,
     "output_per_million": 0.28,
 }
+
+# Retry policy for retryable errors (rate limits, server overload).
+# Non-retryable errors (model not found, insufficient balance) skip
+# straight to the next model in the fallback chain.
+MAX_RETRIES_PER_MODEL = 2
+RETRY_BACKOFF_BASE = 5
+RETRY_BACKOFF_MAX = 15
 
 
 class OpencodeClient(BaseLLMClient):
@@ -72,6 +80,7 @@ class OpencodeClient(BaseLLMClient):
         }
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 600)
+        self.max_retries = config.get("max_retries_per_model", MAX_RETRIES_PER_MODEL)
         self._call_count = 0
         self._available: Optional[bool] = None
 
@@ -124,12 +133,15 @@ class OpencodeClient(BaseLLMClient):
         """
         Send a prompt via `opencode run --format json` and parse the response.
 
-        The primary model for the tier is tried first. If it fails (non-zero
-        exit, empty NDJSON response, or timeout), each model in
-        `self.fallback_models[tier]` is tried in order until one succeeds or
-        the chain is exhausted. This guards against free-tier quota / token
-        exhaustion on the primary model — e.g. falling back from
-        opencode/deepseek-v4-flash-free to opencode-go/glm-5.2.
+        The primary model for the tier is tried first. If it fails, each
+        model in `self.fallback_models[tier]` is tried in order until one
+        succeeds or the chain is exhausted.
+
+        Failure detection is immediate for structured errors the CLI returns
+        in the NDJSON stream (model not found, insufficient balance, rate
+        limit), avoiding a full timeout wait. Retryable errors (rate limits,
+        server overload) get up to `self.max_retries` retries with
+        exponential backoff before advancing to the next model.
 
         Args:
             prompt: The user prompt.
@@ -151,8 +163,6 @@ class OpencodeClient(BaseLLMClient):
             return None
 
         primary = self.models.get(tier, self.models["medium"])
-        # De-dup the chain while preserving order: primary first, then any
-        # fallbacks that aren't already the primary.
         chain = [primary] + [
             m for m in self.fallback_models.get(tier, []) if m != primary
         ]
@@ -190,58 +200,143 @@ class OpencodeClient(BaseLLMClient):
                 full_prompt,
             ]
 
-            try:
+            # Track whether we should try the next model in the chain.
+            model_failed = True
+
+            for attempt in range(1 + self.max_retries):
+                if self._call_count >= self.max_calls:
+                    break
+
                 logger.debug(
-                    "Invoking opencode (tier=%s, model=%s, call=%d/%d%s)",
-                    tier, model, self._call_count + 1, self.max_calls,
+                    "Invoking opencode (tier=%s, model=%s, attempt=%d/%d, call=%d/%d%s)",
+                    tier, model, attempt + 1, 1 + self.max_retries,
+                    self._call_count + 1, self.max_calls,
                     ", fallback" if is_fallback else "",
                 )
+
                 t0 = time.monotonic()
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._timeout,
-                )
 
-                if result.returncode != 0:
-                    last_error_snippet = (result.stderr or "")[:300]
-                    logger.debug(
-                        "opencode run failed (model=%s, rc=%d): %s",
-                        model, result.returncode, last_error_snippet,
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=self._timeout,
                     )
-                    continue
 
-                response = self._parse_ndjson_response(result.stdout)
-                elapsed = time.monotonic() - t0
-                self._tier_time[tier] += elapsed
+                    text, error = self._parse_ndjson_result(result.stdout)
+                    elapsed = time.monotonic() - t0
+                    self._tier_time[tier] += elapsed
 
-                if not response:
+                    if error:
+                        action = self._classify_error(error)
+                        err_name = error.get("name", "UnknownError")
+                        err_msg = error.get("message", "")[:200]
+
+                        if action == "fallback":
+                            logger.info(
+                                "Opencode fast-fallback for %s (tier=%s): "
+                                "%s — %s (%.1fs)",
+                                model, tier, err_name, err_msg, elapsed,
+                            )
+                            model_failed = True
+                            break  # skip retries, try next model
+
+                        # Retryable error (rate limit, server overload)
+                        if attempt < self.max_retries:
+                            backoff = min(
+                                RETRY_BACKOFF_BASE * (2 ** attempt)
+                                + random.uniform(0, 2),
+                                RETRY_BACKOFF_MAX,
+                            )
+                            logger.info(
+                                "Opencode retrying %s (tier=%s, attempt=%d/%d): "
+                                "%s — %s (%.1fs, backoff %.1fs)",
+                                model, tier, attempt + 1, 1 + self.max_retries,
+                                err_name, err_msg, elapsed, backoff,
+                            )
+                            time.sleep(backoff)
+                            continue  # retry same model
+                        else:
+                            logger.info(
+                                "Opencode exhausted retries for %s (tier=%s): "
+                                "%s — %s (%.1fs)",
+                                model, tier, err_name, err_msg, elapsed,
+                            )
+                            model_failed = True
+                            break  # all retries used, try next model
+
+                    if result.returncode != 0 and not text:
+                        last_error_snippet = (result.stderr or "")[:300]
+                        if attempt < self.max_retries:
+                            backoff = min(
+                                RETRY_BACKOFF_BASE * (2 ** attempt)
+                                + random.uniform(0, 2),
+                                RETRY_BACKOFF_MAX,
+                            )
+                            logger.info(
+                                "Opencode retrying %s (tier=%s, attempt=%d/%d): "
+                                "rc=%d (%.1fs, backoff %.1fs)",
+                                model, tier, attempt + 1, 1 + self.max_retries,
+                                result.returncode, elapsed, backoff,
+                            )
+                            time.sleep(backoff)
+                            continue
+                        else:
+                            model_failed = True
+                            break
+
+                    if text:
+                        # Success
+                        self._call_count += 1
+                        self._tier_calls[tier] += 1
+                        self._tier_input_chars[tier] += full_prompt_len
+                        self._tier_output_chars[tier] += len(text.encode("utf-8"))
+                        self._tier_served_by[tier] = model
+                        if is_fallback:
+                            self._tier_fallback_hits[tier] += 1
+                        return text
+
+                    # Empty response (no text, no error, rc=0)
                     logger.debug(
-                        "opencode returned empty NDJSON response (model=%s)",
-                        model,
+                        "opencode returned empty NDJSON response (model=%s, attempt=%d)",
+                        model, attempt,
                     )
-                    continue
+                    model_failed = True
+                    break  # no point retrying empty responses
 
-                # Success: bookkeeping
-                self._call_count += 1
-                self._tier_calls[tier] += 1
-                self._tier_input_chars[tier] += full_prompt_len
-                self._tier_output_chars[tier] += len(response.encode("utf-8"))
-                self._tier_served_by[tier] = model
-                if is_fallback:
-                    self._tier_fallback_hits[tier] += 1
-                return response
+                except subprocess.TimeoutExpired:
+                    elapsed = time.monotonic() - t0
+                    self._tier_time[tier] += elapsed
+                    if attempt < self.max_retries:
+                        backoff = min(
+                            RETRY_BACKOFF_BASE * (2 ** attempt)
+                            + random.uniform(0, 2),
+                            RETRY_BACKOFF_MAX,
+                        )
+                        logger.info(
+                            "Opencode retrying %s (tier=%s, attempt=%d/%d): "
+                            "timeout after %ds (backoff %.1fs)",
+                            model, tier, attempt + 1, 1 + self.max_retries,
+                            self._timeout, backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    logger.warning(
+                        "Opencode exhausted retries for %s (tier=%s): "
+                        "timeout after %ds",
+                        model, tier, self._timeout,
+                    )
+                    model_failed = True
+                    break
 
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    "opencode run timed out after %ds (tier=%s, model=%s)",
-                    self._timeout, tier, model,
-                )
-                continue
-            except Exception as e:
-                logger.debug("opencode run exception (model=%s): %s", model, e)
-                continue
+                except Exception as e:
+                    logger.debug("opencode run exception (model=%s): %s", model, e)
+                    model_failed = True
+                    break
+
+            if model_failed:
+                continue  # try next model in the chain
 
         # All models in the chain failed
         self._tier_failures[tier] += 1
@@ -259,20 +354,25 @@ class OpencodeClient(BaseLLMClient):
         return None
 
     @staticmethod
-    def _parse_ndjson_response(stdout: str) -> str:
+    def _parse_ndjson_result(stdout: str) -> Tuple[str, Optional[Dict]]:
         """
-        Parse opencode's --format json NDJSON output and extract text.
+        Parse opencode's --format json NDJSON output.
 
-        The CLI emits one JSON object per line (JSONL). Only events with
-        type="text" contribute to the response.
+        Extracts both text events and structured error events. The caller
+        should check the error dict first: when it is not None, the model
+        returned an immediate error (model not found, insufficient balance,
+        rate limit) and the text string is empty.
 
         Args:
             stdout: Raw stdout from the opencode process.
 
         Returns:
-            Concatenated text from all text-type events.
+            Tuple of (concatenated_text, error_dict_or_None).
+            error_dict has keys: name, message, isRetryable, statusCode
+            (where available).
         """
         parts = []
+        last_error = None
         for line in stdout.strip().split("\n"):
             line = line.strip()
             if not line:
@@ -282,11 +382,54 @@ class OpencodeClient(BaseLLMClient):
             except json.JSONDecodeError:
                 logger.debug("Skipping non-JSON line in NDJSON output: %.80s", line)
                 continue
-            if event.get("type") == "text":
+
+            event_type = event.get("type")
+
+            if event_type == "text":
                 text = event.get("part", {}).get("text", "")
                 if text:
                     parts.append(text)
-        return "".join(parts)
+
+            elif event_type == "error":
+                err = event.get("error", {})
+                err_name = err.get("name", "UnknownError")
+                err_data = err.get("data", {})
+                last_error = {
+                    "name": err_name,
+                    "message": err_data.get("message", ""),
+                    "isRetryable": err_data.get("isRetryable"),
+                    "statusCode": err_data.get("statusCode"),
+                }
+
+        return "".join(parts), last_error
+
+    @staticmethod
+    def _classify_error(error: Dict) -> str:
+        """
+        Classify an NDJSON error event into an action.
+
+        Returns:
+            "fallback" — skip straight to the next model in the chain.
+            "retry"   — retry the same model with exponential backoff.
+        """
+        name = error.get("name", "")
+        is_retryable = error.get("isRetryable")
+        status_code = error.get("statusCode")
+
+        # Non-retryable API errors: insufficient balance, auth failure, etc.
+        if name == "APIError" and is_retryable is False:
+            return "fallback"
+
+        # Server-side rate limits / overload — worth a retry.
+        if is_retryable is True:
+            return "retry"
+
+        if status_code and status_code in (429, 502, 503, 504):
+            return "retry"
+
+        # UnknownError (model not found, provider not found) or anything
+        # else we haven't seen — fail safe and move to the next model.
+        return "fallback"
 
     def get_usage_summary(
         self,

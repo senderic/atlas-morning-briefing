@@ -173,6 +173,15 @@ opencode:
     medium: ["opencode-go/glm-5.2"]
     light: ["opencode-go/glm-5.2"]
   max_calls_per_run: 50
+  # Per-call timeout. Fast failures (model not found, insufficient balance,
+  # rate limit) are detected immediately via NDJSON error events and skip
+  # straight to the fallback chain — they never wait for the full timeout.
+  # Retryable errors (rate limits, server overload) get 2 retries with
+  # exponential backoff (5-15s) before advancing to the next model.
+  timeout: 120
+  # Number of retries for retryable errors before falling back. Set to 0
+  # to disable retries entirely.
+  max_retries_per_model: 2
   # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
   # instead of the free opencode model. Used in the usage summary footer.
   pricing:
