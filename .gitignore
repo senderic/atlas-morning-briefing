@@ -56,6 +56,7 @@ htmlcov/
 
 # Markdown files (except docs)
 *.md
+!AGENTS.md
 !CLAUDE.md
 !CONTRIBUTING.md
 !README.md
@@ -67,6 +68,8 @@ htmlcov/
 !examples/*.md
 !references/*.md
 !skills/*.md
+!.opencode/commands/*.md
+!.opencode/command/*.md
 atlas-morning-briefing.json
 .env
 uv.lock
