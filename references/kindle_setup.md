@@ -195,10 +195,10 @@ For daily automatic delivery:
 crontab -e
 ```
 
-Add (runs every day at 7 AM):
+Add (runs Mon-Sat at 7 AM; skips Sunday):
 
 ```cron
-0 7 * * * cd /path/to/morning-briefing && /usr/bin/python3 scripts/briefing_runner.py --config config.yaml >> logs/briefing.log 2>&1
+0 7 * * 1-6 cd /path/to/morning-briefing && /usr/bin/python3 scripts/briefing_runner.py --config config.yaml >> logs/briefing.log 2>&1
 ```
 
 **Tips**:
@@ -215,10 +215,10 @@ source ~/.bashrc  # Load environment variables
 python3 scripts/briefing_runner.py --config config.yaml >> logs/briefing.log 2>&1
 ```
 
-Then in crontab:
+Then in crontab (Mon-Sat only; skips Sunday):
 
 ```cron
-0 7 * * * /path/to/morning-briefing/run_briefing.sh
+0 7 * * 1-6 /path/to/morning-briefing/run_briefing.sh
 ```
 
 ## Privacy & Security
