@@ -166,7 +166,7 @@ class TestInvoke:
             client.invoke("test", tier="heavy")
             cmd = mock_run.call_args[0][0]
             model_idx = cmd.index("-m") + 1
-            assert cmd[model_idx] == "opencode/deepseek-v4-flash-free"
+            assert cmd[model_idx] == "opencode-zen/deepseek-v4-flash-free"
 
     def test_tier_model_selection_light(self):
         with (
@@ -342,14 +342,14 @@ class TestUsageSummary:
 class TestDefaults:
     def test_default_models(self):
         client = OpencodeClient({})
-        assert client.models["heavy"] == "opencode/deepseek-v4-flash-free"
-        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
-        assert client.models["light"] == "opencode/deepseek-v4-flash-free"
+        assert client.models["heavy"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client.models["medium"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client.models["light"] == "opencode-zen/deepseek-v4-flash-free"
 
     def test_custom_model_override(self):
         client = OpencodeClient({"models": {"heavy": "other/model"}})
         assert client.models["heavy"] == "other/model"
-        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
+        assert client.models["medium"] == "opencode-zen/deepseek-v4-flash-free"
 
     def test_default_max_calls(self):
         client = OpencodeClient({})
@@ -378,19 +378,19 @@ class TestFallback:
     def test_default_fallback_models_set(self):
         client = OpencodeClient({})
         for tier in ("heavy", "medium", "light"):
-            assert client.fallback_models[tier] == ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"]
+            assert client.fallback_models[tier] == ["opencode-go/deepseek-v4-flash"]
 
     def test_custom_fallback_models(self):
         client = OpencodeClient({
             "fallback_models": {
-                "heavy": ["opencode-go/glm-5.2"],
+                "heavy": ["opencode-go/deepseek-v4-flash"],
                 "medium": [],
-                "light": ["opencode-go/glm-5.2", "opencode/x"],
+                "light": ["opencode-go/deepseek-v4-flash", "opencode/x"],
             },
         })
-        assert client.fallback_models["heavy"] == ["opencode-go/glm-5.2"]
+        assert client.fallback_models["heavy"] == ["opencode-go/deepseek-v4-flash"]
         assert client.fallback_models["medium"] == []
-        assert client.fallback_models["light"] == ["opencode-go/glm-5.2", "opencode/x"]
+        assert client.fallback_models["light"] == ["opencode-go/deepseek-v4-flash", "opencode/x"]
 
     def test_fallback_after_nonzero_exit(self):
         # Primary fails (rc=1), first fallback succeeds.
@@ -406,14 +406,14 @@ class TestFallback:
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._call_count == 1
-        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-flash"
         assert client._tier_fallback_hits["heavy"] == 1
         # Primary then first fallback were tried
         assert mock_run.call_count == 2
         first_cmd = mock_run.call_args_list[0][0][0]
         second_cmd = mock_run.call_args_list[1][0][0]
-        assert first_cmd[first_cmd.index("-m") + 1] == "opencode/deepseek-v4-flash-free"
-        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/glm-5.2"
+        assert first_cmd[first_cmd.index("-m") + 1] == "opencode-zen/deepseek-v4-flash-free"
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-flash"
 
     def test_fallback_after_empty_ndjson(self):
         # Primary returns rc=0 but empty NDJSON; fallback succeeds.
@@ -425,11 +425,11 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects),
         ):
-            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
-        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-flash"
 
     def test_fallback_after_timeout(self):
         side_effects = [
@@ -440,7 +440,7 @@ class TestFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects),
         ):
-            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 0, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
@@ -478,8 +478,8 @@ class TestFallback:
         ):
             client = OpencodeClient({
                 "max_retries_per_model": 0,
-                "models": {"heavy": "opencode/deepseek-v4-flash-free"},
-                "fallback_models": {"heavy": ["opencode-go/glm-5.2", "opencode/mimo-v2.5-free"]},
+                "models": {"heavy": "opencode-zen/deepseek-v4-flash-free"},
+                "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash", "opencode/mimo-v2.5-free"]},
             })
             result = client.invoke("test", tier="heavy")
         assert result is None
@@ -508,17 +508,17 @@ class TestFallback:
         ):
             client = OpencodeClient({
                 "max_retries_per_model": 0,
-                "models": {"heavy": "opencode/deepseek-v4-flash-free"},
+                "models": {"heavy": "opencode-zen/deepseek-v4-flash-free"},
                 "fallback_models": {"heavy": [
-                    "opencode/deepseek-v4-flash-free",  # duplicates primary
-                    "opencode-go/glm-5.2",
+                    "opencode-zen/deepseek-v4-flash-free",  # duplicates primary
+                    "opencode-go/deepseek-v4-flash",
                 ]},
             })
             client.invoke("test", tier="heavy")
-        # Primary dedup'd, so only 2 calls (primary + glm-5.2)
+        # Primary dedup'd, so only 2 calls (primary + deepseek-v4-flash)
         assert mock_run.call_count == 2
         second_cmd = mock_run.call_args_list[1][0][0]
-        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/glm-5.2"
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-flash"
 
     def test_no_fallback_invoked_when_primary_succeeds(self):
         with (
@@ -530,7 +530,7 @@ class TestFallback:
         assert result == "Hello there"
         assert mock_run.call_count == 1
         assert client._tier_fallback_hits["medium"] == 0
-        assert client._tier_served_by["medium"] == "opencode/deepseek-v4-flash-free"
+        assert client._tier_served_by["medium"] == "opencode-zen/deepseek-v4-flash-free"
 
     def test_budget_check_applies_during_fallback(self):
         # Burn budget on the primary attempt; even if fallback would succeed,
@@ -567,11 +567,11 @@ class TestFastFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects) as mock_run,
         ):
-            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
-        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-flash"
         # Only 2 calls: primary (fast-fail) + fallback (success) — no retries
         assert mock_run.call_count == 2
 
@@ -588,7 +588,7 @@ class TestFastFallback:
             patch("shutil.which", return_value="/usr/bin/opencode"),
             patch("subprocess.run", side_effect=side_effects),
         ):
-            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
@@ -618,11 +618,11 @@ class TestRetryThenFallback:
             patch("subprocess.run", side_effect=side_effects) as mock_run,
             patch("time.sleep"),  # don't actually sleep
         ):
-            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
-        assert client._tier_served_by["heavy"] == "opencode-go/glm-5.2"
+        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-flash"
         # 3 primary attempts + 1 fallback = 4 total
         assert mock_run.call_count == 4
 
@@ -644,7 +644,7 @@ class TestRetryThenFallback:
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 0  # no fallback
-        assert client._tier_served_by["heavy"] == "opencode/deepseek-v4-flash-free"
+        assert client._tier_served_by["heavy"] == "opencode-zen/deepseek-v4-flash-free"
         assert mock_run.call_count == 2  # initial + retry
 
     def test_nonzero_exit_retries_then_fallback(self):
@@ -660,7 +660,7 @@ class TestRetryThenFallback:
             patch("subprocess.run", side_effect=side_effects) as mock_run,
             patch("time.sleep"),
         ):
-            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1
@@ -678,7 +678,7 @@ class TestRetryThenFallback:
             patch("subprocess.run", side_effect=side_effects) as mock_run,
             patch("time.sleep"),
         ):
-            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/glm-5.2"]}})
+            client = OpencodeClient({"max_retries_per_model": 2, "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash"]}})
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 1

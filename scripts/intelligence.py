@@ -1398,7 +1398,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="heavy", max_tokens=700, system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return ""
@@ -1489,7 +1489,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="heavy", max_tokens=700, system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return ""

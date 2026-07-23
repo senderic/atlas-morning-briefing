@@ -23,18 +23,17 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
-    "heavy": "opencode/deepseek-v4-flash-free",
-    "medium": "opencode/deepseek-v4-flash-free",
-    "light": "opencode/deepseek-v4-flash-free",
+    "heavy": "opencode-zen/deepseek-v4-flash-free",
+    "medium": "opencode-zen/deepseek-v4-flash-free",
+    "light": "opencode-zen/deepseek-v4-flash-free",
 }
 
 # Free-tier backup models tried in order if the primary model for a tier
-# fails (non-zero exit, empty response, or timeout). Keep glm-5.2 first
-# since it has the largest free quota on the opencode-go Zen provider.
+# fails (non-zero exit, empty response, or timeout).
 DEFAULT_FALLBACK_MODELS = {
-    "heavy": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
-    "medium": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
-    "light": ["opencode-go/glm-5.2", "opencode/deepseek-v4-flash-free"],
+    "heavy": ["opencode-go/deepseek-v4-flash"],
+    "medium": ["opencode-go/deepseek-v4-flash"],
+    "light": ["opencode-go/deepseek-v4-flash"],
 }
 
 DEFAULT_PRICING = {
@@ -129,7 +128,13 @@ class OpencodeClient(BaseLLMClient):
         prompt: str,
         tier: str = "medium",
         system_prompt: Optional[str] = None,
+        **kwargs: Any,
     ) -> Optional[str]:
+        if kwargs:
+            logger.debug(
+                "Opencode ignoring unexpected kwargs to invoke(): %s",
+                ", ".join(kwargs),
+            )
         """
         Send a prompt via `opencode run --format json` and parse the response.
 

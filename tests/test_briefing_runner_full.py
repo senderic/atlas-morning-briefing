@@ -18,7 +18,7 @@ def cfg():
         "stocks": [],
         "news_queries": [],
         "paper_scoring": {"has_code": 5, "topic_match": 3, "recency": 2, "citation_count": 1},
-        "num_paper_picks": 2,
+        "num_paper_picks": 5,
         "max_papers": 5,
         "max_blogs": 5,
         "max_news": 5,
