@@ -588,7 +588,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -723,7 +723,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -928,7 +928,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return blogs[:5]
@@ -1022,7 +1022,7 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
@@ -1088,7 +1088,7 @@ class BriefingIntelligence:
             "respond with NONE."
         )
 
-        result = self.client.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="heavy")
         if not result or "NONE" in result.upper():
             return []
 

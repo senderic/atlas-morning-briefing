@@ -143,27 +143,27 @@ class TestStatePersistence:
     def test_save_and_load_roundtrip(self, runner, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         papers = [{"title": "P1"}, {"title": "P2"}]
-        BriefingRunner._save_state(
+        runner._save_state(
             papers, [{"title": "B"}], [{"title": "N"}],
             [{"symbol": "X", "current_price": 100}],
             emerging_themes=["theme1"],
             trending_topics={"x": {"count": 1}},
             weekly_items=[{"date": "d", "title": "t"}],
         )
-        state = BriefingRunner._load_previous_state()
+        state = runner._load_previous_state()
         assert state["top_paper_titles"] == ["P1", "P2"]
         assert state["emerging_themes"] == ["theme1"]
         assert state["trending_topics"] == {"x": {"count": 1}}
         assert state["weekly_items"][0]["date"] == "d"
 
-    def test_load_missing_returns_empty(self, tmp_path, monkeypatch):
+    def test_load_missing_returns_empty(self, runner, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        assert BriefingRunner._load_previous_state() == {}
+        assert runner._load_previous_state() == {}
 
-    def test_load_corrupt_returns_empty(self, tmp_path, monkeypatch):
+    def test_load_corrupt_returns_empty(self, runner, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".atlas-state.json").write_text("{not valid json")
-        assert BriefingRunner._load_previous_state() == {}
+        assert runner._load_previous_state() == {}
 
 
 # ---------- save_status ----------

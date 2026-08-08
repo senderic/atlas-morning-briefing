@@ -18,18 +18,19 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
+from scripts.llm_errors import classify_error
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
-    "heavy": "opencode-zen/deepseek-v4-flash-free",
-    "medium": "opencode-zen/deepseek-v4-flash-free",
-    "light": "opencode-zen/deepseek-v4-flash-free",
+    "heavy": "opencode-go/deepseek-v4-pro",
+    "medium": "opencode/deepseek-v4-flash-free",
+    "light": "opencode/deepseek-v4-flash-free",
 }
 
-# Free-tier backup models tried in order if the primary model for a tier
-# fails (non-zero exit, empty response, or timeout).
+# Backup models tried in order if the primary model for a tier fails
+# (non-zero exit, empty response, or timeout).
 DEFAULT_FALLBACK_MODELS = {
     "heavy": ["opencode-go/deepseek-v4-flash"],
     "medium": ["opencode-go/deepseek-v4-flash"],
@@ -63,6 +64,8 @@ class OpencodeClient(BaseLLMClient):
         """
         config = config or {}
         self.enabled = config.get("enabled", True)
+        self.provider = config.get("provider", "opencode")
+        self.render_key_rotation = True  # CompositeClient sets False to unify
         models_config = config.get("models", {})
         self.models = {
             "heavy": models_config.get("heavy", DEFAULT_MODELS["heavy"]),
@@ -420,6 +423,7 @@ class OpencodeClient(BaseLLMClient):
         name = error.get("name", "")
         is_retryable = error.get("isRetryable")
         status_code = error.get("statusCode")
+        message = error.get("message", "")
 
         # Non-retryable API errors: insufficient balance, auth failure, etc.
         if name == "APIError" and is_retryable is False:
@@ -429,12 +433,38 @@ class OpencodeClient(BaseLLMClient):
         if is_retryable is True:
             return "retry"
 
+        # Defer to the shared classifier for anything with a status code or
+        # message so "out of usage" providers skip straight to the next one.
+        action = classify_error(status_code=status_code, text=message)
+        if action == "fallback":
+            return "fallback"
         if status_code and status_code in (429, 502, 503, 504):
+            return "retry"
+        if action == "retry":
             return "retry"
 
         # UnknownError (model not found, provider not found) or anything
         # else we haven't seen — fail safe and move to the next model.
         return "fallback"
+
+    def get_key_rotation_rows(self):
+        """Return per-tier model rows for the unified provider summary.
+
+        For the opencode CLI the "keys" are the model IDs that served each
+        tier. Provider is derived from the model's prefix (e.g. ``opencode-go``,
+        ``opencode``, ``openrouter``). Each row:
+        (provider, key_index, preview, success, failures).
+        """
+        rows = []
+        for tier in ("heavy", "medium", "light"):
+            calls = self._tier_calls.get(tier, 0)
+            failures = self._tier_failures.get(tier, 0)
+            if calls == 0 and failures == 0:
+                continue
+            served = self._tier_served_by.get(tier) or self.models.get(tier, "?")
+            provider = served.split("/", 1)[0] if "/" in served else self.provider
+            rows.append((provider, tier, served, calls, failures))
+        return rows
 
     def get_usage_summary(
         self,

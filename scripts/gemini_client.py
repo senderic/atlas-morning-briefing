@@ -28,15 +28,12 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_random_exponential,
-    retry_if_exception,
-    before_sleep_log
-)
-
 from scripts.llm_client import BaseLLMClient
+from scripts.llm_errors import classify_error
+
+RETRY_BACKOFF_BASE = 5
+RETRY_BACKOFF_MAX = 15
+MAX_ATTEMPTS_DEFAULT = 6
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -164,9 +161,14 @@ class GeminiCLIClient(BaseLLMClient):
         """
         config = config or {}
         self.enabled = config.get("enabled", True)
+        self.provider = config.get("provider", "gemini")
+        self.render_key_rotation = True  # CompositeClient sets False to unify
         self.ignore_hard_quota = config.get("ignore_hard_quota", False)
         self.track_hard_quotas = config.get("track_hard_quotas", False) # Flag to permanently skip keys
         self.internal_max_attempts = config.get("internal_max_attempts", 1)
+        # Bounded number of CLI attempts per logical invocation across all keys
+        # (replaces the old heavy-tier "12 attempts @ up to 450s" persistence).
+        self.config_retries = config.get("retries", config.get("max_attempts", MAX_ATTEMPTS_DEFAULT))
 
         # Explicit binary override (e.g. "agy" or "gemini"); None = auto-detect.
         # Validate so a typo doesn't silently fall through to auto-detect.
@@ -614,116 +616,117 @@ class GeminiCLIClient(BaseLLMClient):
         model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
-        # Ultra-persistence for the Heavy (Pro) model
-        # 12 attempts total (spread across keys)
-        max_attempts = 12 if tier == "heavy" else 4
+        # Consistent, bounded retry policy across ALL tiers (no heavy 12-attempt
+        # ultra-persistence). max_attempts_total caps the number of CLI calls
+        # for this logical invocation across all keys.
+        max_attempts_total = self.config_retries
+        # Per-key soft-quota retries before rotating to the next key.
+        max_soft_per_key = 2
 
-        def is_transient_error(exception):
-            """Check if the error is worth retrying, and rotate key if quota hit."""
-            if isinstance(exception, (subprocess.TimeoutExpired, ValueError)):
-                return True
-            if isinstance(exception, subprocess.CalledProcessError):
-                # Check both stderr and stdout for error messages
-                error_msg = ""
-                if exception.stderr:
-                    error_msg += exception.stderr
-                if exception.stdout:
-                    error_msg += exception.stdout
-                
-                if not error_msg:
-                    error_msg = str(exception)
-                
-                error_msg = error_msg.lower()
-                
-                # Keywords for typical transient errors
-                quota_keywords = ["resource_exhausted", "capacity", "rate limit", "429", "503", "500", "exhausted", "quota"]
-                # Keywords that usually mean a hard daily stop
-                hard_quota_keywords = ["daily", "rpd", "limit reached"]
-                
-                is_quota = any(kw in error_msg for kw in quota_keywords) or any(kw in error_msg for kw in hard_quota_keywords)
-                
-                if is_quota:
-                    # If it's a hard quota, mark this key as exhausted for the rest of the run
-                    if any(kw in error_msg for kw in hard_quota_keywords):
-                        if self.track_hard_quotas:
-                            logger.warning(f"Hard quota (Daily/RPD) reached for key {self._current_key_index}. Marking as exhausted.")
-                            self._exhausted_keys.add(self._current_key_index)
-                        else:
-                            logger.info(f"Potential hard quota hit for key {self._current_key_index}, but track_hard_quotas is False. Rotating but NOT exhausting.")
-                        
-                        self._attempts_on_current_key = 0 # reset for new key
-                        return self._rotate_key()
+        last_action = "retry"
+        attempt = 0
+        while attempt < max_attempts_total:
+            attempt += 1
+            try:
+                result = self._execute_command(model_id, full_prompt, tier)
+                if result:
+                    self._call_count += 1
+                    return result
+                # Empty output is treated as a transient problem.
+                logger.warning(
+                    f"Gemini returned empty output (tier={tier}, attempt={attempt}/{max_attempts_total}); "
+                    "treating as retryable."
+                )
+                last_action = "retry"
+            except (subprocess.TimeoutExpired, ValueError) as e:
+                logger.warning(
+                    f"Gemini transient error (tier={tier}, attempt={attempt}/{max_attempts_total}): {e}"
+                )
+                last_action = "retry"
+                if attempt < max_attempts_total:
+                    time.sleep(self._retry_sleep(attempt))
+                continue
+            except subprocess.CalledProcessError as e:
+                err = str(e)
+                if e.stderr:
+                    err += f" | stderr: {e.stderr.strip()}"
+                action = classify_error(text=err)
 
-                    # For soft quotas, retry the same key multiple times first
-                    self._attempts_on_current_key += 1
-                    if self._attempts_on_current_key >= max_attempts_per_key:
-                        logger.info(f"Key {self._current_key_index} hit quota {self._attempts_on_current_key} times. Rotating...")
-                        self._attempts_on_current_key = 0 # reset for new key
-                        if self._rotate_key():
-                            return True
-                    else:
-                        logger.info(
-                            f"Key {self._current_key_index} hit soft quota (attempt {self._attempts_on_current_key}/{max_attempts_per_key}). "
-                            "Retrying same key after backoff..."
-                        )
-                        return True
-                    
-                    if any(kw in error_msg for kw in hard_quota_keywords):
-                        if self.ignore_hard_quota:
-                            logger.info(f"Potential hard quota hit for {tier}, but ignore_hard_quota is enabled. Retrying with current key...")
-                            return True
-                        logger.warning(f"Hard quota reached for {tier} and no more keys to rotate. Skipping retries.")
-                        return False
-                
-                return any(kw in error_msg for kw in quota_keywords)
-            return False
-
-        try:
-            # Smarter Wait Strategy:
-            # For Heavy tier, we start with a 90s floor to clear 60s RPM windows.
-            # Max wait of 450s (7.5m) to clear larger sliding windows.
-            wait_strategy = wait_random_exponential(
-                multiplier=60 if tier == "heavy" else 30, 
-                min=90 if tier == "heavy" else 60, 
-                max=450 if tier == "heavy" else 300
-            )
-
-            @retry(
-                stop=stop_after_attempt(max_attempts),
-                wait=wait_strategy,
-                retry=retry_if_exception(is_transient_error),
-                before_sleep=before_sleep_log(logger, logging.INFO),
-                reraise=True
-            )
-            def retry_call():
-                return self._execute_command(model_id, full_prompt, tier)
-
-            # Successful logical call - increment budget ONCE
-            result = retry_call()
-            if result:
-                self._call_count += 1
-            return result
-
-        except Exception as e:
-            # Capture more detail in the error log
-            error_detail = str(e)
-            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
-                error_detail += f" | stderr: {e.stderr.strip()}"
-            
-            logger.error(f"All attempts for tier {tier} failed after {max_attempts-1} retries: {error_detail}")
-            
-            # Recursive fallback for both timeout and other failures
-            if allow_fallback:
-                next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
-                if next_tier:
-                    logger.info(f"--- Falling back from {tier} to {next_tier} ---")
-                    return self.invoke(
-                        prompt, tier=next_tier,
-                        system_prompt=system_prompt,
-                        allow_fallback=True,
+                if action == "fallback":
+                    # Out of usage (quota/balance/auth exhausted). Try rotating
+                    # to a different key once (another key may still work), but
+                    # if we've already rotated through everything, return None
+                    # so the composite falls through to the next provider.
+                    logger.warning(
+                        f"Gemini out-of-usage (tier={tier}, attempt={attempt}/{max_attempts_total}): {err[:300]}"
                     )
+                    last_action = "fallback"
+                    if not self._try_rotate_for_new_key(err):
+                        return None
+                    if attempt < max_attempts_total:
+                        continue
+                    return None
+
+                # Retryable (transient) error: rotate key after soft-quota
+                # retries on the current key, else backoff.
+                logger.warning(
+                    f"Gemini retryable error (tier={tier}, attempt={attempt}/{max_attempts_total}): {err[:300]}"
+                )
+                last_action = "retry"
+                self._attempts_on_current_key += 1
+                if self._attempts_on_current_key >= max_soft_per_key:
+                    self._attempts_on_current_key = 0
+                    if self._rotate_key() and attempt < max_attempts_total:
+                        continue
+                if attempt < max_attempts_total:
+                    time.sleep(self._retry_sleep(attempt))
+                continue
+
+        logger.error(f"All Gemini attempts for tier {tier} failed after {max_attempts_total} attempts (last action={last_action}).")
+
+        # Recursive fallback for both timeout and other failures
+        if allow_fallback:
+            next_tier = {"heavy": "medium", "medium": "light"}.get(tier)
+            if next_tier:
+                logger.info(f"--- Falling back from {tier} to {next_tier} ---")
+                return self.invoke(
+                    prompt, tier=next_tier,
+                    system_prompt=system_prompt,
+                    allow_fallback=True,
+                )
 
         return None
+
+    def _retry_sleep(self, attempt: int) -> float:
+        """Short bounded backoff (matches other providers), capped at RETRY_BACKOFF_MAX."""
+        backoff = min(
+            RETRY_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 2),
+            RETRY_BACKOFF_MAX,
+        )
+        return backoff
+
+    def _try_rotate_for_new_key(self, err: str) -> bool:
+        """Rotate to a fresh, non-exhausted key. Returns True if one is available.
+
+        If the provider-wide error is a hard quota / payment failure on the
+        account, rotating is pointless — return False so the caller falls back.
+        """
+        hard_look = (err or "").lower()
+        if any(k in hard_look for k in ("insufficient balance", "billing", "payment", "forbidden")):
+            logger.warning("Gemini provider-wide block (billing/auth) — not rotating keys.")
+            return False
+        return self._rotate_key()
+
+    def get_key_rotation_rows(self):
+        """Return per-key rotation rows for the unified provider summary.
+
+        Each row: (provider, key_index, preview, success, failures).
+        """
+        rows = []
+        for idx in sorted(self.key_usage_stats.keys()):
+            stats = self.key_usage_stats[idx]
+            rows.append((self.provider, idx, stats["preview"], stats["success"], stats["failure"]))
+        return rows
 
     def get_usage_summary(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> str:
         """Generate a formatted markdown summary of Gemini API usage and estimated costs.
@@ -767,14 +770,15 @@ class GeminiCLIClient(BaseLLMClient):
             f"**{sum(s['failed_attempts'] for s in self.usage_stats.values())}** | | | **${total_cost:.4f}** |\n\n"
         )
 
-        # Add API Key Rotation Summary
-        if self.key_usage_stats:
+        # Add API Key Rotation Summary (suppressed when CompositeClient renders
+        # a unified provider-aware table).
+        if self.render_key_rotation and self.key_usage_stats:
             lines.append("### API Key Rotation Summary\n\n")
-            lines.append("| Key Index | Preview | Success | Quota/Failures |\n")
-            lines.append("| :--- | :--- | :---: | :---: |\n")
+            lines.append("| Provider | Key Index | Preview | Success | Quota/Failures |\n")
+            lines.append("| :--- | :---: | :--- | :---: | :---: |\n")
             for idx in sorted(self.key_usage_stats.keys()):
                 stats = self.key_usage_stats[idx]
-                lines.append(f"| {idx} | `{stats['preview']}` | {stats['success']} | {stats['failure']} |\n")
+                lines.append(f"| {self.provider} | {idx} | `{stats['preview']}` | {stats['success']} | {stats['failure']} |\n")
             lines.append("\n")
 
         lines.append(

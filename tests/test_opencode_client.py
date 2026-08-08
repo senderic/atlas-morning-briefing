@@ -166,7 +166,7 @@ class TestInvoke:
             client.invoke("test", tier="heavy")
             cmd = mock_run.call_args[0][0]
             model_idx = cmd.index("-m") + 1
-            assert cmd[model_idx] == "opencode-zen/deepseek-v4-flash-free"
+            assert cmd[model_idx] == "opencode-go/deepseek-v4-pro"
 
     def test_tier_model_selection_light(self):
         with (
@@ -342,14 +342,14 @@ class TestUsageSummary:
 class TestDefaults:
     def test_default_models(self):
         client = OpencodeClient({})
-        assert client.models["heavy"] == "opencode-zen/deepseek-v4-flash-free"
-        assert client.models["medium"] == "opencode-zen/deepseek-v4-flash-free"
-        assert client.models["light"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client.models["heavy"] == "opencode-go/deepseek-v4-pro"
+        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
+        assert client.models["light"] == "opencode/deepseek-v4-flash-free"
 
     def test_custom_model_override(self):
         client = OpencodeClient({"models": {"heavy": "other/model"}})
         assert client.models["heavy"] == "other/model"
-        assert client.models["medium"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
 
     def test_default_max_calls(self):
         client = OpencodeClient({})
@@ -412,7 +412,7 @@ class TestFallback:
         assert mock_run.call_count == 2
         first_cmd = mock_run.call_args_list[0][0][0]
         second_cmd = mock_run.call_args_list[1][0][0]
-        assert first_cmd[first_cmd.index("-m") + 1] == "opencode-zen/deepseek-v4-flash-free"
+        assert first_cmd[first_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-pro"
         assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-flash"
 
     def test_fallback_after_empty_ndjson(self):
@@ -530,7 +530,7 @@ class TestFallback:
         assert result == "Hello there"
         assert mock_run.call_count == 1
         assert client._tier_fallback_hits["medium"] == 0
-        assert client._tier_served_by["medium"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client._tier_served_by["medium"] == "opencode/deepseek-v4-flash-free"
 
     def test_budget_check_applies_during_fallback(self):
         # Burn budget on the primary attempt; even if fallback would succeed,
@@ -644,7 +644,7 @@ class TestRetryThenFallback:
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 0  # no fallback
-        assert client._tier_served_by["heavy"] == "opencode-zen/deepseek-v4-flash-free"
+        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-pro"
         assert mock_run.call_count == 2  # initial + retry
 
     def test_nonzero_exit_retries_then_fallback(self):

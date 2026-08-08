@@ -28,6 +28,7 @@ briefings/
 
 # Runtime data
 .atlas-state.json
+.local-state.json
 state.json
 status.json
 blogs.json
@@ -41,6 +42,7 @@ logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl
 logs/gemini-audit-*.txt
+logs/local-gemini-calls.jsonl
 
 # IDE and Tools
 .vscode/

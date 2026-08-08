@@ -50,27 +50,37 @@ from scripts.llm_client import BaseLLMClient
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-STATE_FILENAME = ".atlas-state.json"
-
-
 class BriefingRunner:
     """Main orchestrator for morning briefing generation."""
 
-    # Default section order
-    DEFAULT_SECTION_ORDER = ["stocks", "news", "top_papers", "blogs"]
-
-    def __init__(self, config: Dict[str, Any], dry_run: bool = False):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        dry_run: bool = False,
+        use_snapshots: Optional[str] = None,
+    ):
         """
         Initialize BriefingRunner.
 
         Args:
             config: Configuration dictionary.
             dry_run: If True, don't send email.
+            use_snapshots: If set to a date string (e.g. "2026-07-27"),
+                           load raw data from snapshots/{date}/ instead of
+                           making live API calls.
         """
         self.config = config
         self.dry_run = dry_run
+        self.use_snapshots = use_snapshots
         self.user_name = os.getenv("USER_NAME", "")
         self.errors = []
+        self.state_file_path = config.get("state_file_path", ".atlas-state.json")
+        self.section_order = config.get("section_order", ["stocks", "news", "top_papers", "blogs"])
+        features = config.get("features", {})
+        self.feature_solo_founder_angle = features.get("solo_founder_angle", True)
+        self.feature_agent_cost_optimization = features.get("agent_cost_optimization", True)
+        self.feature_weekly_deep_dive = features.get("weekly_deep_dive", True)
+        self._headings = config.get("section_headings", {})
         self._briefing_title = self._format_filename(datetime.now())
         self.status = {
             "timestamp": datetime.now().isoformat(),
@@ -86,12 +96,34 @@ class BriefingRunner:
             "elapsed_seconds": 0,
         }
 
-        # Initialize LLM client and intelligence layer
+        # Initialize LLM client and intelligence layer.
+        # Chain: opencode/DeepSeek first (its own per-tier fallbacks run
+        # internally), then the Gemini CLI, then OpenRouter as fallbacks when
+        # the respective backends are enabled.
+        gemini_config = config.get("gemini", config.get("bedrock", {}))
+        openrouter_config = config.get("openrouter", {})
         if config.get("opencode", {}).get("enabled"):
             from scripts.opencode_client import OpencodeClient
-            self.llm_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}))
+            opencode_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}))
+            fallback_clients = []
+            if gemini_config.get("enabled"):
+                fallback_clients.append(GeminiCLIClient(gemini_config))
+            if openrouter_config.get("enabled"):
+                from scripts.openrouter_client import OpenRouterClient
+                fallback_clients.append(OpenRouterClient(openrouter_config))
+            if fallback_clients:
+                from scripts.composite_client import CompositeClient
+                composite_timeout = config.get("llm", {}).get(
+                    "fallback_timeout_seconds",
+                    config.get("composite", {}).get("timeout_seconds", 240),
+                )
+                self.llm_client = CompositeClient(
+                    [opencode_client] + fallback_clients,
+                    timeout=composite_timeout,
+                )
+            else:
+                self.llm_client = opencode_client
         else:
-            gemini_config = config.get("gemini", config.get("bedrock", {}))
             self.llm_client = GeminiCLIClient(gemini_config)
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
@@ -101,6 +133,23 @@ class BriefingRunner:
             snapshot_dir=snapshot_cfg.get("dir", "snapshots"),
             enabled=snapshot_cfg.get("enabled", True),
         )
+        logger.debug(
+            "Initialized BriefingRunner: state_file=%s section_order=%s "
+            "features(solo=%s agent=%s weekly=%s) dry_run=%s use_snapshots=%s",
+            self.state_file_path, self.section_order,
+            self.feature_solo_founder_angle, self.feature_agent_cost_optimization,
+            self.feature_weekly_deep_dive, self.dry_run, self.use_snapshots,
+        )
+
+    @staticmethod
+    def _load_snapshot(path: str) -> List[Dict[str, Any]]:
+        """Load a JSON snapshot file, returning an empty list on any failure."""
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"Snapshot load failed: {path} — {e}")
+            return []
 
     def run_arxiv_scan(self, topics: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Run arxiv paper scan."""
@@ -404,7 +453,7 @@ class BriefingRunner:
         # Add title and timestamp (localized with timezone)
         now = datetime.now().astimezone()
         timestamp_str = now.strftime("%A, %B %d, %Y | %I:%M %p %Z")
-        md.append("# Atlas Morning Briefing\n")
+        md.append(f"# {self.config.get('briefing_title', 'Atlas Morning Briefing')}\n")
         
         user_suffix = f" [RIGHT]for {self.user_name}[/RIGHT]" if self.user_name else ""
         md.append(f"*{timestamp_str}{user_suffix}*\n\n")
@@ -433,23 +482,22 @@ class BriefingRunner:
                     continue
                 cleaned.append(line)
             intro = "\n".join(cleaned).strip()
-            md.append("## Executive Summary\n\n")
+            md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
             md.append(f"{intro}\n\n")
         else:
-            # Fallback if synthesis failed
-            md.append("## Executive Summary\n\n")
+            md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
             md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
 
-            # Solo Founder Angle (1-man company idea of the day)
+        if self.feature_solo_founder_angle:
             solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
             if solo_angle:
-                md.append("## 💡 Solo Founder Angle\n\n")
+                md.append(f"## {self._headings.get('solo_founder_angle', 'Solo Founder Angle')}\n\n")
                 md.append(f"{solo_angle}\n\n")
 
-            # Agent Cost-Optimization Play
+        if self.feature_agent_cost_optimization:
             cost_play = synthesis.get("agent_cost_play", "") if synthesis else ""
             if cost_play:
-                md.append("## 💰 Agent Cost-Optimization Play\n\n")
+                md.append(f"## {self._headings.get('agent_cost_optimization', 'Agent Cost-Optimization Play')}\n\n")
                 md.append(f"{cost_play}\n\n")
 
             # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
@@ -457,8 +505,7 @@ class BriefingRunner:
             # entity_mentions = synthesis.get("entity_mentions", [])
             # if entity_mentions: ...
 
-        # Fixed section order -- no LLM override
-        section_order = self.DEFAULT_SECTION_ORDER
+        section_order = self.section_order
 
         # Section renderers
         section_data = {
@@ -468,6 +515,13 @@ class BriefingRunner:
             "top_papers": top_papers,
             "papers": papers,
         }
+        logger.debug(
+            "Generating markdown: section_order=%s headings_keys=%s "
+            "briefing_title=%s sections_with_data=%s",
+            section_order, list(self._headings.keys()),
+            self.config.get('briefing_title', 'Atlas Morning Briefing'),
+            [k for k, v in section_data.items() if v],
+        )
 
         for section in section_order:
             data = section_data.get(section, [])
@@ -486,13 +540,13 @@ class BriefingRunner:
                 md.append(self._render_papers(data))
 
         # Feature 2: Weekly Deep Dive section (Saturday only)
-        if weekly_deep_dive:
-            md.append("## This Week in AI\n\n")
+        if self.feature_weekly_deep_dive and weekly_deep_dive:
+            md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
             md.append(f"{weekly_deep_dive}\n\n")
 
         # Errors section
         if self.errors:
-            md.append("## Errors\n\n")
+            md.append(f"## {self._headings.get('errors', 'Errors')}\n\n")
             for error in self.errors:
                 md.append(f"- {error}\n")
             md.append("\n")
@@ -550,7 +604,7 @@ class BriefingRunner:
 
     def _render_stocks(self, stocks: List[Dict[str, Any]], market_trend: str = "") -> str:
         """Render stock watchlist as compact overview table with trend analysis."""
-        md = ["## Financial Market Overview\n\n"]
+        md = [f"## {self._headings.get('stocks', 'Financial Market Overview')}\n\n"]
 
         if market_trend:
             md.append(f"{market_trend}\n\n")
@@ -606,7 +660,7 @@ class BriefingRunner:
 
     def _render_news(self, news: List[Dict[str, Any]]) -> str:
         """Render news section (top 5, with summaries)."""
-        md = ["## AI & Tech News\n\n"]
+        md = [f"## {self._headings.get('news', 'AI & Tech News')}\n\n"]
         for article in news[:5]:
             article_title = article.get("title", "")
             url = article.get("url", "")
@@ -630,7 +684,7 @@ class BriefingRunner:
 
     def _render_blogs(self, blogs: List[Dict[str, Any]]) -> str:
         """Render blog updates section (top 5, with summaries, sorted by score)."""
-        md = ["## Blog Updates\n\n"]
+        md = [f"## {self._headings.get('blogs', 'Blog Updates')}\n\n"]
         
         # Sort by score if available, otherwise use original order
         if any(b.get("score_combined") for b in blogs):
@@ -726,7 +780,7 @@ class BriefingRunner:
 
     def _render_top_papers(self, top_papers: List[Dict[str, Any]]) -> str:
         """Render top papers section (top N per config.num_paper_picks, with summaries, scores, and repro assessment)."""
-        md = ["## Top Papers\n\n"]
+        md = [f"## {self._headings.get('top_papers', 'Top Papers')}\n\n"]
         num_picks = self.config.get("num_paper_picks", 5)
         sorted_papers = sorted(top_papers[:num_picks], key=lambda x: x.get("score_combined", 0), reverse=True)
         if any(p.get("score_combined") for p in sorted_papers):
@@ -791,7 +845,7 @@ class BriefingRunner:
 
     def _render_papers(self, papers: List[Dict[str, Any]]) -> str:
         """Render recent papers section (top 5, compact)."""
-        md = ["## Recent Papers\n\n"]
+        md = [f"## {self._headings.get('recent_papers', 'Recent Papers')}\n\n"]
         for paper in papers[:5]:
             paper_title = paper.get("title", "")
             authors = paper.get("authors", [])
@@ -845,9 +899,12 @@ class BriefingRunner:
         """Generate EPUB from markdown."""
         try:
             logger.info("=== Generating EPUB ===")
+            epub_cfg = self.config.get("epub", {})
+            epub_title_fmt = epub_cfg.get("title_format", "Morning Briefing - {date}")
+            epub_author = epub_cfg.get("author", "Atlas")
             generator = EPUBGenerator(
-                title=f"Morning Briefing - {datetime.now().strftime('%Y-%m-%d')}",
-                author="Atlas"
+                title=epub_title_fmt.format(date=datetime.now().strftime("%Y-%m-%d")),
+                author=epub_author
             )
             generator.generate_epub(markdown_content, output_path)
             self.status["epub_generated"] = True
@@ -935,10 +992,9 @@ class BriefingRunner:
         except IOError as e:
             logger.warning(f"Failed to save status: {e}")
 
-    @staticmethod
-    def _load_previous_state() -> Dict[str, Any]:
+    def _load_previous_state(self) -> Dict[str, Any]:
         """Load previous briefing state for cross-day trend tracking."""
-        state_path = Path(STATE_FILENAME)
+        state_path = Path(self.state_file_path)
         if state_path.exists():
             try:
                 with open(state_path) as f:
@@ -947,8 +1003,8 @@ class BriefingRunner:
                 return {}
         return {}
 
-    @staticmethod
     def _save_state(
+        self,
         papers: List[Dict[str, Any]],
         blogs: List[Dict[str, Any]],
         news: List[Dict[str, Any]],
@@ -976,7 +1032,7 @@ class BriefingRunner:
         if weekly_items is not None:
             state["weekly_items"] = weekly_items
         try:
-            with open(STATE_FILENAME, "w") as f:
+            with open(self.state_file_path, "w") as f:
                 json.dump(state, f, indent=2)
         except IOError:
             pass
@@ -994,41 +1050,67 @@ class BriefingRunner:
         # --- Load previous state for cross-day tracking ---
         previous_state = self._load_previous_state()
 
-        # --- Topic expansion (intelligence layer) ---
-        topics = self.config.get("arxiv_topics", [])
-        if self.intelligence.available:
-            logger.info("=== Intelligence Layer: Expanding Topics ===")
-            topics = self.intelligence.expand_topics(topics)
-
-        # --- Run scanners in parallel (papers + blogs + stocks are independent) ---
-        from concurrent.futures import ThreadPoolExecutor
-        logger.info("=== Parallel data fetch (papers/blogs/stocks) ===")
-        with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
-            fut_papers = pool.submit(self.run_arxiv_scan, topics)
-            fut_blogs = pool.submit(self.run_blog_scan)
-            fut_stocks = pool.submit(self.run_stock_fetch)
-
-            papers = fut_papers.result()
-            blogs = fut_blogs.result()
-            stocks = fut_stocks.result()
-
-        # --- Generate dynamic news queries (intelligence layer) ---
-        news_queries = self.config.get("news_queries", [])
-        if self.intelligence.available:
-            logger.info("=== Intelligence Layer: Generating Dynamic Queries ===")
-            news_queries = self.intelligence.generate_dynamic_queries(
-                previous_state, news_queries
+        if self.use_snapshots:
+            # --- Load from saved snapshots (skip all live API calls) ---
+            logger.info(
+                "=== Loading from snapshots/%s (skipping live fetches) ===",
+                self.use_snapshots,
             )
+            papers = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/arxiv_papers.json"
+            )
+            blogs = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/rss_feeds.json"
+            )
+            stocks = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/finnhub_data.json"
+            )
+            news = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/brave_news.json"
+            )
+            topics = self.config.get("arxiv_topics", [])
+            news_queries = self.config.get("news_queries", [])
+            self.status["papers_found"] = len(papers)
+            self.status["blogs_found"] = len(blogs)
+            self.status["stocks_fetched"] = len(stocks)
+            self.status["news_found"] = len(news)
+        else:
+            # --- Topic expansion (intelligence layer) ---
+            topics = self.config.get("arxiv_topics", [])
+            if self.intelligence.available:
+                logger.info("=== Intelligence Layer: Expanding Topics ===")
+                topics = self.intelligence.expand_topics(topics)
 
-        news = self.run_news_aggregation(queries=news_queries)
+            # --- Run scanners in parallel (papers + blogs + stocks are independent) ---
+            from concurrent.futures import ThreadPoolExecutor
 
-        # --- Save raw data snapshots ---
-        logger.info("=== Saving raw data snapshots ===")
-        self.snapshot_manager.save_stocks(stocks)
-        self.snapshot_manager.save_news(news)
-        self.snapshot_manager.save_blogs(blogs)
-        self.snapshot_manager.save_papers(papers)
-        self.snapshot_manager.save_manifest()
+            logger.info("=== Parallel data fetch (papers/blogs/stocks) ===")
+            with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
+                fut_papers = pool.submit(self.run_arxiv_scan, topics)
+                fut_blogs = pool.submit(self.run_blog_scan)
+                fut_stocks = pool.submit(self.run_stock_fetch)
+
+                papers = fut_papers.result()
+                blogs = fut_blogs.result()
+                stocks = fut_stocks.result()
+
+            # --- Generate dynamic news queries (intelligence layer) ---
+            news_queries = self.config.get("news_queries", [])
+            if self.intelligence.available:
+                logger.info("=== Intelligence Layer: Generating Dynamic Queries ===")
+                news_queries = self.intelligence.generate_dynamic_queries(
+                    previous_state, news_queries
+                )
+
+            news = self.run_news_aggregation(queries=news_queries)
+
+            # --- Save raw data snapshots ---
+            logger.info("=== Saving raw data snapshots ===")
+            self.snapshot_manager.save_stocks(stocks)
+            self.snapshot_manager.save_news(news)
+            self.snapshot_manager.save_blogs(blogs)
+            self.snapshot_manager.save_papers(papers)
+            self.snapshot_manager.save_manifest()
 
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
@@ -1114,27 +1196,27 @@ class BriefingRunner:
                 previous_state=previous_state,
             )
 
-            # Solo-founder startup angle (1-man company idea of the day)
-            try:
-                solo_angle = self.intelligence.generate_solo_startup_angle(
-                    papers, blogs[:6], news[:6], top_papers[:3],
-                    emerging_themes=emerging_themes,
-                )
-                if solo_angle:
-                    synthesis["solo_startup"] = solo_angle
-            except Exception as e:
-                logger.warning(f"Solo-startup angle generation failed: {e}")
+            if self.feature_solo_founder_angle:
+                try:
+                    solo_angle = self.intelligence.generate_solo_startup_angle(
+                        papers, blogs[:6], news[:6], top_papers[:3],
+                        emerging_themes=emerging_themes,
+                    )
+                    if solo_angle:
+                        synthesis["solo_startup"] = solo_angle
+                except Exception as e:
+                    logger.warning(f"Solo-startup angle generation failed: {e}")
 
-            # Agent cost-optimization play of the day
-            try:
-                cost_play = self.intelligence.generate_agent_cost_optimization(
-                    papers, blogs[:6], news[:6], top_papers[:3],
-                    emerging_themes=emerging_themes,
-                )
-                if cost_play:
-                    synthesis["agent_cost_play"] = cost_play
-            except Exception as e:
-                logger.warning(f"Agent cost-optimization generation failed: {e}")
+            if self.feature_agent_cost_optimization:
+                try:
+                    cost_play = self.intelligence.generate_agent_cost_optimization(
+                        papers, blogs[:6], news[:6], top_papers[:3],
+                        emerging_themes=emerging_themes,
+                    )
+                    if cost_play:
+                        synthesis["agent_cost_play"] = cost_play
+                except Exception as e:
+                    logger.warning(f"Agent cost-optimization generation failed: {e}")
 
             # Feature 3: Competitive Intelligence (entity tracking)
             tracked_entities = self.config.get("tracked_entities", [])
@@ -1147,33 +1229,34 @@ class BriefingRunner:
                 # Add to synthesis for rendering in Executive Summary
                 synthesis["entity_mentions"] = entity_mentions
 
-        # Feature 2: Weekly Deep Dive (accumulate items & generate on Saturday)
         now = datetime.now()
-        is_saturday = now.weekday() == 5
         weekly_deep_dive = ""
-        weekly_items = previous_state.get("weekly_items", [])
+        weekly_items = []
+        if self.feature_weekly_deep_dive:
+            is_saturday = now.weekday() == 5
+            weekly_items = previous_state.get("weekly_items", [])
 
-        # Accumulate today's top items for the week
-        today_str = now.strftime("%Y-%m-%d")
-        for paper in top_papers[:3]:
-            weekly_items.append({
-                "date": today_str,
-                "type": "paper",
-                "title": paper.get("title", ""),
-            })
-        for article in news[:3]:
-            weekly_items.append({
-                "date": today_str,
-                "type": "news",
-                "title": article.get("title", ""),
-            })
+            # Accumulate today's top items for the week
+            today_str = now.strftime("%Y-%m-%d")
+            for paper in top_papers[:3]:
+                weekly_items.append({
+                    "date": today_str,
+                    "type": "paper",
+                    "title": paper.get("title", ""),
+                })
+            for article in news[:3]:
+                weekly_items.append({
+                    "date": today_str,
+                    "type": "news",
+                    "title": article.get("title", ""),
+                })
 
-        # On Saturday, generate the deep dive and clear weekly_items
-        if is_saturday and self.intelligence.available and weekly_items:
-            logger.info("=== Intelligence Layer: Weekly Deep Dive (Saturday) ===")
-            weekly_deep_dive = self.intelligence.generate_weekly_deep_dive(weekly_items)
-            # Clear weekly items after generation
-            weekly_items = []
+            # On Saturday, generate the deep dive and clear weekly_items
+            if is_saturday and self.intelligence.available and weekly_items:
+                logger.info("=== Intelligence Layer: Weekly Deep Dive (Saturday) ===")
+                weekly_deep_dive = self.intelligence.generate_weekly_deep_dive(weekly_items)
+                # Clear weekly items after generation
+                weekly_items = []
 
         # --- Check if we have any data ---
         has_data = any([papers, blogs, stocks, news])
@@ -1307,6 +1390,13 @@ def main() -> int:
         help="Generate briefing but don't send email",
     )
     parser.add_argument(
+        "--use-snapshots",
+        type=str,
+        metavar="DATE",
+        default=None,
+        help="Load raw data from snapshots/DATE/ instead of making live API calls",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="DEBUG",
@@ -1332,7 +1422,11 @@ def main() -> int:
     check_environment(config, dry_run=args.dry_run)
 
     # Run briefing
-    runner = BriefingRunner(config=config, dry_run=args.dry_run)
+    runner = BriefingRunner(
+        config=config,
+        dry_run=args.dry_run,
+        use_snapshots=args.use_snapshots,
+    )
     return runner.run()
 
 

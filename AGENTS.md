@@ -6,7 +6,7 @@ A single-machine, cron-driven pipeline that fetches ArXiv papers, RSS blogs, sto
 
 ## Schedule
 
-Cron (America/Los_Angeles): `30 5 * * 1-6` — 5:30 AM Mon-Sat.
+Cron (America/Los_Angeles): `0 6 * * 1-6` — 6:00 AM Mon-Sat.
 Downstream consumer: `~/sender-trades/` runs at 6:30 AM Mon-Fri.
 
 ## Active Binary Paths
@@ -36,6 +36,7 @@ uv run pytest tests/test_briefing_runner.py -v --tb=short
 - **Active LLM backend is Gemini CLI** (not Amazon Bedrock). `config.yaml` has `gemini.enabled: true`, `bedrock.enabled: false`. The README's Bedrock framing is aspirational/legacy.
 - **v0.1 runner is the active one** (`scripts/briefing_runner.py`). `briefing_runner_v2.py` is experimental.
 - **Two config files exist:** `config.yaml` (main config, 10KB) and `config.json` (small model override for opencode, 100B). The shell script references `config.yaml`.
+- **THREE configs for runs — blanket changes must touch all of them:** `config.yaml` (main Atlas briefing) AND `config_local.yaml` (San Diego local briefing, run via `run_briefing.sh` second invocation) both need the same model/LLM edits — e.g. 2026-08-08 heavy-tier OpenRouter model was updated in `config.yaml` but not `config_local.yaml`, so the local run kept using `deepseek/deepseek-chat`. `config.json` only overrides the opencode editor model. `scripts/openrouter_client.py` etc. hold code defaults that must match too.
 - **`.gitignore` ignores all `*.md`** except a whitelist. Add new doc files to `.gitignore` whitelist.
 - **Scripts in `scripts/` that are NOT pytest tests:** `test_briefing_alignment.py`, `verify_agy.py`, `audit_gemini.py`, `benchmark_*.py`, `check_weekly_state.py` — these are live diagnostics needing API keys. Test paths are pinned to `tests/`.
 - **Config topics are intentional** — defense/space/AI theming is user-specific, not placeholder.

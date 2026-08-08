@@ -1,0 +1,181 @@
+# San Diego / California Local News Briefing Configuration
+# Separate pipeline from the main Atlas Morning Briefing.
+# Run with: python3 scripts/briefing_runner.py --config config_local.yaml
+
+# --- Pipeline identity ---
+state_file_path: ".local-state.json"
+briefing_title: "San Diego Local News Briefing"
+file_naming: "Local-Briefing-{yyyy}.{mm}.{dd}"
+
+# --- Skip arxiv papers and stocks ---
+arxiv_topics: []
+stocks: []
+
+# --- RSS feeds: local news sources ---
+blog_feeds:
+  - name: "Voice of San Diego"
+    url: "https://voiceofsandiego.org/feed/"
+  - name: "KPBS Local"
+    url: "https://www.kpbs.org/news/local.rss"
+  - name: "Times of San Diego"
+    url: "https://timesofsandiego.com/feed/"
+  - name: "CalMatters"
+    url: "https://calmatters.org/feed/"
+
+# --- Interest profile for relevance filtering / ranking ---
+interest_profile:
+  - topic: "San Diego zoning and land-use changes"
+    weight: 1.0
+  - topic: "California housing legislation and policy"
+    weight: 0.95
+  - topic: "Local investment and real estate opportunities"
+    weight: 0.9
+  - topic: "Public transit and infrastructure in San Diego"
+    weight: 0.85
+  - topic: "California tax and regulatory changes"
+    weight: 0.85
+  - topic: "Environmental and coastal regulations"
+    weight: 0.8
+  - topic: "Small business and permitting changes"
+    weight: 0.75
+  - topic: "Local government and city council decisions"
+    weight: 0.7
+  - topic: "San Diego events and community news"
+    weight: 0.65
+
+# --- Domain framing for LLM prompts ---
+briefing_profile:
+  domain: "San Diego and California local news, policy, and investment"
+  audience: "a San Diego resident and investor tracking local opportunities and regulatory changes"
+  landscape: "the San Diego and California news, real estate, and public policy landscape"
+
+# --- News search queries (Brave Search API) ---
+news_queries:
+  - "San Diego city council decisions zoning permits"
+  - "San Diego housing development regulations changes"
+  - "San Diego business investment opportunities"
+  - "California state legislation housing property"
+  - "California new laws regulations real estate"
+  - "San Diego public transit infrastructure development"
+  - "San Diego environmental coastal commission"
+  - "San Diego downtown redevelopment commercial real estate"
+  - "San Diego flood insurance fire safety regulations"
+  - "California tax changes small business property"
+
+# --- Section layout (no papers, no stocks, no defense features) ---
+section_order: ["news", "blogs"]
+
+# --- Custom section headings ---
+section_headings:
+  executive_summary: "Executive Summary"
+  news: "San Diego / California News"
+  blogs: "Local Sources & Analysis"
+  errors: "Errors"
+
+# --- Disable defense-specific features ---
+features:
+  solo_founder_angle: false
+  agent_cost_optimization: false
+  weekly_deep_dive: false
+
+# --- EPUB metadata ---
+epub:
+  title_format: "Local Briefing - {date}"
+  author: "Atlas Local"
+
+# --- Output ---
+output_dir: "briefings/local"
+
+# --- Snapshot settings ---
+snapshot:
+  enabled: true
+  dir: "snapshots/local"
+
+# --- Paper scoring (unused but required by code path) ---
+paper_scoring:
+  has_code: 5
+  topic_match: 3
+  recency: 2
+  citation_count: 1
+num_paper_picks: 2
+repro_min_score: 12
+
+# --- Maximum items ---
+max_papers: 30
+max_blogs: 8
+max_news: 15
+arxiv_days_back: 3
+
+# --- Concurrency ---
+max_workers: 1
+
+# --- PDF disabled ---
+pdf:
+  enabled: false
+
+# --- Delivery settings ---
+kindle_email: "${KINDLE_EMAIL:-YOUR_NAME@kindle.com}"
+sender_email: "${SENDER_EMAIL:-your-sender@gmail.com}"
+output_format: "kindle"
+email_recipients:
+  - "${RECIPIENT_EMAIL:-your-email@example.com}"
+
+# --- Logging ---
+log_level: "DEBUG"
+
+# --- LLM CLI configuration (same as main pipeline) ---
+gemini:
+  enabled: true
+  ignore_hard_quota: true
+  track_hard_quotas: true
+  internal_max_attempts: 1
+  max_calls_per_run: 50
+  retry_wait_seconds: 61
+  key_swap_delay: 5
+  call_log_path: "logs/local-gemini-calls.jsonl"
+  models:
+    heavy: "pro"
+    medium: "flash"
+    light: "flash-lite"
+
+opencode:
+  enabled: true
+  models:
+    heavy: "opencode-go/deepseek-v4-pro"
+    medium: "opencode/deepseek-v4-flash-free"
+    light: "opencode/deepseek-v4-flash-free"
+  fallback_models:
+    heavy: ["opencode-go/deepseek-v4-flash"]
+    medium: ["opencode-go/deepseek-v4-flash"]
+    light: ["opencode-go/deepseek-v4-flash"]
+  max_calls_per_run: 50
+  timeout: 120
+  pricing:
+    input_per_million: 0.14
+    output_per_million: 0.28
+
+openrouter:
+  enabled: true
+  api_base: "https://openrouter.ai/api/v1/chat/completions"
+  models:
+    heavy: "deepseek/deepseek-v4-pro"
+    medium: "deepseek/deepseek-chat"
+    light: "deepseek/deepseek-chat"
+  fallback_models:
+    heavy: ["openrouter/auto"]
+    medium: ["openrouter/auto"]
+    light: ["openrouter/auto"]
+  max_calls_per_run: 50
+  timeout: 120
+  max_tokens: 2048
+  temperature: 0.3
+  pricing:
+    input_per_million: 0.25
+    output_per_million: 0.75
+
+# LLM fallback chain tuning
+composite:
+  timeout_seconds: 240
+
+bedrock:
+  enabled: false
