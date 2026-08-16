@@ -28,7 +28,7 @@ class NewsAggregator:
 
     BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/news/search"
 
-    def __init__(self, api_key: str, queries: List[str], max_results: int = 15, request_delay: float = 1.0):
+    def __init__(self, api_key: str, queries: List[str], max_results: int = 15, request_delay: float = 1.0, freshness: str = "pd"):
         """
         Initialize NewsAggregator.
 
@@ -37,11 +37,15 @@ class NewsAggregator:
             queries: List of search queries
             max_results: Maximum number of results per query
             request_delay: Seconds to wait between API calls
+            freshness: Brave search freshness window (pd=past day, pw=past week,
+                pm=past month). Wider windows help catch event announcements
+                published several days ahead of the event.
         """
         self.api_key = api_key
         self.queries = queries
         self.max_results = max_results
         self.request_delay = request_delay
+        self.freshness = freshness
 
     def search_news(self, query: str) -> List[Dict[str, Any]]:
         """
@@ -62,7 +66,7 @@ class NewsAggregator:
             params = {
                 "q": query,
                 "count": self.max_results,
-                "freshness": "pd",  # Past day
+                "freshness": self.freshness,
             }
 
             response = requests.get(

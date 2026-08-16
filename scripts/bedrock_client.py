@@ -112,6 +112,7 @@ class BedrockClient:
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         system_prompt: Optional[str] = None,
+        reasoning_enabled: bool = True,
     ) -> Optional[str]:
         """
         Invoke a Bedrock model.

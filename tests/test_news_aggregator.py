@@ -15,6 +15,14 @@ def aggregator():
     return NewsAggregator(api_key="fake-key", queries=["AI"], max_results=10, request_delay=0)
 
 
+@pytest.fixture
+def aggregator_week():
+    return NewsAggregator(
+        api_key="fake-key", queries=["AI"], max_results=10,
+        request_delay=0, freshness="pw",
+    )
+
+
 SAMPLE_RESPONSE = {
     "results": [
         {
@@ -56,6 +64,22 @@ class TestSearchNews:
         assert call.kwargs["headers"]["X-Subscription-Token"] == "fake-key"
         assert call.kwargs["params"]["q"] == "AI safety"
         assert call.kwargs["params"]["freshness"] == "pd"
+
+    @patch("scripts.news_aggregator.requests.get")
+    def test_search_uses_custom_freshness(self, mock_get, aggregator_week):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = SAMPLE_RESPONSE
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        aggregator_week.search_news("AI safety")
+
+        call = mock_get.call_args
+        assert call.kwargs["params"]["freshness"] == "pw"
+
+    def test_freshness_defaults_to_past_day(self):
+        agg = NewsAggregator(api_key="k", queries=["q"])
+        assert agg.freshness == "pd"
 
     @patch("scripts.news_aggregator.requests.get")
     def test_search_handles_missing_meta(self, mock_get, aggregator):

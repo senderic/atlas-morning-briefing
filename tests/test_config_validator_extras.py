@@ -29,6 +29,58 @@ class TestValidateExtras:
         is_valid, msgs = validate_config(cfg)
         assert is_valid is False
 
+    def test_interest_graph_valid(self):
+        cfg = {
+            "arxiv_topics": ["X"],
+            "interest_graph": {
+                "max_dynamic_queries": 2,
+                "roots": [
+                    {"id": "r1", "query": "defense", "children": [{"id": "l1", "query": "palantir"}]}
+                ],
+            },
+        }
+        is_valid, msgs = validate_config(cfg)
+        assert is_valid is True
+        assert msgs == []
+
+    def test_interest_graph_empty_roots(self):
+        cfg = {"arxiv_topics": ["X"], "interest_graph": {"roots": []}}
+        is_valid, msgs = validate_config(cfg)
+        assert is_valid is False
+        assert any("interest_graph.roots" in m for m in msgs)
+
+    def test_interest_graph_node_missing_query(self):
+        cfg = {
+            "arxiv_topics": ["X"],
+            "interest_graph": {"roots": [{"id": "r1"}]},
+        }
+        is_valid, msgs = validate_config(cfg)
+        assert is_valid is False
+        assert any(".query" in m for m in msgs)
+
+    def test_interest_graph_duplicate_ids(self):
+        cfg = {
+            "arxiv_topics": ["X"],
+            "interest_graph": {
+                "roots": [
+                    {"id": "r1", "query": "a"},
+                    {"id": "r1", "query": "b"},
+                ]
+            },
+        }
+        is_valid, msgs = validate_config(cfg)
+        assert is_valid is False
+        assert any("duplicate" in m for m in msgs)
+
+    def test_interest_graph_bad_max_dynamic(self):
+        cfg = {
+            "arxiv_topics": ["X"],
+            "interest_graph": {"max_dynamic_queries": "many", "roots": [{"id": "r", "query": "x"}]},
+        }
+        is_valid, msgs = validate_config(cfg)
+        assert is_valid is False
+        assert any("max_dynamic_queries" in m for m in msgs)
+
     def test_kindle_email_without_kindle_warns(self):
         cfg = {"arxiv_topics": ["X"], "kindle_email": "test@example.com"}
         is_valid, msgs = validate_config(cfg)

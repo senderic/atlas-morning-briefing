@@ -97,7 +97,7 @@ class TestRunOrchestration:
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
         runner.intelligence.expand_topics.side_effect = lambda t: t
-        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q: q
+        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q, today_blogs=None: q
         runner.intelligence.filter_papers_by_relevance.side_effect = lambda p, ip: p
         runner.intelligence.rank_and_summarize_news.side_effect = lambda n, t: n
         runner.intelligence.rank_and_summarize_blogs.side_effect = lambda b, t: b
@@ -152,7 +152,7 @@ class TestRunOrchestration:
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
         runner.intelligence.expand_topics.side_effect = lambda t: t
-        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q: q
+        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q, today_blogs=None: q
         runner.intelligence.filter_papers_by_relevance.side_effect = lambda p, ip: p
         runner.intelligence.rank_and_summarize_news.side_effect = lambda n, t: n
         runner.intelligence.rank_and_summarize_blogs.side_effect = lambda b, t: b

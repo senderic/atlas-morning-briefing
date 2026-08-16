@@ -38,6 +38,10 @@ scored_papers.json
 stocks.json
 logs/*.log
 *.log
+logs/*.dot
+logs/*.mmd
+logs/*.png
+logs/*.svg
 logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl

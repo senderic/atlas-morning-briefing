@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Non-reasoning model to swap in when reasoning_enabled=False.
+_NON_REASONING_SWAPS = {
+    "deepseek/deepseek-v4-pro": "deepseek/deepseek-chat",
+}
+
 # Default model IDs per tier. These are common OpenRouter model slugs.
 DEFAULT_MODELS = {
     "heavy": "deepseek/deepseek-v4-pro",
@@ -127,6 +132,7 @@ class OpenRouterClient(BaseLLMClient):
         prompt: str,
         tier: str = "medium",
         system_prompt: Optional[str] = None,
+        reasoning_enabled: bool = True,
         **kwargs: Any,
     ) -> Optional[str]:
         if kwargs:
@@ -148,6 +154,17 @@ class OpenRouterClient(BaseLLMClient):
         chain = [primary] + [
             m for m in self.fallback_models.get(tier, []) if m != primary
         ]
+
+        # When reasoning is disabled, swap reasoning models for their
+        # non-reasoning equivalents so chain-of-thought cannot leak into
+        # the visible answer.
+        if not reasoning_enabled:
+            chain = [_NON_REASONING_SWAPS.get(m, m) for m in chain]
+            if any(m != orig for m, orig in zip(chain, [primary] + self.fallback_models.get(tier, []))):
+                logger.info(
+                    "OpenRouter reasoning disabled — swapped tier=%s models: "
+                    "%s -> %s", tier, primary, chain[0],
+                )
 
         # Enforce the per-run budget across the whole chain.
         budget_remaining = self.max_calls - self._call_count
