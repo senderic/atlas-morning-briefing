@@ -21,6 +21,13 @@ blog_feeds:
     url: "https://timesofsandiego.com/feed/"
   - name: "CalMatters"
     url: "https://calmatters.org/feed/"
+  # Times of San Diego now publishes the former Beach & Bay Press / Peninsula
+  # Beacon (covers Pacific Beach, Mission Beach, Crown Point). These two
+  # category feeds surface beach-community news and event previews.
+  - name: "Times of San Diego Events"
+    url: "https://timesofsandiego.com/category/san-diego-events/feed/"
+  - name: "Times of San Diego Community"
+    url: "https://timesofsandiego.com/category/community/feed/"
 
 # --- Interest profile for relevance filtering / ranking ---
 interest_profile:
@@ -42,6 +49,16 @@ interest_profile:
     weight: 0.7
   - topic: "San Diego events and community news"
     weight: 0.65
+  - topic: "Pacific Beach and Mission Beach community news"
+    weight: 0.8
+  - topic: "San Diego coastal resilience, sea-level rise, and beach erosion"
+    weight: 0.7
+  - topic: "Mission Bay and Crown Point park development"
+    weight: 0.65
+  - topic: "Beach community events, festivals, and local happenings"
+    weight: 0.7
+  - topic: "San Diego beaches and bays access, parking, and regulations"
+    weight: 0.6
 
 # --- Domain framing for LLM prompts ---
 briefing_profile:
@@ -49,25 +66,84 @@ briefing_profile:
   audience: "a San Diego resident and investor tracking local opportunities and regulatory changes"
   landscape: "the San Diego and California news, real estate, and public policy landscape"
 
-# --- News search queries (Brave Search API) ---
-news_queries:
-  - "San Diego city council decisions zoning permits"
-  - "San Diego housing development regulations changes"
-  - "San Diego business investment opportunities"
-  - "California state legislation housing property"
-  - "California new laws regulations real estate"
-  - "San Diego public transit infrastructure development"
-  - "San Diego environmental coastal commission"
-  - "San Diego downtown redevelopment commercial real estate"
-  - "San Diego flood insurance fire safety regulations"
-  - "California tax changes small business property"
+# --- News search queries (Brave Search API) as an interest taxonomy DAG ---
+# Root queries fire every run as a baseline; leaf queries are selected per-run
+# (up to max_dynamic_queries) based on signal from yesterday's briefing and
+# today's blogs. See scripts/interest_graph.py.
+interest_graph:
+  max_dynamic_queries: 3
+  roots:
+    - id: "housing"
+      query: "San Diego housing zoning development transit"
+      children:
+        - id: "zoning"
+          query: "San Diego city council decisions zoning permits"
+        - id: "housing_dev"
+          query: "San Diego housing development regulations changes"
+        - id: "downtown"
+          query: "San Diego downtown redevelopment commercial real estate"
+        - id: "transit"
+          query: "San Diego public transit infrastructure development"
+    - id: "ca_regulation"
+      query: "California legislation regulation housing real estate tax"
+      children:
+        - id: "state_housing"
+          query: "California state legislation housing property"
+        - id: "new_laws"
+          query: "California new laws regulations real estate"
+        - id: "tax"
+          query: "California tax changes small business property"
+    - id: "coast_env"
+      query: "San Diego coastal environment flood fire erosion"
+      children:
+        - id: "coastal_commission"
+          query: "San Diego environmental coastal commission"
+        - id: "flood_fire"
+          query: "San Diego flood insurance fire safety regulations"
+        - id: "erosion"
+          query: "San Diego coastal erosion sea level rise"
+    - id: "investment"
+      query: "San Diego business investment redevelopment"
+      children:
+        - id: "business_investment"
+          query: "San Diego business investment opportunities"
+    - id: "beach_neighborhood"
+      query: "Pacific Beach Mission Beach events park beach"
+      children:
+        - id: "pb_mb_news"
+          query: "Pacific Beach Mission Beach community news"
+        - id: "mission_bay"
+          query: "Mission Bay Park development Crown Point"
+        - id: "beach_access"
+          query: "San Diego beach parking access regulations"
 
 # --- Section layout (no papers, no stocks, no defense features) ---
-section_order: ["news", "blogs"]
+# happenings renders first, right below the Executive Summary.
+section_order: ["happenings", "news", "blogs"]
+
+# --- Upcoming happenings (Pacific Beach / Mission Beach / Crown Point / Kate Sessions) ---
+# Dedicated Brave search for neighborhood events. Uses a wider freshness window
+# than the main news ("pw" = past week) so event announcements published several
+# days ahead are caught.
+#
+# happenings_fetch_weekday: fetch fresh happenings only on this weekday
+# (0=Mon ... 6=Sun); on other days the previous fetch is reused from state so
+# we only hit Brave for events once a week.
+happenings_fetch_weekday: 5
+happenings_queries:
+  - "Pacific Beach San Diego events upcoming"
+  - "Pacific Beach San Diego concerts festivals"
+  - "Mission Beach San Diego upcoming events"
+  - "Crown Point Mission Bay Park events San Diego"
+  - "Kate Sessions park events San Diego"
+  - "Pacific Beach Town Council community meeting"
+max_happenings: 6
+happenings_freshness: "pw"
 
 # --- Custom section headings ---
 section_headings:
   executive_summary: "Executive Summary"
+  happenings: "Pacific Beach Area — Upcoming Happenings"
   news: "San Diego / California News"
   blogs: "Local Sources & Analysis"
   errors: "Errors"
@@ -167,7 +243,7 @@ openrouter:
     light: ["openrouter/auto"]
   max_calls_per_run: 50
   timeout: 120
-  max_tokens: 2048
+  max_tokens: 4096
   temperature: 0.3
   pricing:
     input_per_million: 0.25

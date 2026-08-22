@@ -29,6 +29,11 @@ DEFAULT_MODELS = {
     "light": "opencode/deepseek-v4-flash-free",
 }
 
+# Non-reasoning model to swap in when reasoning_enabled=False.
+_NON_REASONING_SWAPS = {
+    "opencode-go/deepseek-v4-pro": "opencode-go/deepseek-v4-flash",
+}
+
 # Backup models tried in order if the primary model for a tier fails
 # (non-zero exit, empty response, or timeout).
 DEFAULT_FALLBACK_MODELS = {
@@ -131,6 +136,7 @@ class OpencodeClient(BaseLLMClient):
         prompt: str,
         tier: str = "medium",
         system_prompt: Optional[str] = None,
+        reasoning_enabled: bool = True,
         **kwargs: Any,
     ) -> Optional[str]:
         if kwargs:
@@ -155,6 +161,8 @@ class OpencodeClient(BaseLLMClient):
             prompt: The user prompt.
             tier: Model tier ("light", "medium", "heavy") — maps to model ID.
             system_prompt: Optional system-level instructions (prepended).
+            reasoning_enabled: When False, swaps reasoning models for their
+                non-reasoning equivalents so chain-of-thought cannot leak.
 
         Returns:
             Response text, or None on failure.
@@ -174,6 +182,14 @@ class OpencodeClient(BaseLLMClient):
         chain = [primary] + [
             m for m in self.fallback_models.get(tier, []) if m != primary
         ]
+
+        if not reasoning_enabled:
+            chain = [_NON_REASONING_SWAPS.get(m, m) for m in chain]
+            if chain[0] != primary:
+                logger.info(
+                    "Opencode reasoning disabled — swapped tier=%s: %s -> %s",
+                    tier, primary, chain[0],
+                )
 
         if system_prompt:
             full_prompt = f"{system_prompt}\n\nUser Request: {prompt}"

@@ -28,6 +28,12 @@ LOCAL_NEWS_CONFIG = {
         "San Diego business investment opportunities",
         "California state legislation housing property",
     ],
+    "happenings_queries": [
+        "Pacific Beach San Diego events upcoming",
+        "Mission Beach San Diego upcoming events",
+    ],
+    "max_happenings": 4,
+    "happenings_freshness": "pw",
     "interest_profile": [
         {"topic": "San Diego zoning changes", "weight": 1.0},
         {"topic": "California housing policy", "weight": 0.95},
@@ -41,9 +47,10 @@ LOCAL_NEWS_CONFIG = {
     "briefing_title": "San Diego Local News Briefing",
     "file_naming": "Local-Briefing-{yyyy}.{mm}.{dd}",
     "output_dir": "briefings/local",
-    "section_order": ["news", "blogs"],
+    "section_order": ["happenings", "news", "blogs"],
     "section_headings": {
         "executive_summary": "Executive Summary",
+        "happenings": "Pacific Beach Area — Upcoming Happenings",
         "news": "San Diego / California News",
         "blogs": "Local Sources & Analysis",
         "errors": "Errors",
@@ -202,7 +209,7 @@ class TestConfigDrivenDefaults:
         assert runner.section_order == ["stocks", "news", "top_papers", "blogs"]
 
     def test_section_order_override_local(self, local_runner):
-        assert local_runner.section_order == ["news", "blogs"]
+        assert local_runner.section_order == ["happenings", "news", "blogs"]
 
     def test_feature_gates_default_true(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -373,7 +380,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=blogs), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=news):
+             patch.object(local_runner, "run_news_aggregation", return_value=news), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             rc = local_runner.run()
         assert rc in (0, 1)
         output_dir = tmp_path / "briefings" / "local"
@@ -386,7 +394,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=[]), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=[]):
+             patch.object(local_runner, "run_news_aggregation", return_value=[]), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             assert local_runner.run() == 2
 
     def test_local_run_with_blogs_only(self, local_runner, tmp_path):
@@ -394,7 +403,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=blogs), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=[]):
+             patch.object(local_runner, "run_news_aggregation", return_value=[]), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             rc = local_runner.run()
         assert rc in (0, 1)
         md_files = list((tmp_path / "briefings" / "local").glob("Local-Briefing-*.md"))
@@ -405,7 +415,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=[]), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=news):
+             patch.object(local_runner, "run_news_aggregation", return_value=news), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             rc = local_runner.run()
         assert rc in (0, 1)
         md_files = list((tmp_path / "briefings" / "local").glob("Local-Briefing-*.md"))
@@ -421,7 +432,7 @@ class TestLocalRunOrchestration:
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
         runner.intelligence.expand_topics.side_effect = lambda t: t
-        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q: q
+        runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q, today_blogs=None: q
         runner.intelligence.filter_papers_by_relevance.side_effect = lambda p, ip: p
         runner.intelligence.rank_and_summarize_news.side_effect = lambda n, t: n
         runner.intelligence.rank_and_summarize_blogs.side_effect = lambda b, t: b
@@ -444,7 +455,8 @@ class TestLocalRunOrchestration:
         with patch.object(runner, "run_arxiv_scan", return_value=[]), \
              patch.object(runner, "run_blog_scan", return_value=_sample_blogs(4)), \
              patch.object(runner, "run_stock_fetch", return_value=[]), \
-             patch.object(runner, "run_news_aggregation", return_value=_sample_news(5)):
+             patch.object(runner, "run_news_aggregation", return_value=_sample_news(5)), \
+             patch.object(runner, "run_happenings_aggregation", return_value=[]):
             rc = runner.run()
 
         assert rc in (0, 1)
@@ -469,7 +481,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=blogs), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=news):
+             patch.object(local_runner, "run_news_aggregation", return_value=news), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             local_runner.run()
         state_path = tmp_path / ".local-state.json"
         assert state_path.exists()
@@ -482,7 +495,8 @@ class TestLocalRunOrchestration:
         with patch.object(local_runner, "run_arxiv_scan", return_value=[]), \
              patch.object(local_runner, "run_blog_scan", return_value=blogs), \
              patch.object(local_runner, "run_stock_fetch", return_value=[]), \
-             patch.object(local_runner, "run_news_aggregation", return_value=news):
+             patch.object(local_runner, "run_news_aggregation", return_value=news), \
+             patch.object(local_runner, "run_happenings_aggregation", return_value=[]):
             local_runner.run()
         assert snapshot_dir.exists()
         brave_files = list(snapshot_dir.rglob("brave_news.json"))
@@ -493,7 +507,7 @@ class TestLocalRunOrchestration:
         main_runner.intelligence = MagicMock()
         main_runner.intelligence.available = True
         main_runner.intelligence.expand_topics.side_effect = lambda t: t
-        main_runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q: q
+        main_runner.intelligence.generate_dynamic_queries.side_effect = lambda s, q, today_blogs=None: q
         main_runner.intelligence.filter_papers_by_relevance.side_effect = lambda p, ip: p
         main_runner.intelligence.rank_and_summarize_news.side_effect = lambda n, t: n
         main_runner.intelligence.rank_and_summarize_blogs.side_effect = lambda b, t: b

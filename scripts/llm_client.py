@@ -25,6 +25,7 @@ class BaseLLMClient(ABC):
         prompt: str,
         tier: str = "medium",
         system_prompt: Optional[str] = None,
+        reasoning_enabled: bool = True,
     ) -> Optional[str]:
         """
         Send a prompt to the LLM and return the response text.
@@ -33,6 +34,9 @@ class BaseLLMClient(ABC):
             prompt: The user prompt.
             tier: Model tier ("light", "medium", "heavy").
             system_prompt: Optional system-level instructions.
+            reasoning_enabled: When False, disables chain-of-thought / reasoning
+                tokens for models that support it (e.g. DeepSeek V4 Pro).
+                Non-reasoning backends ignore this flag.
 
         Returns:
             Response string, or None on failure.

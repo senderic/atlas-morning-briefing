@@ -580,6 +580,7 @@ class GeminiCLIClient(BaseLLMClient):
         tier: str = "medium",
         system_prompt: Optional[str] = None,
         allow_fallback: bool = True,
+        reasoning_enabled: bool = True,
     ) -> Optional[str]:
         """
         Invoke a Gemini model via CLI with recursive tier fallback.

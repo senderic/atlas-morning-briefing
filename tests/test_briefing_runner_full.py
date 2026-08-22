@@ -113,27 +113,30 @@ class TestCleanSummary:
 
 class TestDedupAgainstPrevious:
     def test_no_state_returns_unchanged(self):
-        p, b, n = BriefingRunner._dedup_against_previous(
+        p, b, n, h = BriefingRunner._dedup_against_previous(
             papers=[{"title": "A"}], blogs=[{"title": "B"}], news=[{"title": "C"}],
             previous_state={},
         )
-        assert len(p) == 1 and len(b) == 1 and len(n) == 1
+        assert len(p) == 1 and len(b) == 1 and len(n) == 1 and h == []
 
     def test_filters_seen_titles(self):
         state = {
             "top_paper_titles": ["paper a"],
             "top_blog_titles": ["blog b"],
             "top_news_titles": ["news c"],
+            "top_happenings_titles": ["event e"],
         }
-        p, b, n = BriefingRunner._dedup_against_previous(
+        p, b, n, h = BriefingRunner._dedup_against_previous(
             papers=[{"title": "Paper A"}, {"title": "Paper X"}],
             blogs=[{"title": "Blog B"}],
             news=[{"title": "News C"}, {"title": "News Y"}],
+            happenings=[{"title": "Event E"}, {"title": "Event Z"}],
             previous_state=state,
         )
         assert [x["title"] for x in p] == ["Paper X"]
         assert b == []
         assert [x["title"] for x in n] == ["News Y"]
+        assert [x["title"] for x in h] == ["Event Z"]
 
 
 # ---------- state ----------

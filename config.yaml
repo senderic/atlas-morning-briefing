@@ -145,30 +145,77 @@ stocks:
   - VGT
   - VRT
 
-# News search queries (Brave Search API)
-news_queries:
-  - "Department of Defense AI contracts and prototypes"
-  - "Defense tech startup AI innovation SBIR"
-  - "DIU Defense Innovation Unit AI projects"
-  - "AI model benchmarks Claude vs Gemini vs GPT-4"
-  - "AI foundation model market share shifts"
-  - "Palantir AIP defense implementation"
-  - "Anduril Lattice AI updates"
-  - "Lockheed Martin AI development practices"
-  - "Northrop Grumman AI systems"
-  - "DARPA AI research breakthroughs"
-  - "Shield AI autonomous flight updates"
-  - "Epirus AI electronic warfare"
-  - "NVIDIA GPU based AI systems for off-grid operations"
-  - "Local LLM deployment on single-node workstations for specialized tasks"
-  - "tactical edge AI hardware and offline model execution"
-  - "Lunar mining and resource extraction commercial projects"
-  - "Asteroid mining startup funding and technology"
-  - "Orbital data centers and space-based AI infrastructure"
-  - "SpaceX Starshield and military space applications"
-  - "Intuitive Machines lunar infrastructure updates"
-  - "Rocket Lab orbital services and satellite manufacturing"
-  - "NASA Artemis program commercial partnerships"
+# News search queries (Brave Search API) as an interest taxonomy DAG.
+# Root queries fire every run as a baseline; leaf queries are selected per-run
+# (up to max_dynamic_queries) based on signal from yesterday's briefing and
+# today's blogs. See scripts/interest_graph.py.
+interest_graph:
+  max_dynamic_queries: 4
+  roots:
+    - id: "defense_contracts"
+      query: "Defense AI contracts programs DoD DIU DARPA SBIR"
+      children:
+        - id: "dod_contracts"
+          query: "Department of Defense AI contracts and prototypes"
+        - id: "diu"
+          query: "DIU Defense Innovation Unit AI projects"
+        - id: "darpa"
+          query: "DARPA AI research breakthroughs"
+        - id: "sbir"
+          query: "Defense tech startup AI innovation SBIR"
+    - id: "defense_contractors"
+      query: "Defense contractor AI systems electronic warfare"
+      children:
+        - id: "palantir"
+          query: "Palantir AIP defense implementation"
+          priority: 1.2
+        - id: "anduril"
+          query: "Anduril Lattice AI updates"
+        - id: "lockheed"
+          query: "Lockheed Martin AI development practices"
+        - id: "northrop"
+          query: "Northrop Grumman AI systems"
+        - id: "shield_ai"
+          query: "Shield AI autonomous flight updates"
+        - id: "epirus"
+          query: "Epirus AI electronic warfare"
+    - id: "ai_models"
+      query: "AI foundation model benchmarks market share"
+      children:
+        - id: "model_benchmarks"
+          query: "AI model benchmarks Claude vs Gemini vs GPT-4"
+        - id: "market_share"
+          query: "AI foundation model market share shifts"
+    - id: "edge_ai"
+      query: "Edge AI off-grid local inference tactical hardware"
+      children:
+        - id: "nvidia_offgrid"
+          query: "NVIDIA GPU based AI systems for off-grid operations"
+          priority: 1.2
+        - id: "local_llm"
+          query: "Local LLM deployment on single-node workstations for specialized tasks"
+        - id: "tactical_edge"
+          query: "tactical edge AI hardware and offline model execution"
+    - id: "commercial_space"
+      query: "Commercial space lunar asteroid launch infrastructure"
+      children:
+        - id: "lunar_mining"
+          query: "Lunar mining and resource extraction commercial projects"
+        - id: "asteroid_mining"
+          query: "Asteroid mining startup funding and technology"
+        - id: "intuitive_machines"
+          query: "Intuitive Machines lunar infrastructure updates"
+        - id: "rocket_lab"
+          query: "Rocket Lab orbital services and satellite manufacturing"
+        - id: "artemis"
+          query: "NASA Artemis program commercial partnerships"
+    - id: "military_space"
+      query: "Military space Starshield orbital data centers"
+      children:
+        - id: "starshield"
+          query: "SpaceX Starshield and military space applications"
+        - id: "orbital_dc"
+          query: "Orbital data centers and space-based AI infrastructure"
 
 # Paper scoring weights
 paper_scoring:
@@ -296,7 +343,7 @@ openrouter:
     light: ["openrouter/auto"]
   max_calls_per_run: 50
   timeout: 120
-  max_tokens: 2048
+  max_tokens: 4096
   temperature: 0.3
   pricing:
     input_per_million: 0.25   # $0.25 per 1M input tokens

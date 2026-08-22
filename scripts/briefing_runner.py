@@ -81,6 +81,8 @@ class BriefingRunner:
         self.feature_agent_cost_optimization = features.get("agent_cost_optimization", True)
         self.feature_weekly_deep_dive = features.get("weekly_deep_dive", True)
         self._headings = config.get("section_headings", {})
+        self._happenings_cache: List[Dict[str, Any]] = []
+        self._happenings_cache_date: Optional[str] = None
         self._briefing_title = self._format_filename(datetime.now())
         self.status = {
             "timestamp": datetime.now().isoformat(),
@@ -88,6 +90,7 @@ class BriefingRunner:
             "blogs_found": 0,
             "stocks_fetched": 0,
             "news_found": 0,
+            "happenings_found": 0,
             "intelligence_enabled": False,
             "errors": [],
             "pdf_generated": False,
@@ -277,6 +280,83 @@ class BriefingRunner:
             self.errors.append(f"News aggregation: {e}")
             return []
 
+    def run_happenings_aggregation(self) -> List[Dict[str, Any]]:
+        """
+        Run neighborhood happenings aggregation (Brave Search).
+
+        Uses a dedicated query list and a wider freshness window than the main
+        news so event announcements published several days ahead are caught.
+
+        Returns:
+            List of happening articles.
+        """
+        try:
+            logger.info("=== Aggregating Neighborhood Happenings ===")
+            api_key = os.environ.get("BRAVE_API_KEY")
+            queries = self.config.get("happenings_queries", [])
+            max_happenings = self.config.get("max_happenings", 6)
+            freshness = self.config.get("happenings_freshness", "pw")
+
+            if not api_key:
+                logger.warning("BRAVE_API_KEY not set, skipping happenings")
+                return []
+
+            if not queries:
+                logger.warning("No happenings_queries configured, skipping")
+                return []
+
+            aggregator = NewsAggregator(
+                api_key=api_key,
+                queries=queries,
+                max_results=max_happenings,
+                freshness=freshness,
+            )
+            articles = aggregator.aggregate_all_queries()
+            self.status["happenings_found"] = len(articles)
+            logger.info(f"Found {len(articles)} happening articles")
+            return articles
+
+        except Exception as e:
+            logger.error(f"Happenings aggregation failed: {e}")
+            self.errors.append(f"Happenings aggregation: {e}")
+            return []
+
+    def _load_or_fetch_happenings(
+        self, previous_state: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        today = datetime.now()
+        fetch_weekday = self.config.get("happenings_fetch_weekday")
+        should_fetch = fetch_weekday is None or today.weekday() == int(fetch_weekday)
+        if should_fetch:
+            logger.info(
+                "Fetching fresh happenings (fetch weekday=%s, today=%s)",
+                fetch_weekday, today.weekday(),
+            )
+            fetched = self.run_happenings_aggregation()
+            if fetched:
+                self._happenings_cache = list(fetched)
+                self._happenings_cache_date = today.strftime("%Y-%m-%d")
+                logger.info(
+                    "Cached %d raw happenings for the coming week",
+                    len(fetched),
+                )
+                return fetched
+            logger.warning("Happenings fetch returned empty, falling back to cache")
+        cached = previous_state.get("cached_happenings", [])
+        if cached:
+            cache_date = previous_state.get("cached_happenings_date", "unknown")
+            logger.info(
+                "Reusing %d cached happenings from %s (fetch weekday=%s, today=%s)",
+                len(cached), cache_date,
+                fetch_weekday, today.weekday(),
+            )
+            self._happenings_cache = list(cached)
+            self._happenings_cache_date = cache_date
+            self.status["happenings_found"] = len(cached)
+            return list(cached)
+        logger.info("No happenings cache available and today is not fetch day")
+        return []
+
     def score_papers(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Score and rank papers."""
         try:
@@ -357,19 +437,37 @@ class BriefingRunner:
         return deduped_news, blogs
 
     @staticmethod
+    def deduplicate_happenings(
+        happenings: List[Dict[str, Any]],
+        news: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Drop happenings whose title already appears in the news section."""
+        news_titles = set(n.get("title", "").lower().strip() for n in news if n.get("title"))
+        deduped = [
+            h for h in happenings
+            if h.get("title", "").lower().strip() not in news_titles
+        ]
+        removed = len(happenings) - len(deduped)
+        if removed:
+            logger.info(f"Dedup: removed {removed} happenings duplicated in news")
+        return deduped
+
+    @staticmethod
     def _dedup_against_previous(
         papers: List[Dict[str, Any]],
         blogs: List[Dict[str, Any]],
         news: List[Dict[str, Any]],
         previous_state: Dict[str, Any],
+        happenings: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple:
-        """Remove papers, blogs, and news that appeared in yesterday's briefing."""
+        """Remove papers, blogs, news, and happenings that appeared in yesterday's briefing."""
         if not previous_state:
-            return papers, blogs, news
+            return papers, blogs, news, (happenings or [])
 
         prev_papers = set(t.lower() for t in previous_state.get("top_paper_titles", []))
         prev_blogs = set(t.lower() for t in previous_state.get("top_blog_titles", []))
         prev_news = set(t.lower() for t in previous_state.get("top_news_titles", []))
+        prev_happenings = set(t.lower() for t in previous_state.get("top_happenings_titles", []))
 
         def _filter(items, prev_titles):
             before = len(items)
@@ -379,7 +477,12 @@ class BriefingRunner:
                 logger.info(f"Cross-day dedup: removed {removed} items seen yesterday")
             return filtered
 
-        return _filter(papers, prev_papers), _filter(blogs, prev_blogs), _filter(news, prev_news)
+        return (
+            _filter(papers, prev_papers),
+            _filter(blogs, prev_blogs),
+            _filter(news, prev_news),
+            _filter(happenings or [], prev_happenings),
+        )
 
     def deduplicate_similar_papers(
         self, papers: List[Dict[str, Any]]
@@ -427,6 +530,7 @@ class BriefingRunner:
         weekly_deep_dive: str = "",
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
+        happenings: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Generate markdown briefing from all data.
@@ -442,6 +546,7 @@ class BriefingRunner:
             weekly_deep_dive: Optional weekly deep dive section (Saturday only).
             start_time: Optional briefing start unix timestamp.
             end_time: Optional briefing end unix timestamp.
+            happenings: Optional neighborhood happenings (Pacific Beach area).
 
         Returns:
             Markdown string.
@@ -482,8 +587,34 @@ class BriefingRunner:
                     continue
                 cleaned.append(line)
             intro = "\n".join(cleaned).strip()
-            md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
-            md.append(f"{intro}\n\n")
+
+            # Guard: detect leaked reasoning / verification scaffolding.
+            # Reasoning models can emit their grounding-verification trace
+            # as visible output (e.g. "Strict Grounding Verification**:" or
+            # "Check verbatim entities/facts:" bullet lists).  If the cleaned
+            # intro contains those telltales — drop it and fall back to the
+            # unavailable placeholder.
+            _intro_lower = intro.lower()
+            _cot_markers = (
+                "strict grounding",
+                "check verbatim",
+                "is verbatim",
+                "entities/facts",
+            )
+            _looks_like_cot = any(m in _intro_lower for m in _cot_markers)
+            if _looks_like_cot:
+                logger.warning(
+                    "Editorial intro looks like leaked CoT scaffolding; "
+                    "falling back to placeholder."
+                )
+                intro = ""
+
+            if intro:
+                md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
+                md.append(f"{intro}\n\n")
+            else:
+                md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
+                md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
         else:
             md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
             md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
@@ -514,6 +645,7 @@ class BriefingRunner:
             "blogs": blogs,
             "top_papers": top_papers,
             "papers": papers,
+            "happenings": happenings or [],
         }
         logger.debug(
             "Generating markdown: section_order=%s headings_keys=%s "
@@ -538,6 +670,8 @@ class BriefingRunner:
                 md.append(self._render_top_papers(data))
             elif section == "papers":
                 md.append(self._render_papers(data))
+            elif section == "happenings":
+                md.append(self._render_happenings(data))
 
         # Feature 2: Weekly Deep Dive section (Saturday only)
         if self.feature_weekly_deep_dive and weekly_deep_dive:
@@ -679,6 +813,29 @@ class BriefingRunner:
             if author_blurb:
                 md.append(f"\n#### Source Information\n{author_blurb}\n")
 
+            md.append("\n")
+        return "".join(md)
+
+    def _render_happenings(self, happenings: List[Dict[str, Any]]) -> str:
+        """Render neighborhood happenings section (upcoming events near Pacific Beach)."""
+        max_happenings = self.config.get("max_happenings", 6)
+        items = happenings[:max_happenings]
+        if not items:
+            return ""
+        md = [f"## {self._headings.get('happenings', 'Pacific Beach Area — Upcoming Happenings')}\n\n"]
+        for article in items:
+            article_title = article.get("title", "")
+            url = article.get("url", "")
+            summary = self._clean_summary(
+                article.get("brief_summary", ""), article_title
+            )
+
+            if url:
+                md.append(f"**[{article_title}]({url})**\n")
+            else:
+                md.append(f"**{article_title}**\n")
+            if summary:
+                md.append(f"{summary}\n")
             md.append("\n")
         return "".join(md)
 
@@ -1012,6 +1169,9 @@ class BriefingRunner:
         emerging_themes: List[str],
         trending_topics: Optional[Dict[str, Any]] = None,
         weekly_items: Optional[List[Dict[str, Any]]] = None,
+        happenings: Optional[List[Dict[str, Any]]] = None,
+        cached_happenings: Optional[List[Dict[str, Any]]] = None,
+        cached_happenings_date: Optional[str] = None,
     ) -> None:
         """Save current briefing state for next run's trend tracking and dedup."""
         state = {
@@ -1019,12 +1179,16 @@ class BriefingRunner:
             "top_paper_titles": [p.get("title", "") for p in papers[:10]],
             "top_blog_titles": [b.get("title", "") for b in blogs[:10]],
             "top_news_titles": [n.get("title", "") for n in news[:10]],
+            "top_happenings_titles": [h.get("title", "") for h in (happenings or [])[:10]],
             "stock_closes": {
                 s.get("symbol", ""): s.get("current_price", 0)
                 for s in stocks if "error" not in s
             },
             "emerging_themes": emerging_themes,
         }
+        if cached_happenings:
+            state["cached_happenings"] = cached_happenings
+            state["cached_happenings_date"] = cached_happenings_date or datetime.now().strftime("%Y-%m-%d")
         # Feature 1: Save trending topics
         if trending_topics is not None:
             state["trending_topics"] = trending_topics
@@ -1068,12 +1232,16 @@ class BriefingRunner:
             news = self._load_snapshot(
                 f"snapshots/{self.use_snapshots}/brave_news.json"
             )
+            happenings = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/happenings.json"
+            )
             topics = self.config.get("arxiv_topics", [])
             news_queries = self.config.get("news_queries", [])
             self.status["papers_found"] = len(papers)
             self.status["blogs_found"] = len(blogs)
             self.status["stocks_fetched"] = len(stocks)
             self.status["news_found"] = len(news)
+            self.status["happenings_found"] = len(happenings)
         else:
             # --- Topic expansion (intelligence layer) ---
             topics = self.config.get("arxiv_topics", [])
@@ -1094,32 +1262,39 @@ class BriefingRunner:
                 blogs = fut_blogs.result()
                 stocks = fut_stocks.result()
 
-            # --- Generate dynamic news queries (intelligence layer) ---
+            # --- Generate news queries (interest graph, or static + dynamic) ---
             news_queries = self.config.get("news_queries", [])
-            if self.intelligence.available:
-                logger.info("=== Intelligence Layer: Generating Dynamic Queries ===")
+            if self.intelligence.available or self.config.get("interest_graph"):
+                logger.info("=== Generating News Queries ===")
                 news_queries = self.intelligence.generate_dynamic_queries(
-                    previous_state, news_queries
+                    previous_state, news_queries, today_blogs=blogs
                 )
 
             news = self.run_news_aggregation(queries=news_queries)
+            happenings = self._load_or_fetch_happenings(previous_state)
 
             # --- Save raw data snapshots ---
             logger.info("=== Saving raw data snapshots ===")
             self.snapshot_manager.save_stocks(stocks)
             self.snapshot_manager.save_news(news)
+            self.snapshot_manager.save_happenings(happenings)
             self.snapshot_manager.save_blogs(blogs)
             self.snapshot_manager.save_papers(papers)
             self.snapshot_manager.save_manifest()
 
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
+        happenings = self.deduplicate_happenings(happenings, news)
 
         # --- Deduplicate similar papers by title ---
         papers = self.deduplicate_similar_papers(papers)
 
         # --- Cross-day deduplication (skip items from yesterday) ---
-        papers, blogs, news = self._dedup_against_previous(
+        # Note: happenings cross-day dedup is skipped because they are
+        # cached weekly (freshness="pw" already covers the week); we
+        # intentionally keep them across days so the same upcoming-events
+        # list is referenced Monday through Saturday.
+        papers, blogs, news, _ = self._dedup_against_previous(
             papers, blogs, news, previous_state
         )
 
@@ -1136,16 +1311,24 @@ class BriefingRunner:
                 logger.info("=== Intelligence Layer: Stage 1 Relevance Filtering ===")
                 papers = self.intelligence.filter_papers_by_relevance(papers, interest_profile)
 
-            # --- Parallel batch 1: papers, news, blogs are independent ---
-            logger.info("=== Intelligence Layer: Parallel enrichment (papers/news/blogs) ===")
+            # --- Parallel batch 1: papers, news, blogs, happenings are independent ---
+            logger.info("=== Intelligence Layer: Parallel enrichment (papers/news/blogs/happenings) ===")
             with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_papers = pool.submit(self._enrich_papers, papers, topics)
                 fut_news = pool.submit(self.intelligence.rank_and_summarize_news, news, topics)
                 fut_blogs = pool.submit(self.intelligence.rank_and_summarize_blogs, blogs, topics)
+                if happenings:
+                    fut_happenings = pool.submit(
+                        self.intelligence.rank_and_summarize_happenings,
+                        happenings,
+                        self.config.get("max_happenings", 6),
+                    )
 
                 papers = fut_papers.result()
                 news = fut_news.result()
                 blogs = fut_blogs.result()
+                if happenings:
+                    happenings = fut_happenings.result()
 
             # --- Parallel batch 2: stocks + themes (both depend on news) ---
             with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
@@ -1259,7 +1442,7 @@ class BriefingRunner:
                 weekly_items = []
 
         # --- Check if we have any data ---
-        has_data = any([papers, blogs, stocks, news])
+        has_data = any([papers, blogs, stocks, news, happenings])
         if not has_data:
             logger.error("No data collected from any source")
             self.status["elapsed_seconds"] = round(time.time() - start_time, 1)
@@ -1279,6 +1462,7 @@ class BriefingRunner:
             weekly_deep_dive=weekly_deep_dive,
             start_time=start_time,
             end_time=time.time(),
+            happenings=happenings,
         )
 
         # --- Save markdown ---
@@ -1311,10 +1495,18 @@ class BriefingRunner:
 
         # --- Save state for cross-day tracking ---
         # Save updated trending_topics and weekly_items from current run
+        cached_happenings = self._happenings_cache
+        cached_happenings_date = self._happenings_cache_date
+        if not cached_happenings:
+            cached_happenings = previous_state.get("cached_happenings", [])
+            cached_happenings_date = previous_state.get("cached_happenings_date")
         self._save_state(
             top_papers, blogs, news, stocks, emerging_themes,
             trending_topics=previous_state.get("trending_topics", {}),
-            weekly_items=weekly_items  # Use updated weekly_items from this run
+            weekly_items=weekly_items,  # Use updated weekly_items from this run
+            happenings=happenings,
+            cached_happenings=cached_happenings,
+            cached_happenings_date=cached_happenings_date,
         )
 
         # --- Finalize ---

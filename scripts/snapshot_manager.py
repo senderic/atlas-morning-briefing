@@ -43,6 +43,9 @@ class SnapshotManager:
     def save_news(self, news: List[Dict[str, Any]]):
         self._write("brave_news.json", news)
 
+    def save_happenings(self, happenings: List[Dict[str, Any]]):
+        self._write("happenings.json", happenings)
+
     def save_blogs(self, blogs: List[Dict[str, Any]]):
         self._write("rss_feeds.json", blogs)
 

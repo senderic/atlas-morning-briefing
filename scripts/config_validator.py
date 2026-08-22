@@ -15,6 +15,55 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _validate_interest_graph(
+    graph: Dict[str, Any], errors: List[str], warnings: List[str]
+) -> None:
+    """Validate the interest_graph taxonomy DAG structure."""
+    max_dynamic = graph.get("max_dynamic_queries")
+    if max_dynamic is not None and (
+        not isinstance(max_dynamic, int) or max_dynamic < 1 or max_dynamic > 50
+    ):
+        errors.append(
+            f"'interest_graph.max_dynamic_queries' must be an integer (1-50), "
+            f"got {max_dynamic!r}"
+        )
+
+    roots = graph.get("roots")
+    if not isinstance(roots, list) or not roots:
+        errors.append("'interest_graph.roots' must be a non-empty list")
+        return
+
+    seen_ids = set()
+
+    def _validate_node(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            errors.append(f"{path} must be a dict")
+            return
+        node_id = node.get("id")
+        query = node.get("query")
+        if not isinstance(node_id, str) or not node_id:
+            errors.append(f"{path}.id must be a non-empty string")
+        elif node_id in seen_ids:
+            errors.append(f"duplicate interest_graph node id: '{node_id}'")
+        else:
+            seen_ids.add(node_id)
+        if not isinstance(query, str) or not query:
+            errors.append(f"{path}.query must be a non-empty string")
+        priority = node.get("priority")
+        if priority is not None and not isinstance(priority, (int, float)):
+            errors.append(f"{path}.priority must be a number")
+        children = node.get("children")
+        if children is not None:
+            if not isinstance(children, list):
+                errors.append(f"{path}.children must be a list")
+            else:
+                for i, child in enumerate(children):
+                    _validate_node(child, f"{path}.children[{i}]")
+
+    for i, root in enumerate(roots):
+        _validate_node(root, f"interest_graph.roots[{i}]")
+
+
 def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
     Validate configuration dictionary.
@@ -79,6 +128,38 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if queries is not None:
         if not isinstance(queries, list):
             errors.append("'news_queries' must be a list of strings")
+
+    # --- Interest graph (taxonomy DAG) ---
+    interest_graph = config.get("interest_graph")
+    if interest_graph is not None:
+        if not isinstance(interest_graph, dict):
+            errors.append("'interest_graph' must be a mapping")
+        else:
+            _validate_interest_graph(interest_graph, errors, warnings)
+
+    # --- Happenings queries ---
+    happenings_queries = config.get("happenings_queries")
+    if happenings_queries is not None:
+        if not isinstance(happenings_queries, list):
+            errors.append("'happenings_queries' must be a list of strings")
+        elif not all(isinstance(q, str) for q in happenings_queries):
+            errors.append("'happenings_queries' must contain only strings")
+
+    happenings_freshness = config.get("happenings_freshness")
+    if happenings_freshness is not None:
+        allowed_freshness = {"pd", "pw", "pm", "py"}
+        if not isinstance(happenings_freshness, str) or happenings_freshness not in allowed_freshness:
+            errors.append(
+                f"'happenings_freshness' must be one of {sorted(allowed_freshness)}, "
+                f"got '{happenings_freshness}'"
+            )
+
+    max_happenings = config.get("max_happenings")
+    if max_happenings is not None:
+        if not isinstance(max_happenings, int):
+            errors.append(f"'max_happenings' must be an integer, got {type(max_happenings).__name__}")
+        elif max_happenings < 1 or max_happenings > 50:
+            warnings.append(f"'max_happenings' value {max_happenings} is outside recommended range (1-50)")
 
     # --- Kindle/email ---
     kindle_email = config.get("kindle_email", "")
@@ -189,7 +270,7 @@ def check_environment(config: Dict[str, Any], dry_run: bool = False) -> List[str
             )
 
     # News requires Brave key
-    if config.get("news_queries"):
+    if config.get("news_queries") or config.get("interest_graph"):
         if not os.environ.get("BRAVE_API_KEY"):
             warnings.append(
                 "BRAVE_API_KEY not set -- news aggregation will be skipped"

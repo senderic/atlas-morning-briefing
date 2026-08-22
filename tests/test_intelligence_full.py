@@ -225,6 +225,48 @@ class TestGenerateDynamicQueries:
         assert intel.generate_dynamic_queries(state, ["q"]) == ["q"]
 
 
+class TestGenerateDynamicQueriesGraph:
+    @pytest.fixture
+    def graph_config(self):
+        return {
+            "interest_graph": {
+                "max_dynamic_queries": 2,
+                "roots": [
+                    {
+                        "id": "r1",
+                        "query": "defense ai",
+                        "children": [
+                            {"id": "l1", "query": "Palantir defense"},
+                            {"id": "l2", "query": "Lunar mining"},
+                        ],
+                    },
+                ],
+            },
+        }
+
+    @pytest.fixture
+    def graph_intel(self, mock_client, graph_config):
+        return BriefingIntelligence(mock_client, graph_config)
+
+    def test_returns_roots_and_dig(self, graph_intel):
+        state = {"top_news_titles": ["Palantir defense contract"]}
+        result = graph_intel.generate_dynamic_queries(state, [])
+        assert "defense ai" in result
+        assert "Palantir defense" in result
+
+    def test_no_signal_returns_roots(self, graph_intel):
+        assert graph_intel.generate_dynamic_queries({}, []) == ["defense ai"]
+
+    def test_ignores_static_queries(self, graph_intel):
+        state = {"top_news_titles": ["Palantir defense contract"]}
+        result = graph_intel.generate_dynamic_queries(state, ["some static query"])
+        assert "some static query" not in result
+
+    def test_unavailable_still_returns_roots(self, client_unavailable, graph_config):
+        intel = BriefingIntelligence(client_unavailable, graph_config)
+        assert intel.generate_dynamic_queries({}, []) == ["defense ai"]
+
+
 # ---------- expand_topics ----------
 
 

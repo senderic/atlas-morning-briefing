@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
+from scripts.interest_graph import generate_graph_queries, parse_graph
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -247,21 +248,36 @@ class BriefingIntelligence:
         return filtered_papers if filtered_papers else papers[:30]  # Fallback to top 30 if filtering fails
 
     def generate_dynamic_queries(
-        self, previous_briefing_state: Optional[Dict[str, Any]], static_queries: List[str]
+        self, previous_briefing_state: Optional[Dict[str, Any]], static_queries: List[str],
+        today_blogs: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """
-        Generate dynamic news queries based on yesterday's top stories.
+        Generate dynamic news queries.
 
-        Takes yesterday's top stories from state.json + static queries,
-        then uses Opus to generate 3 additional targeted follow-up queries.
+        If the config defines an ``interest_graph``, delegates to the interest
+        taxonomy engine: root queries fire as a baseline and leaf queries are
+        selected per-run from signal in yesterday's briefing and today's blogs.
+
+        Otherwise (legacy mode), takes yesterday's top stories from state plus
+        static queries and generates a few targeted follow-up queries.
 
         Args:
             previous_briefing_state: Previous briefing state with top stories.
             static_queries: Static queries from config.
+            today_blogs: Fresh blog entries for signal scoring (optional).
 
         Returns:
-            Combined list of static + dynamic queries (total ~13 queries).
+            Combined list of queries to run.
         """
+        graph = parse_graph(self.config)
+        if graph is not None:
+            return generate_graph_queries(
+                graph,
+                previous_briefing_state,
+                today_blogs=today_blogs,
+                llm_client=self.client if self.available else None,
+            )
+
         if not self.available or not previous_briefing_state or not static_queries:
             return static_queries
 
@@ -880,6 +896,95 @@ class BriefingIntelligence:
             fallback.append(a)
         return fallback
 
+    def rank_and_summarize_happenings(
+        self, happenings: List[Dict[str, Any]], max_items: int = 6
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank neighborhood happenings and write concise, date-led summaries.
+
+        Filters the fetched articles down to genuine upcoming events around
+        Pacific Beach / Mission Beach / Crown Point / Kate Sessions Park and
+        writes short blurbs that lead with the date/venue where available.
+
+        Args:
+            happenings: List of event/happening article dictionaries.
+            max_items: Maximum number of happenings to return.
+
+        Returns:
+            Top happenings, ranked and summarized.
+        """
+        if not self.available or not happenings:
+            fallback = []
+            for article in happenings[:max_items]:
+                a = article.copy()
+                a["brief_summary"] = a.get("description", a.get("snippet", ""))
+                fallback.append(a)
+            return fallback
+
+        lines = []
+        for i, article in enumerate(happenings[:20]):
+            title = _sanitize_prompt_input(article.get("title", ""), max_length=300)
+            source = _sanitize_prompt_input(article.get("source", ""), max_length=100)
+            snippet = _sanitize_prompt_input(
+                article.get("description", article.get("snippet", ""))[:250], max_length=300
+            )
+            lines.append(f"[{i+1}] {title} ({source}): {snippet}")
+
+        articles_block = "\n".join(lines)
+        prompt = (
+            "You curate an 'upcoming happenings' section for a resident of "
+            "Pacific Beach, San Diego (near Crown Point and Kate Sessions Park, "
+            "covering the Pacific Beach / Mission Beach area).\n"
+            "From these articles, select the TOP "
+            f"{max_items} that represent genuine upcoming events or community "
+            "happenings nearby -- festivals, concerts, farmers markets, beach "
+            "cleanups, park events, planning/community meetings, restaurant "
+            "openings, etc. DROP pure policy news, crime stories, and anything "
+            "not in or near the beach communities.\n\n"
+            f"<articles>\n{articles_block}\n</articles>\n\n"
+            "For each pick, respond in this exact format:\n"
+            "[original_number] 1-2 sentence summary.\n\n"
+            "In each summary, LEAD WITH the concrete details: what it is, when "
+            "(date/time if mentioned), and where (venue/neighborhood if "
+            "mentioned), then the 'so what' -- why it's worth the resident's "
+            "attention. Active voice, specific names, no hype, no filler. "
+            "Do not invent details. If an item has no clear date/venue and is "
+            "not clearly in the area, drop it."
+        )
+
+        result = self.client.invoke(
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+        )
+        if not result:
+            fallback = []
+            for article in happenings[:max_items]:
+                a = article.copy()
+                a["brief_summary"] = a.get("description", a.get("snippet", ""))
+                fallback.append(a)
+            return fallback
+
+        logger.debug(f"Happenings LLM response:\n{result[:500]}")
+        parsed = self._parse_ranked_response(result)
+        ranked = []
+        for idx, text in parsed:
+            if 0 <= idx < len(happenings):
+                article = happenings[idx].copy()
+                article["brief_summary"] = text
+                ranked.append(article)
+
+        if ranked:
+            diversified = self._enforce_source_diversity(ranked, max_per_source=2)
+            logger.info(f"Ranked and summarized {len(diversified)} happenings")
+            return diversified[:max_items]
+
+        logger.warning("Happenings ranking parse failed, using description fallback")
+        fallback = []
+        for article in happenings[:max_items]:
+            a = article.copy()
+            a["brief_summary"] = a.get("description", a.get("snippet", ""))
+            fallback.append(a)
+        return fallback
+
     def rank_and_summarize_blogs(
         self, blogs: List[Dict[str, Any]], topics: List[str]
     ) -> List[Dict[str, Any]]:
@@ -1254,19 +1359,10 @@ class BriefingIntelligence:
             "the one section every reader reads, so it must earn an A+ in a senior "
             "journalism seminar.\n\n"
             "Your job is NOT to list what happened. It is to CONNECT THE DOTS: "
-            "find the single most important through-line across today's papers, "
-            "news, blogs, and market moves, and tell the reader what it means and "
-            "why it matters now.\n\n"
-            "Reason it through before you write:\n"
-            "1. What is the biggest story in this data -- the thing a sharp analyst "
-            "would lead with?\n"
-            "2. What non-obvious connection ties two or more sources together? "
-            "(e.g., a paper that explains a market move, a blog that contradicts "
-            "the headlines, a new capability that shifts the strategic calculus.)\n"
-            "3. What is the second-order implication -- the 'so what' a casual "
-            "reader would miss?\n\n"
-            "Then write the Executive Summary in a format optimized for quick "
-            "scanning -- a reader glancing at it should absorb ~80% of the "
+            "find the single most important through-line across today's data and "
+            "tell the reader what it means and why it matters now.\n\n"
+            "Write the Executive Summary in a format optimized for quick "
+            "scanning — a reader glancing at it should absorb ~80% of the "
             "depth in 5 seconds:\n\n"
             "STRUCTURE:\n"
             "- **Bold a one-sentence headline** that states the day's single "
@@ -1280,27 +1376,17 @@ class BriefingIntelligence:
             "compare or contrast signals — otherwise stick to short paragraphs.\n"
             "- End with **Watch:** or **The bottom line:** in bold, followed by "
             "the single call-out worth tracking.\n\n"
-            "SELF-VERIFY before finalizing:\n"
-            "Re-read what you wrote. Would a skimmer reading only the bold text "
-            "and the first sentence of each paragraph get ~80% of the meaning? "
-            "If not, restructure: add bold anchors, tighten first sentences, "
-            "or break up dense paragraphs.\n\n"
             "Voice: plain, vigorous, active. Concrete nouns and numbers.\n\n"
-            "GROUNDING -- ZERO TOLERANCE FOR HALLUCINATION:\n"
-            "- Every assertion, number, dollar figure, percentage, company name, "
-            "product name, and personnel name MUST appear verbatim in the <data> "
-            "section below. You may paraphrase the analysis that follows each "
-            "headline (the text after the colon), but you MUST NOT add new factual "
-            "content from outside knowledge.\n"
-            "- Do NOT infer, extrapolate, or generate specifics. If a concrete "
-            "figure is not shown in <data>, describe the trend qualitatively. "
-            "A vaguer true sentence beats a precise fabricated one.\n"
-            "- This is not a creative writing exercise. Every claim you make "
-            "must be traceable to the data provided. If you cannot anchor a "
-            "statement in the data, do not make it.\n"
-            f"If you reference today's date in the output, use exactly '{_today_str}' — do not infer or invent a different date.\n\n"
+            "GROUND RULES:\n"
+            "- Every specific fact, number, ticker, company name, product name, "
+            "or personnel name you state must appear verbatim in the <data> "
+            "below. Paraphrase the analysis, never invent specifics.\n"
+            "- If a concrete figure is not in <data>, describe the trend "
+            "qualitatively. A vaguer true sentence beats a precise invented one.\n"
+            f"- Today's date is exactly {_today_str} — do not infer a different "
+            "date if you reference one.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
-            "independent sources -- treat them as the strongest signal and build "
+            "independent sources — treat them as the strongest signal and build "
             "your through-line around them where they fit. If emerging themes or "
             "multi-day trends are present, work them in.\n\n"
             f"<data>\n{all_data}\n</data>"
@@ -1308,7 +1394,10 @@ class BriefingIntelligence:
         )
 
         result = self.client.invoke(
-            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
+            prompt,
+            tier="heavy",
+            system_prompt=SYSTEM_PROMPT,
+            reasoning_enabled=False,
         )
         if not result:
             return {}
