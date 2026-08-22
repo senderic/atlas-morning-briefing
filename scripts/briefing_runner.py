@@ -47,6 +47,7 @@ from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
+from scripts.leak_detection import is_cot_leak
 from scripts.llm_client import BaseLLMClient
 
 
@@ -742,14 +743,7 @@ class BriefingRunner:
             # "Check verbatim entities/facts:" bullet lists).  If the cleaned
             # intro contains those telltales — drop it and fall back to the
             # unavailable placeholder.
-            _intro_lower = intro.lower()
-            _cot_markers = (
-                "strict grounding",
-                "check verbatim",
-                "is verbatim",
-                "entities/facts",
-            )
-            _looks_like_cot = any(m in _intro_lower for m in _cot_markers)
+            _looks_like_cot = is_cot_leak(intro)
             if _looks_like_cot:
                 logger.warning(
                     "Editorial intro looks like leaked CoT scaffolding; "
@@ -826,8 +820,16 @@ class BriefingRunner:
 
         # Feature 2: Weekly Deep Dive section (Saturday only)
         if self.feature_weekly_deep_dive and weekly_deep_dive:
-            md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
-            md.append(f"{weekly_deep_dive}\n\n")
+            # Guard: drop leaked reasoning / verification scaffolding.
+            if weekly_deep_dive and is_cot_leak(weekly_deep_dive):
+                logger.warning(
+                    "Weekly deep dive looks like leaked CoT scaffolding; "
+                    "omitting section."
+                )
+                weekly_deep_dive = ""
+            if weekly_deep_dive:
+                md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
+                md.append(f"{weekly_deep_dive}\n\n")
 
         # Errors section
         if self.errors:

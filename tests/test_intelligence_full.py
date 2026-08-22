@@ -669,6 +669,29 @@ class TestSynthesizeBriefing:
         )
         assert result == {}
 
+    def test_leaky_response_triggers_retry(self, intel, mock_client):
+        leaky = (
+            "Strict Grounding Verification**:\n"
+            "- Check verbatim entities/facts: every number cited.\n"
+        )
+        clean = "Today's briefing highlights X, Y, and Z."
+        mock_client.invoke.side_effect = [leaky, clean]
+        result = intel.synthesize_briefing(
+            papers=[{"title": "P1"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+        assert result["editorial_intro"] == clean
+        assert mock_client.invoke.call_count == 2
+        assert mock_client.invoke.call_args_list[0].kwargs.get("reasoning_enabled") is True
+        assert mock_client.invoke.call_args_list[1].kwargs.get("reasoning_enabled") is False
+
+    def test_leaky_then_leaky_returns_empty(self, intel, mock_client):
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        mock_client.invoke.side_effect = [leaky, leaky]
+        result = intel.synthesize_briefing(
+            papers=[{"title": "P1"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+        assert result == {}
+
 
 # ---------- detect_cross_source_signals ----------
 
@@ -772,6 +795,25 @@ class TestGenerateWeeklyDeepDive:
     def test_llm_failure(self, intel, mock_client):
         mock_client.invoke.return_value = None
         assert intel.generate_weekly_deep_dive([{"date": "d", "title": "t"}]) == ""
+
+    def test_leaky_response_triggers_retry(self, intel, mock_client):
+        items = [{"date": "2026-05-19", "type": "paper", "title": "A"}]
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        clean = "Weekly synthesis: themes were X, Y, Z."
+        mock_client.invoke.side_effect = [leaky, clean]
+        result = intel.generate_weekly_deep_dive(items)
+        assert result == clean
+        assert mock_client.invoke.call_count == 2
+        # First call runs on the reasoning model by default (no override).
+        assert mock_client.invoke.call_args_list[0].kwargs.get("reasoning_enabled") is not False
+        assert mock_client.invoke.call_args_list[1].kwargs.get("reasoning_enabled") is False
+
+    def test_leaky_then_leaky_returns_empty(self, intel, mock_client):
+        items = [{"date": "2026-05-19", "type": "paper", "title": "A"}]
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        mock_client.invoke.side_effect = [leaky, leaky]
+        result = intel.generate_weekly_deep_dive(items)
+        assert result == ""
 
 
 # ---------- track_trending ----------

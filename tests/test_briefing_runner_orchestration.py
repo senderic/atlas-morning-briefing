@@ -276,3 +276,23 @@ class TestEnrichPapers:
         result = runner._enrich_papers(papers, ["topic"])
         assert result[0]["brief_summary"] == "s"
         assert result[0]["semantic_score"] == 7
+
+
+class TestMarkdownLeakGuards:
+    LEAKY_TEXT = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+
+    def test_leaky_editorial_intro_renders_placeholder(self, runner_with_data):
+        md = runner_with_data.generate_markdown_briefing(
+            [], [], [], [], [],
+            synthesis={"editorial_intro": self.LEAKY_TEXT},
+        )
+        assert "Synthesis unavailable" in md
+        assert "Strict Grounding" not in md
+
+    def test_leaky_weekly_deep_dive_omitted(self, runner_with_data):
+        md = runner_with_data.generate_markdown_briefing(
+            [], [], [], [], [],
+            weekly_deep_dive=self.LEAKY_TEXT,
+        )
+        assert "This Week in AI" not in md
+        assert "Strict Grounding" not in md

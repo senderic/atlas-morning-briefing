@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
 from scripts.interest_graph import generate_graph_queries, parse_graph
+from scripts.leak_detection import is_cot_leak
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -1467,7 +1468,9 @@ class BriefingIntelligence:
             "- If a concrete figure is not in <data>, describe the trend "
             "qualitatively. A vaguer true sentence beats a precise invented one.\n"
             f"- Today's date is exactly {_today_str} — do not infer a different "
-            "date if you reference one.\n\n"
+            "date if you reference one.\n"
+            "- Never output your internal reasoning, verification, or grounding "
+            "steps; output only the final editorial text.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
             "independent sources — treat them as the strongest signal and build "
             "your through-line around them where they fit. If emerging themes or "
@@ -1481,8 +1484,21 @@ class BriefingIntelligence:
             prompt,
             tier="heavy",
             system_prompt=SYSTEM_PROMPT,
-            reasoning_enabled=False,
+            reasoning_enabled=True,
         )
+        if result and is_cot_leak(result):
+            logger.warning(
+                "Editorial synthesis leaked CoT scaffolding; "
+                "retrying without reasoning."
+            )
+            result = self.client.invoke(
+                prompt,
+                tier="heavy",
+                system_prompt=SYSTEM_PROMPT,
+                reasoning_enabled=False,
+            )
+            if not result or is_cot_leak(result):
+                result = None
         if not result:
             return {}
 
@@ -1970,6 +1986,19 @@ class BriefingIntelligence:
         result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
+        if result and is_cot_leak(result):
+            logger.warning(
+                "Weekly Deep Dive leaked CoT scaffolding; "
+                "retrying without reasoning."
+            )
+            result = self.client.invoke(
+                prompt,
+                tier="heavy",
+                system_prompt=SYSTEM_PROMPT,
+                reasoning_enabled=False,
+            )
+            if not result or is_cot_leak(result):
+                result = None
 
         if result:
             logger.info("Weekly Deep Dive generated successfully")
