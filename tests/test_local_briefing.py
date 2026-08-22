@@ -542,3 +542,82 @@ class TestLocalRunOrchestration:
         assert "Solo Founder Angle" in content
         assert "Agent Cost-Optimization Play" in content
         assert "AI & Tech News" in content
+
+
+class TestShippedLocalConfig:
+    """Guards the life-first intent of the checked-in config_local.yaml."""
+
+    @staticmethod
+    def _config():
+        import yaml
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "config_local.yaml"
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def test_summaries_are_action_first(self):
+        assert self._config()["briefing_profile"]["actionable"] is True
+
+    def test_investment_is_the_last_priority_tier(self):
+        priorities = self._config()["briefing_profile"]["priorities"]
+        assert len(priorities) >= 2
+        assert "investment" in priorities[-1].lower()
+        assert not any("investment" in tier.lower() for tier in priorities[:-1])
+
+    def test_daily_life_outweighs_investment_in_interest_profile(self):
+        profile = self._config()["interest_profile"]
+        weights = {item["topic"].lower(): item["weight"] for item in profile}
+        money = [w for topic, w in weights.items()
+                 if "investment" in topic or "commercial real estate" in topic]
+        assert money, "expected investment topics to still be present"
+        top_topic = max(profile, key=lambda item: item["weight"])["topic"].lower()
+        assert "investment" not in top_topic
+        assert max(money) < max(weights.values())
+
+    def test_happenings_lead_the_content_sections(self):
+        order = self._config()["section_order"]
+        assert order.index("happenings") < order.index("news") < order.index("blogs")
+
+    def test_alerts_lead_the_section_order(self):
+        assert self._config()["section_order"][0] == "alerts"
+
+    def test_alerts_use_coastal_zones_not_the_whole_county(self):
+        alerts = self._config()["alerts"]
+        assert alerts["enabled"] is True
+        assert alerts["zones"] == ["CAZ043", "CAZ243"]
+        # CAC073 covers inland deserts and would fire alerts that do not apply
+        # at the coast.
+        assert "CAC073" not in alerts["zones"]
+
+    def test_geo_filter_and_dedup_are_on(self):
+        config = self._config()
+        assert config["geo_filter"]["enabled"] is True
+        assert "san diego" in config["geo_filter"]["place_terms"]
+        assert config["news_similarity_dedup"]["enabled"] is True
+
+    def test_every_graph_query_is_short(self):
+        """Long keyword strings drift out of the area; 2-4 words is the shape."""
+        config = self._config()
+
+        def walk(node):
+            yield node
+            for child in node.get("children", []) or []:
+                yield from walk(child)
+
+        for root in config["interest_graph"]["roots"]:
+            for node in walk(root):
+                words = node["query"].split()
+                assert len(words) <= 5, f"{node['id']} query is too long: {node['query']}"
+
+    def test_hyperlocal_branches_use_a_weekly_window(self):
+        roots = {r["id"]: r for r in self._config()["interest_graph"]["roots"]}
+        assert roots["neighborhood"]["freshness"] == "pw"
+        assert roots["beach_access"]["freshness"] == "pw"
+
+    def test_condition_queries_are_not_sent_to_news_search(self):
+        """Surf/outage/closure status comes from the alerts scanner, not Brave."""
+        config = self._config()
+        blob = str(config["interest_graph"]).lower()
+        for term in ("power outage", "water shutoff", "high surf", "road closure"):
+            assert term not in blob

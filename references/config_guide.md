@@ -84,7 +84,86 @@ news_queries:
 **Tips**:
 - Use specific queries for targeted results
 - Combine related terms in one query
-- Results are filtered to past 24 hours
+- Results are filtered to past 24 hours by default (`news_freshness`)
+
+**Query shape** (measured against the live Brave news API):
+Brave treats a place name as a ranking hint, not a filter. Long keyword
+strings drift out of the area -- `"San Diego road closure construction traffic
+detour this week"` returned 15 results, none of them from San Diego. Quoting
+returns 0 results and `site:` is unsupported on the news endpoint. Use 2-4
+words built on one distinctive proper noun instead (`Crown Point San Diego`).
+
+### Freshness Windows
+
+Each interest-graph branch declares the window its topic needs, inherited by
+child nodes. Hyperlocal branches need a wider window than market branches --
+a neighborhood does not generate news every 24 hours, and a starved `pd` query
+gets backfilled with national noise.
+
+```yaml
+news_freshness: "pd"          # default for queries with no branch binding
+
+interest_graph:
+  roots:
+    - id: "neighborhood"
+      query: "Pacific Beach San Diego"
+      freshness: "pw"          # inherited by every child below
+      children:
+        - id: "crown_point"
+          query: "Crown Point San Diego"
+          priority: 1.35       # multiplies the per-run signal score
+```
+
+### Geographic Relevance Gate
+
+Drops results that never mention a configured place term, before they reach
+the LLM ranking layer. Items from `trusted_sources` pass without a match, since
+a local outlet is local even when its headline does not say so. Omit the block
+(or set `enabled: false`) to keep every result.
+
+```yaml
+geo_filter:
+  enabled: true
+  place_terms: ["san diego", "pacific beach", "california"]
+  trusted_sources: ["voiceofsandiego.org", "kpbs.org"]
+```
+
+### Cross-Outlet Duplicate Collapse
+
+One viral story arrives from a dozen syndicating outlets under different
+headlines. Compares Jaccard overlap of headline content words; the copy from a
+`trusted_sources` outlet wins. Disabled unless configured.
+
+```yaml
+news_similarity_dedup:
+  enabled: true
+  threshold: 0.3     # retellings measured 0.23-0.47, distinct stories 0.00-0.17
+```
+
+## Public-Safety Alerts
+
+Active National Weather Service alerts for specific zones. Free, no API key,
+and rendered without the LLM, so the section survives an LLM outage. This is
+the reliable answer to "is there a heat warning where I live today" -- news
+search answers it with whatever storm is trending nationally.
+
+```yaml
+alerts:
+  enabled: true
+  provider: "nws"
+  zones: ["CAZ043", "CAZ243"]   # forecast zone + fire weather zone
+  max_alerts: 4
+  timeout: 20
+  user_agent: "atlas-morning-briefing (you@example.com)"
+```
+
+Find your zones with `curl 'https://api.weather.gov/points/<lat>,<lon>'` and
+read `forecastZone`, `fireWeatherZone`, and `county` from the response. Prefer
+the narrowest zone that covers you: a county zone fires for inland alerts that
+may not apply at the coast.
+
+Add `"alerts"` to `section_order` to render the section, and a matching
+`section_headings.alerts` label.
 
 ## Paper Scoring
 

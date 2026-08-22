@@ -36,6 +36,9 @@ from scripts.arxiv_scanner import ArxivScanner, create_scanner
 from scripts.snapshot_manager import SnapshotManager
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
+from scripts.alerts_scanner import create_scanner as create_alerts_scanner
+from scripts.geo_filter import apply_config_filter
+from scripts.interest_graph import query_freshness
 from scripts.news_aggregator import NewsAggregator
 from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
@@ -91,6 +94,8 @@ class BriefingRunner:
             "stocks_fetched": 0,
             "news_found": 0,
             "happenings_found": 0,
+            "alerts_found": 0,
+            "geo_filtered_out": 0,
             "intelligence_enabled": False,
             "errors": [],
             "pdf_generated": False,
@@ -242,7 +247,11 @@ class BriefingRunner:
         self, queries: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Run news aggregation.
+        Run news aggregation, honoring each query's freshness binding.
+
+        Interest-graph queries carry the freshness window their branch asked
+        for (hyperlocal branches need a wider window than market branches), so
+        queries are grouped by window and each group is fetched separately.
 
         Args:
             queries: Optional list of queries. If None, uses config.
@@ -265,12 +274,33 @@ class BriefingRunner:
                 logger.warning("No news_queries configured, skipping")
                 return []
 
-            aggregator = NewsAggregator(
-                api_key=api_key,
-                queries=queries,
-                max_results=max_news,
-            )
-            articles = aggregator.aggregate_all_queries()
+            default_freshness = self.config.get("news_freshness", "pd")
+            groups: Dict[str, List[str]] = {}
+            for query in queries:
+                groups.setdefault(
+                    query_freshness(query, default_freshness), []
+                ).append(str(query))
+
+            articles: List[Dict[str, Any]] = []
+            seen_urls = set()
+            for freshness, group in groups.items():
+                logger.info(
+                    "News group freshness=%s queries=%d", freshness, len(group)
+                )
+                aggregator = NewsAggregator(
+                    api_key=api_key,
+                    queries=group,
+                    max_results=max_news,
+                    freshness=freshness,
+                )
+                for article in aggregator.aggregate_all_queries():
+                    url = article.get("url", "")
+                    if url and url in seen_urls:
+                        continue
+                    if url:
+                        seen_urls.add(url)
+                    articles.append(article)
+
             self.status["news_found"] = len(articles)
             logger.info(f"Found {len(articles)} news articles")
             return articles
@@ -279,6 +309,41 @@ class BriefingRunner:
             logger.error(f"News aggregation failed: {e}")
             self.errors.append(f"News aggregation: {e}")
             return []
+
+    def run_alerts_scan(self) -> List[Dict[str, Any]]:
+        """
+        Fetch active public-safety alerts (NWS) for the configured zones.
+
+        Deterministic and LLM-free: alerts are rendered as fetched, so this
+        section survives an LLM outage intact.
+
+        Returns:
+            List of active alerts, most severe first.
+        """
+        try:
+            scanner = create_alerts_scanner(self.config)
+            if scanner is None:
+                return []
+            logger.info("=== Fetching Public-Safety Alerts ===")
+            alerts = scanner.fetch()
+            self.status["alerts_found"] = len(alerts)
+            logger.info(f"Found {len(alerts)} active alerts")
+            return alerts
+        except Exception as e:
+            logger.error(f"Alerts scan failed: {e}")
+            self.errors.append(f"Alerts scan: {e}")
+            return []
+
+    def _apply_geo_filter(
+        self, items: List[Dict[str, Any]], label: str
+    ) -> List[Dict[str, Any]]:
+        """Drop items with no reference to the configured area (config-driven)."""
+        before = len(items)
+        kept = apply_config_filter(items, self.config, label=label)
+        dropped = before - len(kept)
+        if dropped:
+            self.status["geo_filtered_out"] += dropped
+        return kept
 
     def run_happenings_aggregation(self) -> List[Dict[str, Any]]:
         """
@@ -484,6 +549,87 @@ class BriefingRunner:
             _filter(happenings or [], prev_happenings),
         )
 
+    _DEDUP_STOPWORDS = {
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
+        "with", "is", "are", "was", "were", "by", "from", "as", "it", "its",
+        "this", "that", "new", "says", "after", "over",
+    }
+
+    @classmethod
+    def _headline_terms(cls, title: str) -> set:
+        """Content words of a headline, for cross-outlet duplicate detection."""
+        return {
+            w for w in re.findall(r"[a-z0-9']+", (title or "").lower())
+            if len(w) > 2 and w not in cls._DEDUP_STOPWORDS
+        }
+
+    def deduplicate_similar_news(
+        self, news: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Collapse the same story reported by many outlets.
+
+        A viral local story ("Darth Vader speaks at city council") arrives from
+        a dozen syndicating outlets with different headlines, crowding out
+        everything else. URL dedup does not catch it and title SequenceMatcher
+        is unreliable across rewrites, so this uses Jaccard overlap of headline
+        content words.
+
+        Threshold calibrated on real Brave results: cross-outlet retellings of
+        one story scored 0.23-0.47, while genuinely distinct local stories
+        scored 0.00-0.17. The default 0.3 sits in that gap.
+
+        When a duplicate is found, the copy from a local outlet
+        (``geo_filter.trusted_sources``) wins over a national aggregator.
+        """
+        cfg = self.config.get("news_similarity_dedup") or {}
+        if not cfg.get("enabled") or len(news) <= 1:
+            return news
+
+        threshold = float(cfg.get("threshold", 0.3))
+        trusted = {
+            t.lower() for t in
+            (self.config.get("geo_filter", {}) or {}).get("trusted_sources", [])
+        }
+
+        def is_trusted(article: Dict[str, Any]) -> bool:
+            host = (article.get("source") or "").lower()
+            return any(host == t or host.endswith("." + t) for t in trusted)
+
+        kept: List[Dict[str, Any]] = []
+        kept_terms: List[set] = []
+        for article in news:
+            terms = self._headline_terms(article.get("title", ""))
+            if not terms:
+                kept.append(article)
+                kept_terms.append(terms)
+                continue
+
+            dup_index = None
+            for i, other in enumerate(kept_terms):
+                if not other:
+                    continue
+                overlap = len(terms & other) / len(terms | other)
+                if overlap >= threshold:
+                    dup_index = i
+                    break
+
+            if dup_index is None:
+                kept.append(article)
+                kept_terms.append(terms)
+            elif is_trusted(article) and not is_trusted(kept[dup_index]):
+                # Prefer the local outlet's version of the same story.
+                kept[dup_index] = article
+                kept_terms[dup_index] = terms
+
+        removed = len(news) - len(kept)
+        if removed:
+            logger.info(
+                "Dedup: collapsed %d syndicated copies of stories already kept",
+                removed,
+            )
+        return kept
+
     def deduplicate_similar_papers(
         self, papers: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -531,6 +677,7 @@ class BriefingRunner:
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         happenings: Optional[List[Dict[str, Any]]] = None,
+        alerts: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Generate markdown briefing from all data.
@@ -547,6 +694,7 @@ class BriefingRunner:
             start_time: Optional briefing start unix timestamp.
             end_time: Optional briefing end unix timestamp.
             happenings: Optional neighborhood happenings (Pacific Beach area).
+            alerts: Optional active public-safety alerts (NWS).
 
         Returns:
             Markdown string.
@@ -646,6 +794,7 @@ class BriefingRunner:
             "top_papers": top_papers,
             "papers": papers,
             "happenings": happenings or [],
+            "alerts": alerts or [],
         }
         logger.debug(
             "Generating markdown: section_order=%s headings_keys=%s "
@@ -672,6 +821,8 @@ class BriefingRunner:
                 md.append(self._render_papers(data))
             elif section == "happenings":
                 md.append(self._render_happenings(data))
+            elif section == "alerts":
+                md.append(self._render_alerts(data))
 
         # Feature 2: Weekly Deep Dive section (Saturday only)
         if self.feature_weekly_deep_dive and weekly_deep_dive:
@@ -814,6 +965,51 @@ class BriefingRunner:
                 md.append(f"\n#### Source Information\n{author_blurb}\n")
 
             md.append("\n")
+        return "".join(md)
+
+    @staticmethod
+    def _format_alert_window(onset: str, expires: str) -> str:
+        """Render an alert's active window as a compact local-time range."""
+        def fmt(value: str) -> str:
+            if not value:
+                return ""
+            try:
+                return datetime.fromisoformat(value).strftime("%a %b %-d, %-I:%M %p")
+            except (ValueError, TypeError):
+                return value
+
+        start, end = fmt(onset), fmt(expires)
+        if start and end:
+            return f"{start} → {end}"
+        return start or end
+
+    def _render_alerts(self, alerts: List[Dict[str, Any]]) -> str:
+        """Render active public-safety alerts (deterministic, no LLM needed)."""
+        max_alerts = self.config.get("alerts", {}).get("max_alerts", 5)
+        items = alerts[:max_alerts]
+        if not items:
+            return ""
+
+        md = [f"## {self._headings.get('alerts', 'Active Alerts')}\n\n"]
+        for alert in items:
+            event = alert.get("event", "Alert")
+            severity = alert.get("severity", "")
+            window = self._format_alert_window(
+                alert.get("onset", ""), alert.get("expires", "")
+            )
+            md.append(f"**{event}**" + (f" — {severity}" if severity else "") + "\n")
+            if window:
+                md.append(f"{window}\n")
+            area = alert.get("area", "")
+            if area:
+                md.append(f"{area}\n")
+            instruction = (alert.get("instruction") or "").replace("\n", " ").strip()
+            if instruction:
+                if len(instruction) > 300:
+                    instruction = instruction[:297].rstrip() + "..."
+                md.append(f"\n{instruction}\n")
+            md.append("\n")
+        md.append(f"_Source: {items[0].get('source', 'National Weather Service')}_\n\n")
         return "".join(md)
 
     def _render_happenings(self, happenings: List[Dict[str, Any]]) -> str:
@@ -1235,6 +1431,9 @@ class BriefingRunner:
             happenings = self._load_snapshot(
                 f"snapshots/{self.use_snapshots}/happenings.json"
             )
+            alerts = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/alerts.json"
+            )
             topics = self.config.get("arxiv_topics", [])
             news_queries = self.config.get("news_queries", [])
             self.status["papers_found"] = len(papers)
@@ -1242,6 +1441,7 @@ class BriefingRunner:
             self.status["stocks_fetched"] = len(stocks)
             self.status["news_found"] = len(news)
             self.status["happenings_found"] = len(happenings)
+            self.status["alerts_found"] = len(alerts)
         else:
             # --- Topic expansion (intelligence layer) ---
             topics = self.config.get("arxiv_topics", [])
@@ -1257,10 +1457,12 @@ class BriefingRunner:
                 fut_papers = pool.submit(self.run_arxiv_scan, topics)
                 fut_blogs = pool.submit(self.run_blog_scan)
                 fut_stocks = pool.submit(self.run_stock_fetch)
+                fut_alerts = pool.submit(self.run_alerts_scan)
 
                 papers = fut_papers.result()
                 blogs = fut_blogs.result()
                 stocks = fut_stocks.result()
+                alerts = fut_alerts.result()
 
             # --- Generate news queries (interest graph, or static + dynamic) ---
             news_queries = self.config.get("news_queries", [])
@@ -1273,17 +1475,25 @@ class BriefingRunner:
             news = self.run_news_aggregation(queries=news_queries)
             happenings = self._load_or_fetch_happenings(previous_state)
 
+            # Geographic relevance gate: news search treats a place name as a
+            # ranking hint, not a constraint, so drop out-of-area results
+            # before they reach the LLM ranking layer.
+            news = self._apply_geo_filter(news, "news")
+            happenings = self._apply_geo_filter(happenings, "happenings")
+
             # --- Save raw data snapshots ---
             logger.info("=== Saving raw data snapshots ===")
             self.snapshot_manager.save_stocks(stocks)
             self.snapshot_manager.save_news(news)
             self.snapshot_manager.save_happenings(happenings)
+            self.snapshot_manager.save_alerts(alerts)
             self.snapshot_manager.save_blogs(blogs)
             self.snapshot_manager.save_papers(papers)
             self.snapshot_manager.save_manifest()
 
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
+        news = self.deduplicate_similar_news(news)
         happenings = self.deduplicate_happenings(happenings, news)
 
         # --- Deduplicate similar papers by title ---
@@ -1442,7 +1652,7 @@ class BriefingRunner:
                 weekly_items = []
 
         # --- Check if we have any data ---
-        has_data = any([papers, blogs, stocks, news, happenings])
+        has_data = any([papers, blogs, stocks, news, happenings, alerts])
         if not has_data:
             logger.error("No data collected from any source")
             self.status["elapsed_seconds"] = round(time.time() - start_time, 1)
@@ -1463,6 +1673,7 @@ class BriefingRunner:
             start_time=start_time,
             end_time=time.time(),
             happenings=happenings,
+            alerts=alerts,
         )
 
         # --- Save markdown ---

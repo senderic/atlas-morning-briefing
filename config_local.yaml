@@ -12,6 +12,8 @@ arxiv_topics: []
 stocks: []
 
 # --- RSS feeds: local news sources ---
+# All verified live. RSS costs nothing, so anything a local outlet publishes
+# should come from here rather than from a paid Brave query.
 blog_feeds:
   - name: "Voice of San Diego"
     url: "https://voiceofsandiego.org/feed/"
@@ -28,98 +30,270 @@ blog_feeds:
     url: "https://timesofsandiego.com/category/san-diego-events/feed/"
   - name: "Times of San Diego Community"
     url: "https://timesofsandiego.com/category/community/feed/"
+  # Broadcast + investigative locals: these carry the closures, outages, and
+  # neighborhood items that news search reliably misses.
+  - name: "NBC 7 San Diego"
+    url: "https://www.nbcsandiego.com/news/local/feed/"
+  - name: "FOX 5 San Diego"
+    url: "https://fox5sandiego.com/feed/"
+  - name: "ABC 10News San Diego"
+    url: "https://www.10news.com/news.rss"
+  - name: "inewsource"
+    url: "https://inewsource.org/feed/"
+  - name: "OB Rag"
+    url: "https://obrag.org/feed/"
+  # County press office: beach closures/advisories, public comment periods,
+  # wildfire readiness, benefit program changes.
+  - name: "San Diego County News Center"
+    url: "https://www.countynewscenter.com/feed/"
 
 # --- Interest profile for relevance filtering / ranking ---
+# Ordered life-first: what changes this week for someone living in Pacific
+# Beach outranks policy, and policy outranks investment angles. These weights
+# also seed the <interests> block in news/blog ranking prompts (no arxiv
+# topics exist in this pipeline).
 interest_profile:
-  - topic: "San Diego zoning and land-use changes"
+  # Tier 1 -- daily life around the beach communities
+  - topic: "Pacific Beach, Mission Beach, and Crown Point community news"
     weight: 1.0
-  - topic: "California housing legislation and policy"
-    weight: 0.95
-  - topic: "Local investment and real estate opportunities"
+  - topic: "Local events, festivals, markets, and community meetings worth attending"
+    weight: 0.98
+  - topic: "Road closures, construction, parking changes, and traffic near the beach communities"
+    weight: 0.96
+  - topic: "Beach and bay conditions: water quality advisories, surf and rip current hazards, closures"
+    weight: 0.94
+  - topic: "Weather, fire, flood, and power/water outage impacts in San Diego"
+    weight: 0.92
+  - topic: "Public safety incidents and trends in the Pacific Beach area"
     weight: 0.9
-  - topic: "Public transit and infrastructure in San Diego"
-    weight: 0.85
-  - topic: "California tax and regulatory changes"
-    weight: 0.85
-  - topic: "Environmental and coastal regulations"
+  - topic: "New restaurants, shops, parks, and rec/library programming nearby"
+    weight: 0.88
+  - topic: "Mission Bay and Crown Point park projects and access"
+    weight: 0.86
+  - topic: "San Diego transit service changes affecting daily travel"
+    weight: 0.84
+  # Tier 2 -- dated obligations and decisions a resident can act on
+  - topic: "Public comment periods, city council votes, and community planning group decisions"
     weight: 0.8
-  - topic: "Small business and permitting changes"
-    weight: 0.75
-  - topic: "Local government and city council decisions"
-    weight: 0.7
-  - topic: "San Diego events and community news"
-    weight: 0.65
-  - topic: "Pacific Beach and Mission Beach community news"
-    weight: 0.8
-  - topic: "San Diego coastal resilience, sea-level rise, and beach erosion"
-    weight: 0.7
-  - topic: "Mission Bay and Crown Point park development"
-    weight: 0.65
-  - topic: "Beach community events, festivals, and local happenings"
-    weight: 0.7
-  - topic: "San Diego beaches and bays access, parking, and regulations"
+  - topic: "Utility rate changes, city fees, permit windows, and tax deadlines"
+    weight: 0.78
+  # Tier 3 -- policy that changes what a resident can do or pay
+  - topic: "San Diego zoning and land-use changes"
+    weight: 0.62
+  - topic: "California housing legislation and policy"
     weight: 0.6
+  - topic: "Coastal regulation, sea-level rise, and beach erosion policy"
+    weight: 0.58
+  - topic: "California tax and regulatory changes for residents and small business"
+    weight: 0.56
+  # Tier 4 -- investment and business, deliberately last
+  - topic: "Local real estate market moves and investment opportunities"
+    weight: 0.4
+  - topic: "San Diego business, development deals, and commercial real estate"
+    weight: 0.38
 
 # --- Domain framing for LLM prompts ---
+# actionable: ask every summary to lead with the date/place/cost/decision.
+# priorities: ordered ranking tiers consumed by scripts/intelligence.py
+#   (news ranking, blog ranking, executive summary). Tier 1 fills most slots.
 briefing_profile:
-  domain: "San Diego and California local news, policy, and investment"
-  audience: "a San Diego resident and investor tracking local opportunities and regulatory changes"
-  landscape: "the San Diego and California news, real estate, and public policy landscape"
+  domain: "San Diego neighborhood life, local civic decisions, and California policy"
+  audience: >-
+    a Pacific Beach resident planning their week -- what affects their
+    streets, their beach, their bills, and their neighborhood -- who also
+    keeps an eye on local real-estate and business opportunities
+  landscape: "the San Diego neighborhood, civic, and real-estate landscape"
+  actionable: true
+  priorities:
+    - >-
+      Daily life in and around Pacific Beach, Mission Beach, and Crown Point:
+      events worth attending, road/beach closures and construction, water
+      quality and surf hazards, weather/fire/outage impacts, public-safety
+      incidents nearby, transit and parking changes, new restaurants, shops,
+      parks, and rec/library programming. Fill most of the slots from this
+      tier.
+    - >-
+      Anything with a date or a decision attached the reader can act on:
+      public comment periods, council and community-planning votes, permit
+      windows, utility rate changes, fee and tax deadlines, service
+      disruptions with start dates.
+    - >-
+      Citywide and California policy that changes what a resident can do or
+      pay -- housing and zoning rules, coastal regulation, transit projects,
+      taxes and fees. Include it when it is concrete; skip process-only
+      chatter with no effect yet.
+    - >-
+      Investment, real-estate, and business angles: market moves, development
+      deals, opportunities. Secondary -- keep at most one or two slots for the
+      most consequential money item, and never open the briefing with it.
 
 # --- News search queries (Brave Search API) as an interest taxonomy DAG ---
 # Root queries fire every run as a baseline; leaf queries are selected per-run
-# (up to max_dynamic_queries) based on signal from yesterday's briefing and
-# today's blogs. See scripts/interest_graph.py.
+# (up to max_dynamic_queries) from signal in yesterday's briefing and today's
+# blogs. See scripts/interest_graph.py.
+#
+# Query shape matters more than query count. Measured against the live Brave
+# news API (2026-08-22):
+#   - Long keyword strings drift out of the area: "San Diego road closure
+#     construction traffic detour this week" returned 15 results, all of them
+#     Bay Area / Texas / Pennsylvania. Brave treats "San Diego" as a ranking
+#     hint, not a filter.
+#   - Quoting does not fix it: '"San Diego" road closure detour' returned 0.
+#     site: is unsupported on the news endpoint (also 0).
+#   - What works: 2-4 words built on one distinctive proper noun, e.g.
+#     "Crown Point San Diego" (surfaced the Amazon-delivery-hub-in-the-park
+#     story across 6 outlets) and "Mission Bay San Diego park".
+#
+# freshness is a property of the branch, not the run, and is inherited by
+# children: the beach neighborhoods do not generate news every 24 hours, so a
+# "pd" window starves those queries and Brave backfills with national noise.
+# Condition queries (surf, outages, closures) are deliberately absent -- they
+# are served by the alerts scanner below, which is precise and free.
 interest_graph:
   max_dynamic_queries: 3
   roots:
-    - id: "housing"
-      query: "San Diego housing zoning development transit"
+    - id: "neighborhood"
+      query: "Pacific Beach San Diego"
+      freshness: "pw"
       children:
-        - id: "zoning"
-          query: "San Diego city council decisions zoning permits"
-        - id: "housing_dev"
-          query: "San Diego housing development regulations changes"
-        - id: "downtown"
-          query: "San Diego downtown redevelopment commercial real estate"
-        - id: "transit"
-          query: "San Diego public transit infrastructure development"
-    - id: "ca_regulation"
-      query: "California legislation regulation housing real estate tax"
-      children:
-        - id: "state_housing"
-          query: "California state legislation housing property"
-        - id: "new_laws"
-          query: "California new laws regulations real estate"
-        - id: "tax"
-          query: "California tax changes small business property"
-    - id: "coast_env"
-      query: "San Diego coastal environment flood fire erosion"
-      children:
-        - id: "coastal_commission"
-          query: "San Diego environmental coastal commission"
-        - id: "flood_fire"
-          query: "San Diego flood insurance fire safety regulations"
-        - id: "erosion"
-          query: "San Diego coastal erosion sea level rise"
-    - id: "investment"
-      query: "San Diego business investment redevelopment"
-      children:
-        - id: "business_investment"
-          query: "San Diego business investment opportunities"
-    - id: "beach_neighborhood"
-      query: "Pacific Beach Mission Beach events park beach"
-      children:
-        - id: "pb_mb_news"
-          query: "Pacific Beach Mission Beach community news"
+        - id: "mission_beach"
+          query: "Mission Beach San Diego"
+          priority: 1.4
+        - id: "crown_point"
+          query: "Crown Point San Diego"
+          priority: 1.35
         - id: "mission_bay"
-          query: "Mission Bay Park development Crown Point"
-        - id: "beach_access"
-          query: "San Diego beach parking access regulations"
+          query: "Mission Bay San Diego park"
+          priority: 1.3
+        - id: "openings"
+          query: "San Diego restaurant opening"
+          priority: 1.0
+    - id: "beach_access"
+      query: "San Diego beach parking"
+      freshness: "pw"
+      children:
+        - id: "lifeguards"
+          query: "San Diego lifeguards"
+          priority: 1.2
+        - id: "coastal_commission"
+          query: "San Diego coastal commission"
+          priority: 1.0
+    - id: "city_hall"
+      query: "San Diego city council"
+      freshness: "pw"
+      children:
+        - id: "planning_groups"
+          query: "San Diego community planning group"
+          priority: 1.1
+        - id: "parks"
+          query: "San Diego parks and recreation"
+          priority: 1.1
+    - id: "ca_policy"
+      query: "California housing law"
+      freshness: "pw"
+      children:
+        - id: "sd_housing_law"
+          query: "San Diego housing development lawsuit"
+          priority: 0.8
+        - id: "ca_new_laws"
+          query: "California new laws"
+          priority: 0.7
+    - id: "market"
+      query: "San Diego housing market"
+      freshness: "pw"
+      children:
+        - id: "rents"
+          query: "San Diego rent prices"
+          priority: 0.6
+        - id: "commercial"
+          query: "San Diego commercial real estate"
+          priority: 0.5
+
+# Default freshness for any query with no branch binding (static news_queries).
+news_freshness: "pd"
+
+# --- Geographic relevance gate ---
+# Applied to Brave results before the LLM ranking layer, so out-of-area stories
+# never consume prompt tokens or a top-5 slot. Items from trusted_sources pass
+# without a place-name match (a local outlet is local even when the headline
+# does not say so). Disable by setting enabled: false.
+geo_filter:
+  enabled: true
+  place_terms:
+    - "san diego"
+    - "pacific beach"
+    - "mission beach"
+    - "mission bay"
+    - "crown point"
+    - "kate sessions"
+    - "la jolla"
+    - "ocean beach"
+    - "point loma"
+    - "clairemont"
+    - "bay park"
+    - "coronado"
+    - "chula vista"
+    - "encinitas"
+    - "oceanside"
+    - "carlsbad"
+    - "escondido"
+    - "california"
+  trusted_sources:
+    - "voiceofsandiego.org"
+    - "timesofsandiego.com"
+    - "kpbs.org"
+    - "obrag.org"
+    - "inewsource.org"
+    - "sandiegouniontribune.com"
+    - "nbcsandiego.com"
+    - "fox5sandiego.com"
+    - "10news.com"
+    - "sandiegomagazine.com"
+    - "sdnews.com"
+    - "coronadotimes.com"
+    - "countynewscenter.com"
+    - "sandiego.gov"
+
+# --- Source diversity ---
+# Cap on items from one outlet per section. The default 2 left the news section
+# with only two items on a day the Union-Tribune had the three biggest local
+# stories; a small local press corps justifies a looser cap.
+source_diversity:
+  max_per_source: 3
+
+# --- Cross-outlet duplicate collapse ---
+# One viral local story arrives from a dozen syndicating outlets with different
+# headlines. Threshold is Jaccard overlap of headline content words, calibrated
+# on live results: retellings of one story scored 0.23-0.47, distinct local
+# stories 0.00-0.17.
+news_similarity_dedup:
+  enabled: true
+  threshold: 0.3
+
+# --- Active public-safety alerts (National Weather Service) ---
+# Free, no API key, and scoped to exact zones -- the one reliable source for
+# "is there a heat warning where I live today". News search answers that
+# question with whatever storm is trending nationally.
+# Find your zones: curl 'https://api.weather.gov/points/<lat>,<lon>' and read
+# forecastZone / fireWeatherZone / county.
+#   CAZ043 = San Diego County Coastal Areas (forecast)
+#   CAZ243 = San Diego County Coastal Areas (fire weather)
+# The county zone CAC073 is deliberately omitted: it fires for inland desert
+# heat warnings that do not apply at the coast.
+alerts:
+  enabled: true
+  provider: "nws"
+  zones:
+    - "CAZ043"
+    - "CAZ243"
+  max_alerts: 4
+  timeout: 20
+  user_agent: "atlas-morning-briefing (${ALERT_CONTACT:-briefing@example.com})"
 
 # --- Section layout (no papers, no stocks, no defense features) ---
-# happenings renders first, right below the Executive Summary.
-section_order: ["happenings", "news", "blogs"]
+# alerts render first (they are the only time-critical items), then
+# happenings, then news, then local analysis.
+section_order: ["alerts", "happenings", "news", "blogs"]
 
 # --- Upcoming happenings (Pacific Beach / Mission Beach / Crown Point / Kate Sessions) ---
 # Dedicated Brave search for neighborhood events. Uses a wider freshness window
@@ -131,20 +305,20 @@ section_order: ["happenings", "news", "blogs"]
 # we only hit Brave for events once a week.
 happenings_fetch_weekday: 5
 happenings_queries:
-  - "Pacific Beach San Diego events upcoming"
-  - "Pacific Beach San Diego concerts festivals"
-  - "Mission Beach San Diego upcoming events"
-  - "Crown Point Mission Bay Park events San Diego"
-  - "Kate Sessions park events San Diego"
-  - "Pacific Beach Town Council community meeting"
-max_happenings: 6
+  - "things to do this weekend San Diego"
+  - "Pacific Beach San Diego events"
+  - "Mission Beach San Diego events"
+  - "Mission Bay San Diego park"
+  - "San Diego festivals concerts"
+max_happenings: 8
 happenings_freshness: "pw"
 
 # --- Custom section headings ---
 section_headings:
   executive_summary: "Executive Summary"
+  alerts: "Active Alerts"
   happenings: "Pacific Beach Area — Upcoming Happenings"
-  news: "San Diego / California News"
+  news: "Around You — What Changes This Week"
   blogs: "Local Sources & Analysis"
   errors: "Errors"
 

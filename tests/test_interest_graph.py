@@ -8,6 +8,8 @@ import pytest
 from scripts.interest_graph import (
     InterestGraph,
     Node,
+    Query,
+    query_freshness,
     generate_graph_queries,
     parse_graph,
     rank_leaves,
@@ -218,3 +220,76 @@ class TestGenerateGraphQueries:
         result = generate_graph_queries(graph, state, llm_client=llm)
         assert "Palantir AIP defense implementation" in result
         llm.invoke.assert_not_called()
+
+
+# ---------- retrieval bindings (freshness flows down the DAG) ----------
+
+
+class TestQueryBindings:
+    def _config(self) -> dict:
+        return {
+            "interest_graph": {
+                "max_dynamic_queries": 2,
+                "roots": [
+                    {
+                        "id": "local",
+                        "query": "Pacific Beach San Diego",
+                        "freshness": "pw",
+                        "children": [
+                            {"id": "mb", "query": "Mission Beach San Diego"},
+                            {"id": "cp", "query": "Crown Point San Diego",
+                             "freshness": "pm"},
+                        ],
+                    },
+                    {"id": "market", "query": "San Diego housing market",
+                     "children": [{"id": "rents", "query": "San Diego rent prices"}]},
+                ],
+            }
+        }
+
+    def test_children_inherit_root_freshness(self):
+        graph = parse_graph(self._config())
+        local = graph.roots[0]
+        assert local.freshness == "pw"
+        assert local.children[0].freshness == "pw"
+
+    def test_child_can_override_freshness(self):
+        graph = parse_graph(self._config())
+        assert graph.roots[0].children[1].freshness == "pm"
+
+    def test_unset_freshness_stays_none(self):
+        graph = parse_graph(self._config())
+        assert graph.roots[1].freshness is None
+        assert graph.roots[1].children[0].freshness is None
+
+    def test_query_freshness_falls_back_to_default(self):
+        assert query_freshness(Query("q", freshness="pw"), "pd") == "pw"
+        assert query_freshness(Query("q"), "pd") == "pd"
+        assert query_freshness("plain string", "pd") == "pd"
+
+    def test_query_behaves_like_a_string(self):
+        q = Query("Crown Point San Diego", freshness="pw", node_id="cp")
+        assert q == "Crown Point San Diego"
+        assert q in {"Crown Point San Diego"}
+        assert q.node_id == "cp"
+
+    def test_generated_queries_carry_their_binding(self):
+        graph = parse_graph(self._config())
+        result = generate_graph_queries(graph, {"top_news_titles": ["Crown Point Amazon"]})
+        by_text = {str(q): q for q in result}
+        assert by_text["Pacific Beach San Diego"].freshness == "pw"
+        assert by_text["San Diego housing market"].freshness is None
+        assert by_text["Crown Point San Diego"].freshness == "pm"
+
+    def test_childless_root_is_not_also_a_dig_candidate(self):
+        graph = InterestGraph(
+            roots=[
+                Node("solo", "solo root"),
+                Node("branch", "branch root",
+                     children=[Node("leaf", "leaf query")]),
+            ],
+            max_dynamic_queries=2,
+        )
+        assert [n.id for n in graph.leaves()] == ["leaf"]
+        result = generate_graph_queries(graph, {"top_news_titles": ["solo root leaf query"]})
+        assert result.count("solo root") == 1

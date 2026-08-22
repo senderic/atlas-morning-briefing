@@ -90,10 +90,54 @@ interest_profile:
 #   domain:    fills "a daily {domain} intelligence briefing"
 #   audience:  the reader the model writes for ("matter to {audience}")
 #   landscape: the field whose implications the weekly deep dive weighs
+#   actionable: when true, summaries lead with the date/place/cost/decision
+#               the reader can act on (default false)
+#   priorities: optional ordered ranking tiers used by news ranking, blog
+#               ranking, and the executive summary. Tier 1 fills most slots;
+#               lower tiers appear only when genuinely consequential. Omit to
+#               keep the default "rank by importance" behavior.
 briefing_profile:
   domain: "AI and technology"
   audience: "an AI researcher or engineer"
   landscape: "the AI and technology landscape"
+  # actionable: false
+  # priorities:
+  #   - "What changes the reader's day: outages, closures, deadlines, events."
+  #   - "Policy and rule changes with concrete effects."
+  #   - "Market and investment angles. Secondary -- never lead with them."
+
+# Default Brave freshness window for news queries with no branch binding
+# ("pd" past day, "pw" past week, "pm" past month). Interest-graph branches can
+# override it per node -- see references/config_guide.md.
+news_freshness: "pd"
+
+# Geographic relevance gate. Drops fetched news that never mentions a place
+# term before it reaches the LLM ranking layer; items from trusted_sources pass
+# without a match. Omit the block entirely to keep every result.
+# geo_filter:
+#   enabled: true
+#   place_terms: ["san diego", "california"]
+#   trusted_sources: ["voiceofsandiego.org"]
+
+# Cap on items from a single outlet per section (default 2).
+# source_diversity:
+#   max_per_source: 3
+
+# Collapse the same story syndicated by many outlets (Jaccard overlap of
+# headline content words). Disabled unless configured.
+# news_similarity_dedup:
+#   enabled: true
+#   threshold: 0.3
+
+# Active public-safety alerts (National Weather Service). Free, no API key,
+# rendered without the LLM. Find zones via api.weather.gov/points/<lat>,<lon>
+# and add "alerts" to section_order to render the section.
+# alerts:
+#   enabled: true
+#   provider: "nws"
+#   zones: ["CAZ043"]
+#   max_alerts: 4
+#   user_agent: "atlas-morning-briefing (you@example.com)"
 
 # Stock watchlist (Finnhub API)
 stocks:

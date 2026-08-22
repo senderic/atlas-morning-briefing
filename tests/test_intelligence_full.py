@@ -920,3 +920,182 @@ class TestBriefingProfile:
             papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[]
         )
         assert "climate science" in self._prompt_arg(mock_client)
+
+
+# ---------- life-first priority ordering + actionable summaries ----------
+
+
+class TestBriefingPriorities:
+    """`briefing_profile.priorities` / `.actionable` steer ranking prompts."""
+
+    LIFE_FIRST = {
+        "domain": "San Diego neighborhood life",
+        "audience": "a Pacific Beach resident",
+        "actionable": True,
+        "priorities": [
+            "Daily life nearby: closures, events, outages.",
+            "Dated obligations: public comment, fee deadlines.",
+            "Investment and business angles. Secondary.",
+        ],
+    }
+
+    def _prompt_arg(self, mock_client):
+        call = mock_client.invoke.call_args
+        return call.args[0] if call.args else call.kwargs.get("prompt", "")
+
+    def _intel(self, mock_client, default_config, profile):
+        config = dict(default_config)
+        config["briefing_profile"] = profile
+        return BriefingIntelligence(mock_client, config)
+
+    def test_defaults_are_off(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        assert intel.briefing_priorities == []
+        assert intel.briefing_actionable is False
+        assert intel._priority_block() == ""
+        assert intel._actionability_note() == ""
+
+    def test_blank_priority_entries_dropped(self, mock_client, default_config):
+        intel = self._intel(
+            mock_client, default_config, {"priorities": ["  ", "Life first", ""]}
+        )
+        assert intel.briefing_priorities == ["Life first"]
+
+    def test_priorities_ordered_in_news_prompt(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
+        )
+        prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in prompt
+        life = prompt.index("1. Daily life nearby")
+        dated = prompt.index("2. Dated obligations")
+        money = prompt.index("3. Investment and business")
+        assert life < dated < money
+        assert "ACTIONABILITY:" in prompt
+
+    def test_priorities_in_blog_and_synthesis_prompts(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+
+        mock_client.invoke.return_value = "[1] SCORE:4/5 summary"
+        intel.rank_and_summarize_blogs(
+            [{"title": "T", "source": "S", "summary": "s"}], topics=["x"]
+        )
+        blog_prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in blog_prompt
+        assert "ACTIONABILITY:" in blog_prompt
+
+        mock_client.invoke.return_value = "out"
+        intel.synthesize_briefing(
+            papers=[], blogs=[], stocks=[], news=[{"title": "N"}], top_papers=[]
+        )
+        synth_prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in synth_prompt
+        assert "1. Daily life nearby" in synth_prompt
+        assert "ACTIONABILITY:" in synth_prompt
+
+    def test_no_priority_block_without_config(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
+        )
+        prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" not in prompt
+        assert "ACTIONABILITY:" not in prompt
+
+    def test_happenings_prompt_gets_actionability(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_happenings(
+            [{"title": "Street fair", "source": "S", "description": "d"}]
+        )
+        assert "ACTIONABILITY:" in self._prompt_arg(mock_client)
+
+    def test_rank_directive_defers_to_priority_order(self, mock_client, default_config):
+        plain = BriefingIntelligence(mock_client, default_config)
+        assert plain._rank_directive() == "Rank by importance."
+        ranked = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        assert ranked._rank_directive() == (
+            "Rank by the priority order above, then by importance."
+        )
+
+
+class TestRankingInterests:
+    """News/blog ranking falls back to interest_profile when no arxiv topics."""
+
+    def test_uses_topics_when_present(self, intel):
+        assert intel._ranking_interests(["Agents", "Evals"]) == ["Agents", "Evals"]
+
+    def test_caps_topics_at_five(self, intel):
+        assert intel._ranking_interests([f"t{i}" for i in range(9)]) == [
+            f"t{i}" for i in range(5)
+        ]
+
+    def test_falls_back_to_interest_profile_by_weight(self, mock_client):
+        config = {
+            "arxiv_topics": [],
+            "interest_profile": [
+                {"topic": "Investment angles", "weight": 0.4},
+                {"topic": "Road closures nearby", "weight": 0.96},
+                {"topic": "Local events", "weight": 0.98},
+            ],
+        }
+        intel = BriefingIntelligence(mock_client, config)
+        assert intel._ranking_interests([]) == [
+            "Local events",
+            "Road closures nearby",
+            "Investment angles",
+        ]
+
+    def test_empty_when_nothing_configured(self, mock_client):
+        intel = BriefingIntelligence(mock_client, {})
+        assert intel._ranking_interests([]) == []
+
+    def test_local_profile_reaches_news_prompt(self, mock_client):
+        config = {
+            "arxiv_topics": [],
+            "interest_profile": [
+                {"topic": "Beach water quality advisories", "weight": 0.94},
+                {"topic": "Commercial real estate deals", "weight": 0.38},
+            ],
+        }
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=[]
+        )
+        call = mock_client.invoke.call_args
+        prompt = call.args[0] if call.args else call.kwargs.get("prompt", "")
+        assert "Beach water quality advisories" in prompt
+
+
+class TestSourceDiversityConfig:
+    """The per-outlet cap is config-driven (a small local press corps needs slack)."""
+
+    def _articles(self, n=5, source="sandiegouniontribune.com"):
+        return [
+            {"title": f"Story {i}", "source": source, "description": "d"}
+            for i in range(n)
+        ]
+
+    def test_defaults_to_two(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        assert intel.max_per_source == 2
+
+    def test_reads_config(self, mock_client, default_config):
+        config = dict(default_config)
+        config["source_diversity"] = {"max_per_source": 3}
+        intel = BriefingIntelligence(mock_client, config)
+        assert intel.max_per_source == 3
+
+    def test_cap_applied_to_news_ranking(self, mock_client, default_config):
+        config = dict(default_config)
+        config["source_diversity"] = {"max_per_source": 3}
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "\n".join(
+            f"[{i + 1}] summary {i}" for i in range(5)
+        )
+        result = intel.rank_and_summarize_news(self._articles(), topics=["x"])
+        assert len(result) == 3
