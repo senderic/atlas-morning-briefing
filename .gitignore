@@ -20,8 +20,15 @@ dist/
 *.pdf
 *.epub
 
+# Snapshot data (raw API responses for sender-trades)
+snapshots/
+
+# Output briefings
+briefings/
+
 # Runtime data
 .atlas-state.json
+.local-state.json
 state.json
 status.json
 blogs.json
@@ -35,6 +42,7 @@ logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl
 logs/gemini-audit-*.txt
+logs/local-gemini-calls.jsonl
 
 # IDE and Tools
 .vscode/
@@ -50,6 +58,7 @@ htmlcov/
 
 # Markdown files (except docs)
 *.md
+!AGENTS.md
 !CLAUDE.md
 !CONTRIBUTING.md
 !README.md
@@ -57,9 +66,12 @@ htmlcov/
 !GEMINI.md
 !SECURITY_FIXES.md
 !CHANGELOG.md
+!AI_LOG.md
 !examples/*.md
 !references/*.md
 !skills/*.md
+!.opencode/commands/*.md
+!.opencode/command/*.md
 atlas-morning-briefing.json
 .env
 uv.lock

@@ -3,16 +3,15 @@
 """
 Intelligence layer for morning briefing.
 
-Uses Gemini CLI models (via GeminiCLIClient) to add reasoning, synthesis,
-and summarization to the briefing pipeline. Falls back gracefully when the
-Gemini CLI is unavailable.
+Uses an LLM client to add reasoning, synthesis, and summarization to the
+briefing pipeline. Falls back gracefully when the LLM client is unavailable.
 """
 
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from scripts.gemini_client import GeminiCLIClient
+from scripts.llm_client import BaseLLMClient
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,15 +56,15 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, gemini: GeminiCLIClient, config: Dict[str, Any]):
+    def __init__(self, client: BaseLLMClient, config: Dict[str, Any]):
         """
         Initialize BriefingIntelligence.
 
         Args:
-            gemini: GeminiCLIClient instance.
+            client: BaseLLMClient instance.
             config: Full config dictionary.
         """
-        self.gemini = gemini
+        self.client = client
         self.config = config
         self.topics = config.get("arxiv_topics", [])
         # Domain framing for prompts is config-driven, never hardcoded here.
@@ -81,7 +80,7 @@ class BriefingIntelligence:
     @property
     def available(self) -> bool:
         """Check if intelligence features are available."""
-        return self.gemini.available
+        return self.client.available
 
     @staticmethod
     def extract_score(text: str) -> Tuple[int, str]:
@@ -214,7 +213,7 @@ class BriefingIntelligence:
             "Be selective. Only include papers that strongly match the profile."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -304,7 +303,7 @@ class BriefingIntelligence:
             "- Multi-agent orchestration frameworks release"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             logger.info("Dynamic query generation failed, using static queries only")
             return static_queries
@@ -351,7 +350,7 @@ class BriefingIntelligence:
             f"<topics>\n{topic_list}\n</topics>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             return topics
 
@@ -459,7 +458,7 @@ class BriefingIntelligence:
             "Each item must start with [n] or n."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="light", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -533,7 +532,7 @@ class BriefingIntelligence:
             f"<items>\n" + "\n\n".join(item_texts) + "\n</items>"
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="light")
         if not result:
             return items
 
@@ -588,8 +587,8 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+        result = self.client.invoke(
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -638,7 +637,7 @@ class BriefingIntelligence:
             "Example: [1] 8 Directly addresses agent evaluation methodology"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -723,8 +722,8 @@ class BriefingIntelligence:
             f"<papers>\n{papers_block}\n</papers>"
         )
 
-        result = self.gemini.invoke(
-            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
+        result = self.client.invoke(
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return papers
@@ -831,7 +830,7 @@ class BriefingIntelligence:
             "filler. Rank by importance. Be factual. Do not invent details."
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -856,7 +855,7 @@ class BriefingIntelligence:
 
         # Retry once with simpler prompt
         logger.warning(f"News ranking parse failed (attempt 1). LLM response: {result[:300]}")
-        retry_result = self.gemini.invoke(
+        retry_result = self.client.invoke(
             f"From these articles, pick the 5 most important for an AI researcher. "
             f"Format EXACTLY as: [number] summary sentence.\n\n{articles_block}",
             tier="medium", system_prompt=SYSTEM_PROMPT
@@ -928,8 +927,8 @@ class BriefingIntelligence:
             "Rank by relevance. Be concise."
         )
 
-        result = self.gemini.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+        result = self.client.invoke(
+            prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return blogs[:5]
@@ -1022,8 +1021,8 @@ class BriefingIntelligence:
             "Every stock MUST have a driver. Never leave blank."
         )
 
-        result = self.gemini.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+        result = self.client.invoke(
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
             return stocks
@@ -1089,7 +1088,7 @@ class BriefingIntelligence:
             "respond with NONE."
         )
 
-        result = self.gemini.invoke(prompt, tier="light")
+        result = self.client.invoke(prompt, tier="heavy")
         if not result or "NONE" in result.upper():
             return []
 
@@ -1138,17 +1137,29 @@ class BriefingIntelligence:
         sections = []
 
         if papers:
-            paper_titles = [p.get("title", "") for p in papers[:10]]
+            paper_items = []
+            for p in papers[:10]:
+                title = p.get("title", "")
+                summary = p.get("brief_summary", p.get("ai_summary", ""))
+                if summary:
+                    paper_items.append(f"- {title}: {summary}")
+                else:
+                    paper_items.append(f"- {title}")
             sections.append(
                 "PAPERS (" + str(len(papers)) + " total):\n"
-                + "\n".join(f"- {t}" for t in paper_titles)
+                + "\n".join(paper_items)
             )
 
         if blogs:
-            blog_items = [
-                f"- [{b.get('source', '')}] {b.get('title', '')}"
-                for b in blogs[:8]
-            ]
+            blog_items = []
+            for b in blogs[:8]:
+                source = b.get("source", "")
+                title = b.get("title", "")
+                summary = b.get("brief_summary", "")
+                if summary:
+                    blog_items.append(f"- [{source}] {title}: {summary}")
+                else:
+                    blog_items.append(f"- [{source}] {title}")
             sections.append("BLOGS:\n" + "\n".join(blog_items))
 
         if stocks:
@@ -1166,8 +1177,15 @@ class BriefingIntelligence:
                 sections.append("STOCKS:\n" + "\n".join(stock_items))
 
         if news:
-            news_titles = [n.get("title", "") for n in news[:10]]
-            sections.append("NEWS:\n" + "\n".join(f"- {t}" for t in news_titles))
+            news_items = []
+            for n in news[:10]:
+                title = n.get("title", "")
+                summary = n.get("brief_summary", "")
+                if summary:
+                    news_items.append(f"- {title}: {summary}")
+                else:
+                    news_items.append(f"- {title}")
+            sections.append("NEWS:\n" + "\n".join(news_items))
 
         if top_papers:
             top_items = []
@@ -1224,9 +1242,15 @@ class BriefingIntelligence:
                 + "\n</cross_source_signals>"
             )
 
+        # Inject today's date so the LLM doesn't hallucinate one from training-cutoff cues.
+        from datetime import datetime as _dt
+        _today_str = _dt.now().strftime("%B %d, %Y")
+
         prompt = (
             "You are writing the lead editorial -- the Executive Summary -- for "
-            f"today's {self.briefing_domain} intelligence briefing. This is "
+            f"today's {self.briefing_domain} intelligence briefing. "
+            f"The date is {_today_str}. "
+            "This is "
             "the one section every reader reads, so it must earn an A+ in a senior "
             "journalism seminar.\n\n"
             "Your job is NOT to list what happened. It is to CONNECT THE DOTS: "
@@ -1241,19 +1265,40 @@ class BriefingIntelligence:
             "the headlines, a new capability that shifts the strategic calculus.)\n"
             "3. What is the second-order implication -- the 'so what' a casual "
             "reader would miss?\n\n"
-            "Then write a tight 4-6 sentence editorial:\n"
-            "- Open with a strong, specific lede that states the day's main theme. "
+            "Then write the Executive Summary in a format optimized for quick "
+            "scanning -- a reader glancing at it should absorb ~80% of the "
+            "depth in 5 seconds:\n\n"
+            "STRUCTURE:\n"
+            "- **Bold a one-sentence headline** that states the day's single "
+            "most important thesis. This is the glanceable takeaway. "
             "No throat-clearing, no 'Today's briefing covers...'.\n"
-            "- Make at least one genuine cross-source connection, naming the "
-            "specifics.\n"
-            "- Land on the implication or the single thing worth watching next.\n"
-            "- Plain, vigorous, active voice. Concrete nouns and numbers. No "
-            "hedging, no jargon for its own sake, no bullet list -- flowing prose.\n"
-            "- GROUNDING (critical): every fact, number, dollar figure, company, "
-            "and product name must appear verbatim in the data below. Do NOT add "
-            "specifics from memory or infer figures that are not shown. If you "
-            "lack a concrete number, describe the move qualitatively rather than "
-            "inventing one. A vaguer true sentence beats a precise fabricated one.\n\n"
+            "- 3-5 short paragraphs (1-2 sentences each) separated by blank "
+            "lines. Develop the through-line, connect sources, deliver analysis.\n"
+            "- **Bold key tickers, numbers, and entities** to create visual "
+            "anchors for skimming (e.g., **NVDA -2.2%**, **$10B**, **Kimi K3**).\n"
+            "- At most one brief bullet list (2-3 items) if it genuinely helps "
+            "compare or contrast signals — otherwise stick to short paragraphs.\n"
+            "- End with **Watch:** or **The bottom line:** in bold, followed by "
+            "the single call-out worth tracking.\n\n"
+            "SELF-VERIFY before finalizing:\n"
+            "Re-read what you wrote. Would a skimmer reading only the bold text "
+            "and the first sentence of each paragraph get ~80% of the meaning? "
+            "If not, restructure: add bold anchors, tighten first sentences, "
+            "or break up dense paragraphs.\n\n"
+            "Voice: plain, vigorous, active. Concrete nouns and numbers.\n\n"
+            "GROUNDING -- ZERO TOLERANCE FOR HALLUCINATION:\n"
+            "- Every assertion, number, dollar figure, percentage, company name, "
+            "product name, and personnel name MUST appear verbatim in the <data> "
+            "section below. You may paraphrase the analysis that follows each "
+            "headline (the text after the colon), but you MUST NOT add new factual "
+            "content from outside knowledge.\n"
+            "- Do NOT infer, extrapolate, or generate specifics. If a concrete "
+            "figure is not shown in <data>, describe the trend qualitatively. "
+            "A vaguer true sentence beats a precise fabricated one.\n"
+            "- This is not a creative writing exercise. Every claim you make "
+            "must be traceable to the data provided. If you cannot anchor a "
+            "statement in the data, do not make it.\n"
+            f"If you reference today's date in the output, use exactly '{_today_str}' — do not infer or invent a different date.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
             "independent sources -- treat them as the strongest signal and build "
             "your through-line around them where they fit. If emerging themes or "
@@ -1262,7 +1307,7 @@ class BriefingIntelligence:
             f"{cross_source_note}"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
         if not result:
@@ -1270,6 +1315,186 @@ class BriefingIntelligence:
 
         logger.info("Briefing synthesis complete")
         return {"editorial_intro": result.strip()}
+
+    def generate_solo_startup_angle(
+        self,
+        papers: List[Dict[str, Any]],
+        blogs: List[Dict[str, Any]],
+        news: List[Dict[str, Any]],
+        top_papers: List[Dict[str, Any]],
+        emerging_themes: Optional[List[str]] = None,
+    ) -> str:
+        """Generate one concrete solo-founder (1-man company) startup angle
+        based on today's signals. Inspired by Pieter Levels / Daniel Vassallo style:
+        small, focused, AI-native, no-team, ship-fast, paid-from-day-one.
+
+        Returns markdown string (the angle), or empty string when unavailable.
+        """
+        if not self.available:
+            return ""
+
+        sections = []
+        if top_papers:
+            sections.append(
+                "TOP PAPERS:\n"
+                + "\n".join(
+                    f"- {p.get('title', '')}" for p in top_papers[:3]
+                )
+            )
+        if papers:
+            sections.append(
+                "OTHER PAPERS:\n"
+                + "\n".join(f"- {p.get('title', '')}" for p in papers[:6])
+            )
+        if blogs:
+            sections.append(
+                "BLOGS:\n"
+                + "\n".join(
+                    f"- [{b.get('source', '')}] {b.get('title', '')}"
+                    for b in blogs[:6]
+                )
+            )
+        if news:
+            sections.append(
+                "NEWS:\n"
+                + "\n".join(f"- {n.get('title', '')}" for n in news[:6])
+            )
+        if emerging_themes:
+            sections.append(
+                "EMERGING THEMES:\n"
+                + "\n".join(f"- {t}" for t in emerging_themes)
+            )
+
+        if not sections:
+            return ""
+
+        all_data = "\n\n".join(sections)
+
+        prompt = (
+            "You are a startup scout for a solo founder (1-man company) in the "
+            "style of Pieter Levels (Nomad List, Photo AI), Daniel Vassallo, "
+            "and the IndieHackers community. The founder is a senior AWS "
+            "principal engineer with strong backend / AI infra chops, no team, "
+            "and limited free hours per week. They want to build small, "
+            "focused, AI-native products that can be shipped in 2-6 weeks and "
+            "reach paying customers fast ($500-$10K MRR is great, no VC needed).\n\n"
+            "Based ONLY on today's signals below, propose ONE concrete solo "
+            "startup idea. Use this exact markdown structure (be terse, no fluff):\n\n"
+            "**Product:** <one sentence — what it does>\n"
+            "**Who pays:** <ICP — be specific about who and why they pay>\n"
+            "**Signal today:** <which paper/blog/news item triggered this and why>\n"
+            "**Wedge / unfair advantage:** <why a solo dev can win this niche>\n"
+            "**MVP in 2-4 weeks:** <3-5 bullets, concrete tech choices>\n"
+            "**Distribution:** <where/how to get the first 10 paying customers>\n"
+            "**Pricing:** <starting price, e.g. $19/mo, $99 one-time, etc.>\n"
+            "**Risk / why it might fail:** <one honest sentence>\n\n"
+            "Rules:\n"
+            "- Must be buildable solo. No 'platform', no 'marketplace requiring "
+            "liquidity', no enterprise sales cycle.\n"
+            "- Must reference TODAY's signals; don't propose generic ideas.\n"
+            "- Prefer wedges with painful, niche, willing-to-pay buyers.\n"
+            "- Boring beats clever. Distribution beats novelty.\n\n"
+            f"<signals>\n{all_data}\n</signals>"
+        )
+
+        result = self.client.invoke(
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
+        )
+        if not result:
+            return ""
+        logger.info("Solo-founder startup angle generated")
+        return result.strip()
+
+    def generate_agent_cost_optimization(
+        self,
+        papers: List[Dict[str, Any]],
+        blogs: List[Dict[str, Any]],
+        news: List[Dict[str, Any]],
+        top_papers: List[Dict[str, Any]],
+        emerging_themes: Optional[List[str]] = None,
+    ) -> str:
+        """Generate one concrete agent cost-optimization play grounded in today's signals.
+        Audience: AWS principal engineer running agents on Bedrock / Trainium / Inferentia,
+        thinking about $/session, latency, throughput, and how to actually move the number.
+        Returns markdown (the play), or empty string when unavailable.
+        """
+        if not self.available:
+            return ""
+
+        sections = []
+        if top_papers:
+            sections.append(
+                "TOP PAPERS:\n"
+                + "\n".join(
+                    f"- {p.get('title', '')}" for p in top_papers[:3]
+                )
+            )
+        if papers:
+            sections.append(
+                "OTHER PAPERS:\n"
+                + "\n".join(f"- {p.get('title', '')}" for p in papers[:6])
+            )
+        if blogs:
+            sections.append(
+                "BLOGS:\n"
+                + "\n".join(
+                    f"- [{b.get('source', '')}] {b.get('title', '')}"
+                    for b in blogs[:6]
+                )
+            )
+        if news:
+            sections.append(
+                "NEWS:\n"
+                + "\n".join(f"- {n.get('title', '')}" for n in news[:6])
+            )
+        if emerging_themes:
+            sections.append(
+                "EMERGING THEMES:\n"
+                + "\n".join(f"- {t}" for t in emerging_themes)
+            )
+
+        if not sections:
+            return ""
+
+        all_data = "\n\n".join(sections)
+
+        prompt = (
+            "You are an AWS principal engineer focused on agent cost "
+            "optimization. The reader runs LLM agents on AWS (Bedrock, "
+            "SageMaker, Trainium / Inferentia, Neuron SDK) and cares about "
+            "$/session, latency P50/P99, throughput, and total monthly spend. "
+            "They want ONE concrete cost-optimization play per day, grounded "
+            "in today's signals, that they could actually try this week.\n\n"
+            "Use this exact markdown structure (terse, no fluff):\n\n"
+            "**Play:** <one sentence — the specific tactic>\n"
+            "**Signal today:** <which paper/blog/news triggered this and why>\n"
+            "**Mechanism:** <how it reduces cost: caching, routing, distillation, "
+            "context compression, batching, KV reuse, speculative decoding, "
+            "smaller model, tool reduction, etc.>\n"
+            "**Estimated impact:** <concrete % or $ range — e.g. '30-50% fewer "
+            "input tokens', '$0.012 → $0.003 per session', '2x throughput on "
+            "trn1.2xlarge'. Be honest about uncertainty.>\n"
+            "**AWS-specific angle:** <Bedrock prompt caching, Trainium NKI, "
+            "Inferentia, SageMaker batch, etc. — what to actually use>\n"
+            "**Try this week:** <3-5 bullets, concrete steps, time estimate>\n"
+            "**Watch-out:** <one honest sentence on where the savings might "
+            "not materialize — e.g. cold-cache, quality regression, hidden cost>\n\n"
+            "Rules:\n"
+            "- Reference TODAY's signals; don't propose generic AWS Well-Architected fluff.\n"
+            "- Prefer plays with measurable $/% impact over architectural opinions.\n"
+            "- Be specific about model IDs, instance types, or AWS services when relevant.\n"
+            "- If today's signals don't suggest a strong play, say so honestly and "
+            "propose the smallest useful experiment.\n\n"
+            f"<signals>\n{all_data}\n</signals>"
+        )
+
+        result = self.client.invoke(
+            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
+        )
+        if not result:
+            return ""
+        logger.info("Agent cost-optimization play generated")
+        return result.strip()
 
     def track_trending(
         self,
@@ -1342,7 +1567,7 @@ class BriefingIntelligence:
             "[5] NEW claude-3.5-haiku\n"
         )
 
-        result = self.gemini.invoke(prompt, tier="light", system_prompt=SYSTEM_PROMPT)
+        result = self.client.invoke(prompt, tier="light", system_prompt=SYSTEM_PROMPT)
         if not result:
             logger.info("Trending tracking skipped (LLM unavailable)")
             return state, papers, blogs, news
@@ -1569,7 +1794,7 @@ class BriefingIntelligence:
             f"<week_items>\n{context_str}\n</week_items>"
         )
 
-        result = self.gemini.invoke(
+        result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
 

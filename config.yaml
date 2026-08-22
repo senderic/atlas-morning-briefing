@@ -191,6 +191,14 @@ output_format: "kindle"
 email_recipients:
   - "${RECIPIENT_EMAIL:-your-email@example.com}"
 
+# Output directory for generated briefings
+output_dir: briefings
+
+# Snapshot settings (saves raw API data for sender-trades to source from)
+snapshot:
+  enabled: true
+  dir: snapshots
+
 # File naming pattern
 file_naming: "Atlas-Briefing-{yyyy}.{mm}.{dd}"
 
@@ -207,6 +215,13 @@ max_news: 15
 
 # Concurrency settings
 max_workers: 1
+
+# LLM fallback chain tuning
+composite:
+  # Max seconds to wait on any single backend before skipping it and moving to
+  # the next fallback. Prevents a quota-exhausted/hanging backend (e.g. Gemini
+  # heavy-tier retry loop) from stalling the run and blocking email delivery.
+  timeout_seconds: 240
 
 # PDF settings
 pdf:
@@ -236,6 +251,56 @@ gemini:
     heavy: "pro"
     medium: "flash"
     light: "flash-lite"
+
+# OpenCode configuration (alternative to Gemini CLI).
+# When enabled, the pipeline uses `opencode run` with free-tier models
+# (e.g. opencode/deepseek-v4-flash-free) instead of the Gemini CLI.
+# Requires `opencode` binary on PATH. Use `--dry-run` to test.
+opencode:
+  enabled: true
+  models:
+    heavy: "opencode-go/deepseek-v4-pro"
+    medium: "opencode/deepseek-v4-flash-free"
+    light: "opencode/deepseek-v4-flash-free"
+  # Fallback chain tried (in order) when the primary model for a tier fails
+  # (non-zero exit, empty response, or timeout).
+  fallback_models:
+    heavy: ["opencode-go/deepseek-v4-flash"]
+    medium: ["opencode-go/deepseek-v4-flash"]
+    light: ["opencode-go/deepseek-v4-flash"]
+  max_calls_per_run: 50
+  # Per-call timeout. 120s is generous — fast failures (model not found,
+  # insufficient balance, rate limit) are detected immediately via NDJSON
+  # error events and skip straight to the fallback chain without waiting
+  # for the timeout.
+  timeout: 120
+  # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
+  # instead of the free opencode model. Used in the usage summary footer.
+  pricing:
+    input_per_million: 0.14    # $0.14 per 1M input tokens
+    output_per_million: 0.28   # $0.28 per 1M output tokens
+
+# OpenRouter configuration (OpenAI-compatible API fallback).
+# Requires an API key: OPENROUTER_API_KEY or OPENAI_API_KEY (pointing at
+# OpenRouter) in the environment.
+openrouter:
+  enabled: true
+  api_base: "https://openrouter.ai/api/v1/chat/completions"
+  models:
+    heavy: "deepseek/deepseek-v4-pro"
+    medium: "deepseek/deepseek-chat"
+    light: "deepseek/deepseek-chat"
+  fallback_models:
+    heavy: ["openrouter/auto"]
+    medium: ["openrouter/auto"]
+    light: ["openrouter/auto"]
+  max_calls_per_run: 50
+  timeout: 120
+  max_tokens: 2048
+  temperature: 0.3
+  pricing:
+    input_per_million: 0.25   # $0.25 per 1M input tokens
+    output_per_million: 0.75  # $0.75 per 1M output tokens
 
 # Amazon Bedrock configuration
 # Set enabled: false to run in deterministic mode (no LLM, zero cost)

@@ -109,36 +109,38 @@ class TestGeminiCLIClient:
         mock_run.side_effect = subprocess.CalledProcessError(1, ["gemini"], stderr="Fatal error")
         client = GeminiCLIClient(mock_config)
         client._available = True
-        
-        # Disable fallback for this test to focus on single tier failure
-        response = client.invoke("Prompt", tier="medium", allow_fallback=False)
-        
+
+        # Fatal error is classified "fallback" (out-of-usage). Pin rotation to
+        # fail so we stop after the first attempt regardless of env keys.
+        with patch.object(client, '_rotate_key', return_value=False):
+            # Disable fallback for this test to focus on single tier failure
+            response = client.invoke("Prompt", tier="medium", allow_fallback=False)
+
         assert response is None
         # Should have 1 failed attempt (no retry because "Fatal error" isn't a quota keyword)
         assert client.usage_stats["medium"]["failed_attempts"] == 1
         assert client.usage_stats["medium"]["calls"] == 0
 
     @patch("subprocess.run")
-    def test_invoke_retry_and_rotation_tracking(self, mock_run, mock_config):
-        # Mock 2 quota failures then 1 success
-        # "429" triggers retry/rotation
+    @patch("time.sleep")
+    def test_invoke_retry_and_rotation_tracking(self, mock_sleep, mock_run, mock_config):
+        # Mock 2 quota failures then 1 success.
+        # "429 quota" is a retryable (transient) error → backoff + rotate.
         mock_run.side_effect = [
             subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
             subprocess.CalledProcessError(1, ["gemini"], stderr="Error: 429 quota exceeded"),
             MagicMock(returncode=0, stdout='{"response": "Success after retries"}')
         ]
-        
+
         # Add multiple keys to allow rotation
         with patch.dict(os.environ, {"GEMINI_API_KEY": "key1,key2,key3"}):
             client = GeminiCLIClient(mock_config)
             client._available = True
             # Shorten delays for test
             client.key_swap_delay = 0.01
-            
-            # Using patch to avoid long exponential waits in test
-            with patch("scripts.gemini_client.wait_random_exponential", return_value=lambda x: 0.01):
-                response = client.invoke("Prompt", tier="heavy")
-        
+
+            response = client.invoke("Prompt", tier="heavy")
+
         assert response == "Success after retries"
         # 2 failures + 1 success
         assert client.usage_stats["heavy"]["failed_attempts"] == 2

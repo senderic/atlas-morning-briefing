@@ -146,11 +146,13 @@ def run_live_briefing(logger: logging.Logger) -> Path:
     today = datetime.datetime.now()
     glob_pattern = f"Atlas-Briefing-{today.year}.{today.month:02d}.{today.day:02d}*.md"
     candidates = sorted(REPO_ROOT.glob(glob_pattern))
+    # Also check briefings/ subdirectory
+    candidates.extend(sorted((REPO_ROOT / "briefings").glob(glob_pattern)))
     if not candidates:
         raise FileNotFoundError(
             f"No briefing markdown found matching {glob_pattern} in "
-            f"{REPO_ROOT}. The runner may have failed before writing the "
-            f"file — check the alignment log."
+            f"{REPO_ROOT} or briefings/. The runner may have failed before "
+            f"writing the file — check the alignment log."
         )
     return candidates[-1]
 

@@ -35,9 +35,15 @@ except ImportError:
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-
 # DeepXiv is an optional upgrade — if not installed, ArxivScanner is used.
+# 2026-07-03: DeepXiv index is stale (returns 0 papers on all queries since ~mid-June 2026).
+# Force-disable DeepXiv and use legacy arxiv.org API directly — reliable in cron path.
+# Re-enable when DeepXiv confirms index refresh.
+FORCE_DISABLE_DEEPXIV = True
+
 try:
+    if FORCE_DISABLE_DEEPXIV:
+        raise ImportError("DeepXiv force-disabled (stale index, see 2026-07-03 fix)")
     from deepxiv_sdk import Reader as DeepXivReader  # type: ignore
     HAS_DEEPXIV = True
 except ImportError:
@@ -452,6 +458,21 @@ class DeepXivScanner:
                     seen_ids.add(pid)
 
         logger.info(f"Total unique papers: {len(all_papers)}")
+
+        # 2026-06-27: DeepXiv index appears to be stale (no papers indexed past ~early June 2026).
+        # If we got nothing, fall back to direct arxiv.org API.
+        if len(all_papers) == 0:
+            logger.warning("DeepXiv returned 0 papers across all topics — falling back to legacy arxiv.org API")
+            try:
+                legacy = ArxivScanner(
+                    topics=self.topics, days_back=self.days_back, max_results=self.max_results
+                )
+                fallback_papers = legacy.scan_all_topics()
+                logger.info(f"Legacy ArXiv fallback returned {len(fallback_papers)} papers")
+                return fallback_papers
+            except Exception as e:
+                logger.error(f"Legacy ArXiv fallback failed: {e}")
+                return []
 
         # Enrich top 10 papers with briefs (saves DeepXiv API budget)
         top_papers = sorted(

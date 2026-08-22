@@ -58,8 +58,9 @@ class TestRunOrchestration:
             rc = runner_with_data.run()
         assert rc in (0, 1)
         # Files generated even without PDF (EPUB always on)
-        md_files = list(tmp_path.glob("Test-*.md"))
-        epub_files = list(tmp_path.glob("Test-*.epub"))
+        output_dir = tmp_path / "briefings"
+        md_files = list(output_dir.glob("Test-*.md"))
+        epub_files = list(output_dir.glob("Test-*.epub"))
         assert len(md_files) == 1
         assert len(epub_files) == 1
 
@@ -73,7 +74,7 @@ class TestRunOrchestration:
              patch.object(runner, "run_stock_fetch", return_value=[]), \
              patch.object(runner, "run_news_aggregation", return_value=[]):
             runner.run()
-        assert list(tmp_path.glob("Test-*.pdf"))
+        assert list((tmp_path / "briefings").glob("Test-*.pdf"))
         assert runner.status["pdf_generated"] is True
 
     def test_run_records_errors_returns_1(self, runner_with_data):
@@ -237,8 +238,8 @@ class TestEnsurePaperSummaries:
         runner = BriefingRunner(base_config, dry_run=True)
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
-        runner.intelligence.gemini = MagicMock()
-        runner.intelligence.gemini.invoke.return_value = (
+        runner.intelligence.client = MagicMock()
+        runner.intelligence.client.invoke.return_value = (
             "[1] SCORE:4/5 Generated summary text."
         )
         runner.intelligence._parse_ranked_response = MagicMock(

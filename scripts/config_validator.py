@@ -8,6 +8,7 @@ Validates config.yaml values at startup to catch errors early.
 
 import logging
 import os
+import shutil
 from typing import Any, Dict, List, Tuple
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
@@ -115,6 +116,29 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
     output_format = config.get("output_format")
     if output_format and output_format not in ("kindle", "a4", "letter"):
         errors.append(f"'output_format' must be 'kindle', 'a4', or 'letter', got '{output_format}'")
+
+    # --- Opencode config ---
+    opencode = config.get("opencode")
+    if opencode is not None:
+        if not isinstance(opencode, dict):
+            errors.append("'opencode' must be a dictionary")
+        elif opencode.get("enabled"):
+            if not shutil.which("opencode"):
+                warnings.append(
+                    "'opencode.enabled' is true but 'opencode' binary not found "
+                    "on PATH — install opencode or set 'opencode.enabled: false'"
+                )
+            models = opencode.get("models")
+            if models is not None:
+                if not isinstance(models, dict):
+                    errors.append("opencode.models must be a dictionary")
+                else:
+                    for tier in models:
+                        if tier not in ("heavy", "medium", "light"):
+                            warnings.append(
+                                f"opencode.models.{tier} is not a recognized tier "
+                                "(expected: heavy, medium, light)"
+                            )
 
     # --- Bedrock config ---
     bedrock = config.get("bedrock")

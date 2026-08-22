@@ -32,6 +32,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.workers.papers_worker import PapersWorker
+from scripts.snapshot_manager import SnapshotManager
 from scripts.workers.blogs_worker import BlogsWorker
 from scripts.workers.news_market_worker import NewsMarketWorker
 from scripts.bedrock_client import BedrockClient
@@ -74,6 +75,12 @@ class BriefingCoordinator:
         self.memory_dir = MEMORY_DIR
         self.memory_dir.mkdir(exist_ok=True)
 
+        snapshot_cfg = config.get("snapshot", {})
+        self.snapshot_manager = SnapshotManager(
+            snapshot_dir=snapshot_cfg.get("dir", "snapshots"),
+            enabled=snapshot_cfg.get("enabled", True),
+        )
+
     def run(self) -> int:
         """
         Run the v0.2 coordinator workflow.
@@ -102,6 +109,14 @@ class BriefingCoordinator:
 
         # Extract items from findings
         papers, blogs, news, stocks = self._extract_items(findings)
+
+        # --- Save raw data snapshots ---
+        logger.info("=== Saving raw data snapshots ===")
+        self.snapshot_manager.save_stocks(stocks)
+        self.snapshot_manager.save_news(news)
+        self.snapshot_manager.save_blogs(blogs)
+        self.snapshot_manager.save_papers(papers)
+        self.snapshot_manager.save_manifest()
 
         # Coordinator synthesis (NOT lazy delegation - reads all findings)
         logger.info("=== Coordinator Synthesis ===")
@@ -428,7 +443,9 @@ class BriefingCoordinator:
 
     def _generate_pdf(self, content: str, filename: str) -> Path:
         """Generate PDF from markdown content."""
-        output_path = f"{filename}.pdf"
+        output_dir = self.config.get("output_dir", "briefings")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        output_path = f"{output_dir}/{filename}.pdf"
         logger.info(f"Generating PDF: {output_path}")
         # Extract PDF config
         pdf_config = self.config.get("pdf", {})

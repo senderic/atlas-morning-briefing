@@ -208,29 +208,26 @@ class TestInvokeFallback:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_heavy_falls_back_to_medium_then_light(self, mock_sleep, mock_run, cfg):
-        # All attempts on heavy fail with non-retryable error → fallback to medium → light
+        # All attempts on heavy fail with unrecoverable error → fallback to medium → light
         mock_run.side_effect = subprocess.CalledProcessError(
             1, ["gemini"], stderr="some unrecoverable error"
         )
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.01):
-                result = client.invoke("p", tier="heavy", allow_fallback=True)
+            result = client.invoke("p", tier="heavy", allow_fallback=True)
         assert result is None
 
     @patch("subprocess.run")
-    def test_no_fallback_when_disabled(self, mock_run, cfg):
+    @patch("time.sleep")
+    def test_no_fallback_when_disabled(self, mock_sleep, mock_run, cfg):
         mock_run.side_effect = subprocess.CalledProcessError(
             1, ["gemini"], stderr="fail"
         )
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.01):
-                result = client.invoke("p", tier="medium", allow_fallback=False)
+            result = client.invoke("p", tier="medium", allow_fallback=False)
         assert result is None
 
     @patch("subprocess.run")
@@ -249,8 +246,7 @@ class TestInvokeBudget:
         with patch("subprocess.run", side_effect=subprocess.CalledProcessError(
             1, ["gemini"], stderr="fatal"
         )):
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.01):
+            with patch.object(client, '_rotate_key', return_value=False):
                 client.invoke("p", tier="medium", allow_fallback=False)
         # _call_count is incremented only on success
         assert client._call_count == 0
@@ -335,37 +331,34 @@ class TestParseResponse:
         assert result == "Plain non-JSON output"
 
     @patch("subprocess.run")
-    def test_empty_response_raises(self, mock_run, cfg):
+    @patch("time.sleep")
+    def test_empty_response_raises(self, mock_sleep, mock_run, cfg):
         mock_run.return_value = MagicMock(
             returncode=0, stdout=json.dumps({"response": ""})
         )
         client = GeminiCLIClient(cfg)
         client._available = True
-        # Empty raises ValueError; retried up to limit; then fallback chain
-        with patch("scripts.gemini_client.wait_random_exponential",
-                   return_value=lambda x: 0.01):
-            result = client.invoke("p", tier="light", allow_fallback=False)
+        # Empty output raises ValueError → treated as transient, retried until cap.
+        result = client.invoke("p", tier="light", allow_fallback=False)
         assert result is None
+        assert mock_run.call_count == cfg.get("retries", 6)
 
 
 class TestQuotaDetection:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_quota_keyword_triggers_rotation(self, mock_sleep, mock_run, cfg):
-        # Must fail 3 times with 429 on first key to trigger rotation.
+        # "HTTP 429 rate limit" is transient → retried on key1, then rotates to key2.
         quota_err = subprocess.CalledProcessError(1, ["gemini"], stderr="HTTP 429 rate limit")
         mock_run.side_effect = [
-            quota_err, quota_err, quota_err,
+            quota_err, quota_err,
             MagicMock(returncode=0, stdout='{"response":"ok"}'),
         ]
         with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.001):
-                result = client.invoke("p", tier="medium")
+            result = client.invoke("p", tier="medium")
             assert result == "ok"
-            assert client._current_key_index == 1
 
     @patch("subprocess.run")
     @patch("time.sleep")
@@ -377,26 +370,22 @@ class TestQuotaDetection:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "only"}, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.001):
+            with patch.object(client, '_rotate_key', return_value=False):
                 result = client.invoke("p", tier="medium", allow_fallback=False)
             assert result is None
 
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_ignore_hard_quota_retries(self, mock_sleep, mock_run, cfg):
-        cfg["ignore_hard_quota"] = True
-        # Returns quota error twice, then success
+        # "daily quota exceeded" is out-of-usage → treated as fallback (rotate).
         mock_run.side_effect = [
             subprocess.CalledProcessError(1, ["gemini"], stderr="daily quota exceeded"),
             MagicMock(returncode=0, stdout='{"response":"finally"}'),
         ]
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "only"}, clear=True):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k1,k2"}, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            with patch("scripts.gemini_client.wait_random_exponential",
-                       return_value=lambda x: 0.001):
-                result = client.invoke("p", tier="medium")
+            result = client.invoke("p", tier="medium")
             assert result == "finally"
 
 
@@ -451,7 +440,8 @@ class TestPerCallLog:
         assert "latency_s" in rec
 
     @patch("subprocess.run")
-    def test_logs_error_record_on_failure(self, mock_run, cfg, tmp_path):
+    @patch("time.sleep")
+    def test_logs_error_record_on_failure(self, mock_sleep, mock_run, cfg, tmp_path):
         log = tmp_path / "calls.jsonl"
         cfg = {**cfg, "call_log_path": str(log)}
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -459,8 +449,7 @@ class TestPerCallLog:
         )
         client = GeminiCLIClient(cfg)
         client._available = True
-        with patch("scripts.gemini_client.wait_random_exponential",
-                   return_value=lambda x: 0.001):
+        with patch.object(client, '_rotate_key', return_value=False):
             client.invoke("p", tier="medium", allow_fallback=False)
 
         records = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]

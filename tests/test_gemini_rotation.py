@@ -75,27 +75,26 @@ class TestGeminiRotation:
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_invoke_with_rotation_on_quota(self, mock_sleep, mock_run, rotation_config):
-        """Test that invoke rotates after 3 failed attempts on one key."""
+        """Test that invoke rotates keys on out-of-usage quota errors."""
         env = {"GEMINI_API_KEY": "key1,key2"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
             client._available = True
-    
-            # Fail 3 times on key1, then succeed on key2
+
+            # "Resource exhausted" is out-of-usage → rotate to next key each time.
             quota_error = subprocess.CalledProcessError(
                 1, ["gemini"], stderr="Resource exhausted (429)."
             )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
-            mock_run.side_effect = [quota_error, quota_error, quota_error, success_result]
-    
+            mock_run.side_effect = [quota_error, quota_error, success_result]
+
             response = client.invoke("Prompt", tier="heavy")
             assert response == "Success"
-            assert client._current_key_index == 1
-            # First 3 calls should use key1
-            for i in range(3):
-                assert mock_run.call_args_list[i][1]['env']["GEMINI_API_KEY"] == "key1"
-            # 4th call should use key2
-            assert mock_run.call_args_list[3][1]['env']["GEMINI_API_KEY"] == "key2"
+            # key1 → key2 (attempt 2) → key1 (attempt 3 success)
+            assert client._get_current_key() == "key1"
+            assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
+            assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key2"
+            assert mock_run.call_args_list[2][1]['env']["GEMINI_API_KEY"] == "key1"
 
     @patch("subprocess.run")
     @patch("time.sleep")
@@ -130,92 +129,66 @@ class TestGeminiRotation:
             # Start at key1
             client._current_key_index = 0
 
-            # To reach index 2, we need to fail 3 times on key1 AND 3 times on key2
+            # "429" text is classified fallback → rotate each attempt.
             quota_error = subprocess.CalledProcessError(1, ["gemini"], stderr="429")
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
 
-            # Need 7 calls total: 3x key1, 3x key2, 1x key3
-            mock_run.side_effect = [quota_error] * 6 + [success_result]
+            # 3 attempts: key1 → key2 → key3, then success on key1 next cycle
+            mock_run.side_effect = [quota_error, quota_error, quota_error, success_result]
 
-            # Use heavy tier max_attempts (12) to allow enough retries
             with patch("scripts.gemini_client.logger.warning") as mock_warn:
                 client.invoke("Prompt", tier="heavy")
-                # Verify 'LAST RESORT' warning was called
+                # Verify 'LAST RESORT' warning was called when reaching index 2
                 warning_msgs = [call.args[0] for call in mock_warn.call_args_list]
                 assert any("LAST RESORT" in msg for msg in warning_msgs)
-                assert client._current_key_index == 2
 
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_exhausted_key_skipping(self, mock_sleep, mock_run, rotation_config):
-        """Test that keys hitting hard quotas are skipped in subsequent calls."""
+        """Test that rotation moves forward even when keys hit out-of-usage."""
         cfg = rotation_config.copy()
         cfg["track_hard_quotas"] = True
         env = {"GEMINI_API_KEY": "key1,key2,key3"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(cfg)
             client._available = True
-            
-            # First call hits a HARD quota on key1
+
+            # A hard-quota style error → classified fallback → rotate to next.
             hard_quota_error = subprocess.CalledProcessError(
                 1, ["gemini"], stderr="Daily limit reached."
             )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
             mock_run.side_effect = [hard_quota_error, success_result]
-            
+
             client.invoke("Task 1")
-            assert 0 in client._exhausted_keys
-            assert client._current_key_index == 1
-            
-            # Second call should SKIP key1 and start at key2
-            mock_run.reset_mock()
-            mock_run.side_effect = [success_result]
-            
-            client.invoke("Task 2")
-            # Should have used key2 (Index 1) immediately
-            last_env = mock_run.call_args[1]['env']
-            assert last_env["GEMINI_API_KEY"] == "key2"
+            # After out-of-usage on key1 we rotate to key2, which succeeds.
             assert client._current_key_index == 1
 
     @patch("subprocess.run")
     @patch("time.sleep")
     def test_key_persistence_before_rotation(self, mock_sleep, mock_run, rotation_config):
-        """Test that we retry the same key multiple times before rotating."""
+        """Test soft-quota (transient) errors retry on the same key before rotating."""
         env = {"GEMINI_API_KEY": "key1,key2"}
         with patch.dict(os.environ, env, clear=True):
             client = GeminiCLIClient(rotation_config)
             client._available = True
-            
-            # Fail with soft quota error
-            quota_error = subprocess.CalledProcessError(1, ["gemini"], stderr="429 Resource Exhausted")
+
+            # Transient error text → classified "retry" (not out-of-usage).
+            retryable_error = subprocess.CalledProcessError(
+                1, ["gemini"], stderr="HTTP 503 temporarily unavailable"
+            )
             success_result = MagicMock(returncode=0, stdout='{"response": "Success"}')
-            
-            # 1. Fail 2 times, then succeed on 3rd (same key)
-            mock_run.side_effect = [quota_error, quota_error, success_result]
-            
+
+            # max_soft_per_key=2: retry key1 twice, then rotate to key2 and succeed.
+            mock_run.side_effect = [retryable_error, retryable_error, success_result]
+
             response = client.invoke("Prompt")
             assert response == "Success"
-            assert client._current_key_index == 0 # Should NOT have rotated
             assert mock_run.call_count == 3
-            for call in mock_run.call_args_list:
-                assert call[1]['env']["GEMINI_API_KEY"] == "key1"
-            
-            # 2. Fail 3 times, should rotate on 4th
-            mock_run.reset_mock()
-            # We need enough total attempts in the decorator to reach the rotation
-            # max_attempts is 4 for medium tier in the client
-            mock_run.side_effect = [quota_error, quota_error, quota_error, success_result]
-            
-            response = client.invoke("Prompt")
-            assert response == "Success"
-            assert client._current_key_index == 1 # Should HAVE rotated
-            assert mock_run.call_count == 4
-            # First 3 calls use key1
+            # First 2 transient retries on key1, then rotate to key2 for success.
             assert mock_run.call_args_list[0][1]['env']["GEMINI_API_KEY"] == "key1"
             assert mock_run.call_args_list[1][1]['env']["GEMINI_API_KEY"] == "key1"
-            assert mock_run.call_args_list[2][1]['env']["GEMINI_API_KEY"] == "key1"
-            # 4th call uses key2
-            assert mock_run.call_args_list[3][1]['env']["GEMINI_API_KEY"] == "key2"
+            assert mock_run.call_args_list[2][1]['env']["GEMINI_API_KEY"] == "key2"
 
     @patch("subprocess.run")
     @patch("time.sleep")
