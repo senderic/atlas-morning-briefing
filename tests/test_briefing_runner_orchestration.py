@@ -296,3 +296,56 @@ class TestMarkdownLeakGuards:
         )
         assert "This Week in AI" not in md
         assert "Strict Grounding" not in md
+
+
+class TestStatusFilePerPipeline:
+    """Two pipelines on one machine must not overwrite each other's status."""
+
+    def _runner(self, base_config, tmp_path, monkeypatch, **overrides):
+        monkeypatch.chdir(tmp_path)
+        config = dict(base_config)
+        config.update(overrides)
+        return BriefingRunner(config, dry_run=True)
+
+    def test_defaults_to_status_json(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        runner.save_status()
+        assert (tmp_path / "status.json").exists()
+
+    def test_honors_configured_filename(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(
+            base_config, tmp_path, monkeypatch, status_file_path="status-local.json"
+        )
+        runner.save_status()
+        assert (tmp_path / "status-local.json").exists()
+        assert not (tmp_path / "status.json").exists()
+
+    def test_two_pipelines_do_not_clobber_each_other(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        atlas = self._runner(
+            base_config, tmp_path, monkeypatch,
+            status_file_path="status.json", pipeline_name="atlas",
+        )
+        atlas.status["papers_found"] = 12
+        atlas.save_status()
+
+        local = self._runner(
+            base_config, tmp_path, monkeypatch,
+            status_file_path="status-local.json", pipeline_name="local",
+        )
+        local.status["papers_found"] = 0
+        local.save_status()
+
+        with open(tmp_path / "status.json") as f:
+            saved_atlas = json.load(f)
+        assert saved_atlas["papers_found"] == 12
+        assert saved_atlas["pipeline"] == "atlas"
+
+    def test_pipeline_name_is_recorded(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        runner = self._runner(base_config, tmp_path, monkeypatch, pipeline_name="local")
+        runner.save_status()
+        with open(tmp_path / "status.json") as f:
+            assert json.load(f)["pipeline"] == "local"

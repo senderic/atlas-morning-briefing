@@ -4,6 +4,10 @@
 
 # --- Pipeline identity ---
 state_file_path: ".local-state.json"
+# Own status file: run_briefing.sh runs this pipeline ~15 min after the main
+# one, and a shared status.json means the second run erases the first's counters.
+status_file_path: "status-local.json"
+pipeline_name: "local"
 briefing_title: "San Diego Local News Briefing"
 file_naming: "Local-Briefing-{yyyy}.{mm}.{dd}"
 
@@ -446,3 +450,32 @@ composite:
 
 bedrock:
   enabled: false
+
+# --- Daily quality check (scripts/quality_check.py, cron 06:40) ---
+# See references/quality_monitoring_design.md.
+quality_check:
+  # Minimum item counts before a section is called thin (INFO only).
+  section_floors:
+    news: 3
+    happenings: 2
+    blogs: 3
+  judge:
+    # The full rubric: this briefing is judged on being life-first and local.
+    dimensions:
+      - "tier_1_share"
+      - "lead_alignment"
+      - "actionability"
+      - "locality"
+      - "specificity"
+      - "freshness"
+  source_health:
+    # A feed that 404s or stops parsing: WARN once, CRITICAL if it persists.
+    dead_url_runs: 3
+    # A feed that still returns 200 but has not published in this long.
+    stale_after_days: 90
+    # Zero items for this many consecutive runs, only alerting when the feed's
+    # own trailing median says it used to contribute.
+    zero_run_threshold: 7
+    median_window: 30
+    # Queries whose trailing mean yield is below 1 are pure quota burn.
+    query_window: 14

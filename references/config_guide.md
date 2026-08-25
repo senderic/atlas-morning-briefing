@@ -188,6 +188,58 @@ may not apply at the coast.
 Add `"alerts"` to `section_order` to render the section, and a matching
 `section_headings.alerts` label.
 
+## Pipeline Identity
+
+Each pipeline on a machine needs its own status file. `run_briefing.sh` runs the
+main briefing and then the local one about fifteen minutes later; with a shared
+filename the second run silently overwrites the first run's counters, and any
+monitoring reading that file reports one pipeline's numbers as if they were both.
+
+```yaml
+pipeline_name: "atlas"          # recorded inside the status file
+status_file_path: "status.json" # local pipeline uses "status-local.json"
+```
+
+Both keys are optional; omitting them keeps the previous behavior
+(`status.json`, no pipeline label).
+
+## Daily Quality Check
+
+Configuration for `scripts/quality_check.py`, which runs after the briefings and
+reviews what they produced. See `references/quality_monitoring_design.md` for the
+design and `run_quality_check.sh` for the cron entry.
+
+```yaml
+quality_check:
+  # Item counts below which a section is called thin (INFO only).
+  section_floors:
+    news: 3
+    blogs: 3
+
+  # Dimensions the LLM judge scores, 0-2 each. Omit to score all six.
+  # Scoring a pipeline on a goal it does not have produces a permanent red
+  # that trains the reader to ignore the section.
+  judge:
+    dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
+
+  source_health:
+    dead_url_runs: 3        # consecutive error+zero-yield runs before CRITICAL
+    stale_after_days: 90    # a feed that still returns 200 but stopped publishing
+    zero_run_threshold: 7   # consecutive zero-yield runs before suspicion
+    median_window: 30       # ...only when this window's median yield was >= 1
+    query_window: 14        # news queries whose mean yield falls below 1
+    feed_overrides:
+      "Karpathy":
+        stale_after_days: 400
+```
+
+**Why the median window matters.** A feed returning nothing means four different
+things: a dead URL, a feed frozen at HTTP 200, a live feed that stopped reaching
+the briefing, and a blogger who simply posts twice a year. Only that feed's own
+history separates them, which is why the zero-yield rule fires solely when the
+trailing median says the feed used to contribute. `feed_overrides` exempts known
+slow publishers from the frozen-feed rule so a normal week stays silent.
+
 ## Paper Scoring
 
 Weights for scoring papers based on reproduction value.

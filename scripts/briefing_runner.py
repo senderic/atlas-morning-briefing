@@ -36,6 +36,7 @@ from scripts.arxiv_scanner import ArxivScanner, create_scanner
 from scripts.snapshot_manager import SnapshotManager
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
+from scripts.text_similarity import DEDUP_STOPWORDS, headline_terms
 from scripts.alerts_scanner import create_scanner as create_alerts_scanner
 from scripts.geo_filter import apply_config_filter
 from scripts.interest_graph import query_freshness
@@ -53,6 +54,26 @@ from scripts.llm_client import BaseLLMClient
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+DEFAULT_FILE_NAMING = "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+
+
+def format_briefing_filename(file_naming: str, now: datetime) -> str:
+    """
+    Render a briefing filename from its config pattern.
+
+    Module-level so anything that needs to *find* today's briefing -- the
+    quality check, for one -- derives the name from the same rule that wrote
+    it, instead of keeping a second copy that drifts.
+    """
+    known_vars = {
+        "yyyy": now.strftime("%Y"),
+        "mm": now.strftime("%m"),
+        "dd": now.strftime("%d"),
+        "type": "Daily",
+    }
+    return (file_naming or DEFAULT_FILE_NAMING).format_map(known_vars)
+
 
 class BriefingRunner:
     """Main orchestrator for morning briefing generation."""
@@ -568,19 +589,15 @@ class BriefingRunner:
             _filter(happenings or [], prev_happenings),
         )
 
-    _DEDUP_STOPWORDS = {
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
-        "with", "is", "are", "was", "were", "by", "from", "as", "it", "its",
-        "this", "that", "new", "says", "after", "over",
-    }
+    # Defined in scripts/text_similarity.py so the quality check measures
+    # duplicates exactly the way this collapse does -- two copies of the rule
+    # would silently drift apart.
+    _DEDUP_STOPWORDS = DEDUP_STOPWORDS
 
     @classmethod
     def _headline_terms(cls, title: str) -> set:
         """Content words of a headline, for cross-outlet duplicate detection."""
-        return {
-            w for w in re.findall(r"[a-z0-9']+", (title or "").lower())
-            if len(w) > 2 and w not in cls._DEDUP_STOPWORDS
-        }
+        return headline_terms(title)
 
     def deduplicate_similar_news(
         self, news: List[Dict[str, Any]]
@@ -864,14 +881,9 @@ class BriefingRunner:
 
     def _format_filename(self, now: datetime) -> str:
         """Format the output filename from config pattern, ignoring unknown keys."""
-        file_naming = self.config.get("file_naming", "Atlas-Briefing-{yyyy}.{mm}.{dd}")
-        known_vars = {
-            "yyyy": now.strftime("%Y"),
-            "mm": now.strftime("%m"),
-            "dd": now.strftime("%d"),
-            "type": "Daily",
-        }
-        return file_naming.format_map(known_vars)
+        return format_briefing_filename(
+            self.config.get("file_naming", DEFAULT_FILE_NAMING), now
+        )
 
     def _enrich_papers(self, papers: list, topics: list) -> list:
         """Run paper summarization + semantic scoring sequentially (used in parallel batch)."""
@@ -1353,11 +1365,19 @@ class BriefingRunner:
         """
         Save run status to JSON file for monitoring.
 
+        The filename is config-driven because a machine can run more than one
+        pipeline: run_briefing.sh runs the main briefing and then the local one
+        ~15 minutes later, and with a shared filename the second run silently
+        overwrites the first run's counters. Monitoring that reads the file
+        would then report one pipeline's numbers as if they were both.
+
         Args:
             output_dir: Directory to save status file.
         """
         self.status["errors"] = self.errors
-        status_path = Path(output_dir) / "status.json"
+        self.status["pipeline"] = self.config.get("pipeline_name", "")
+        status_filename = self.config.get("status_file_path", "status.json")
+        status_path = Path(output_dir) / status_filename
         try:
             with open(status_path, "w") as f:
                 json.dump(self.status, f, indent=2)

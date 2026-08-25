@@ -140,6 +140,27 @@ news_freshness: "pd"
 #   max_alerts: 4
 #   user_agent: "atlas-morning-briefing (you@example.com)"
 
+# Pipeline identity. Give each pipeline on a machine its own status file, or
+# the one that runs second overwrites the first one's counters.
+pipeline_name: "atlas"
+status_file_path: "status.json"
+
+# Daily quality check (scripts/quality_check.py, run after the briefing).
+# See references/config_guide.md and references/quality_monitoring_design.md.
+# quality_check:
+#   section_floors:
+#     news: 3
+#   judge:
+#     dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
+#   source_health:
+#     dead_url_runs: 3
+#     stale_after_days: 90
+#     zero_run_threshold: 7
+#     median_window: 30
+#     feed_overrides:
+#       "Some Slow Blog":
+#         stale_after_days: 400
+
 # Stock watchlist (Finnhub API)
 stocks:
   - AMZN
