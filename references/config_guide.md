@@ -126,7 +126,30 @@ geo_filter:
   enabled: true
   place_terms: ["san diego", "pacific beach", "california"]
   trusted_sources: ["voiceofsandiego.org", "kpbs.org"]
+  blocked_sources: ["openpr.com", "prnewswire.com"]
 ```
+
+`blocked_sources` drops a source outright, even when the item mentions a place
+term -- blocked beats both `place_terms` and `trusted_sources`. It exists for
+pay-to-publish press-release portals: a local briefing once ran "Seaside Pizza
+Co. Adds Beer and Wine to Its Pacific Beach Pizza Takeout Experience" from
+`openpr.com`, which passed the gate because it does say "Pacific Beach".
+
+### Happenings Refresh Days
+
+`happenings_fetch_weekday` takes a weekday or a list of them (0=Mon ... 6=Sun).
+On other days the previous fetch is replayed from state, so an events section
+costs a handful of API calls per week instead of per morning.
+
+```yaml
+happenings_fetch_weekday: [0, 3]    # Monday and Thursday
+```
+
+Pick days that sit *ahead* of what the section advertises. A Saturday-only
+fetch left the section promoting a weekend that had already ended by Tuesday;
+Thursday previews the coming weekend and Monday refreshes for midweek. The
+happenings ranking prompt is also date-aware and drops events whose date has
+passed, so a stale cache degrades to a shorter section rather than a wrong one.
 
 ### Cross-Outlet Duplicate Collapse
 

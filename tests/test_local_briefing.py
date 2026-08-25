@@ -621,3 +621,15 @@ class TestShippedLocalConfig:
         blob = str(config["interest_graph"]).lower()
         for term in ("power outage", "water shutoff", "high surf", "road closure"):
             assert term not in blob
+
+    def test_happenings_refresh_lands_before_the_weekend(self):
+        """A Saturday-only fetch left the section advertising a past weekend."""
+        days = self._config()["happenings_fetch_weekday"]
+        assert isinstance(days, list) and days
+        assert 3 in days, "expected a Thursday refresh ahead of the weekend"
+        assert days != [5]
+
+    def test_press_release_portals_are_blocked(self):
+        blocked = self._config()["geo_filter"]["blocked_sources"]
+        assert "openpr.com" in blocked
+        assert "prnewswire.com" in blocked

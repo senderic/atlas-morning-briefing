@@ -387,12 +387,30 @@ class BriefingRunner:
             self.errors.append(f"Happenings aggregation: {e}")
             return []
 
+    def _happenings_fetch_days(self) -> Optional[set]:
+        """
+        Weekdays on which happenings are re-fetched (0=Mon ... 6=Sun).
+
+        Accepts a single weekday or a list of them; returns None when the key
+        is absent, meaning "fetch every run". A list lets a cache refresh land
+        both before the weekend and again midweek, so the section does not
+        spend the back half of its cycle advertising events that have passed.
+        """
+        raw = self.config.get("happenings_fetch_weekday")
+        if raw is None:
+            return None
+        if isinstance(raw, (list, tuple, set)):
+            days = {int(d) for d in raw}
+            return days or None
+        return {int(raw)}
+
     def _load_or_fetch_happenings(
         self, previous_state: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         today = datetime.now()
+        fetch_days = self._happenings_fetch_days()
         fetch_weekday = self.config.get("happenings_fetch_weekday")
-        should_fetch = fetch_weekday is None or today.weekday() == int(fetch_weekday)
+        should_fetch = fetch_days is None or today.weekday() in fetch_days
         if should_fetch:
             logger.info(
                 "Fetching fresh happenings (fetch weekday=%s, today=%s)",

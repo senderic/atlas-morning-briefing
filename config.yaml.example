@@ -118,6 +118,7 @@ news_freshness: "pd"
 #   enabled: true
 #   place_terms: ["san diego", "california"]
 #   trusted_sources: ["voiceofsandiego.org"]
+#   blocked_sources: ["openpr.com", "prnewswire.com"]   # never ranked
 
 # Cap on items from a single outlet per section (default 2).
 # source_diversity:

@@ -55,6 +55,52 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
     return text
 
 
+# Meta-commentary markers a model sometimes appends to a ranked summary,
+# leaking its own filtering rationale (e.g. "Dropped: [1], [2] (duplicates)").
+# Only matched when they start a new sentence or line -- never mid-sentence --
+# so legitimate prose like "Charges were dropped: the DA declined to file"
+# survives untouched.
+_RATIONALE_MARKERS = (
+    "Dropped",
+    "Excluded",
+    "Omitted",
+    "Not selected",
+    "Rejected",
+    "Skipped",
+)
+_TRAILING_RATIONALE_RE = re.compile(
+    r"(?:^|(?<=[.!?])\s+|\n)(?:" + "|".join(re.escape(m) for m in _RATIONALE_MARKERS) + r"):\s",
+    re.IGNORECASE,
+)
+
+
+def _strip_trailing_rationale(text: str) -> str:
+    """
+    Strip a trailing meta-commentary clause leaking the model's filtering
+    rationale off the end of a reader-facing summary.
+
+    Models occasionally append text like "Dropped: [1], [2] (duplicates)"
+    to the last item in a ranked response, explaining which candidates they
+    excluded. That rationale is never meant for the reader. This only trims
+    a marker that begins a new sentence or line (case-insensitive), so
+    legitimate mid-sentence usage (e.g. "Charges were dropped: the DA
+    declined to file") and unrelated uses of the same words are left intact.
+
+    Args:
+        text: Candidate summary text, possibly with a leaked rationale tail.
+
+    Returns:
+        The text with any trailing rationale clause removed and trailing
+        whitespace trimmed. Returns the input unchanged if no leak is found.
+    """
+    if not text:
+        return text
+    match = _TRAILING_RATIONALE_RE.search(text)
+    if not match:
+        return text
+    return text[: match.start()].rstrip()
+
+
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
@@ -940,7 +986,7 @@ class BriefingIntelligence:
         for idx, text in parsed:
             if 0 <= idx < len(news):
                 article = news[idx].copy()
-                article["brief_summary"] = text
+                article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked_news.append(article)
 
         if ranked_news:
@@ -960,7 +1006,7 @@ class BriefingIntelligence:
             for idx, text in parsed_retry:
                 if 0 <= idx < len(news):
                     article = news[idx].copy()
-                    article["brief_summary"] = text
+                    article["brief_summary"] = _strip_trailing_rationale(text)
                     ranked_news.append(article)
             if ranked_news:
                 diversified = self._enforce_source_diversity(ranked_news, max_per_source=self.max_per_source)
@@ -1010,16 +1056,27 @@ class BriefingIntelligence:
             lines.append(f"[{i+1}] {title} ({source}): {snippet}")
 
         articles_block = "\n".join(lines)
+
+        # Inject today's date so the LLM doesn't hallucinate one and can tell
+        # which events have already happened.
+        from datetime import datetime as _dt
+        _today_str = _dt.now().strftime("%B %d, %Y")
+
         prompt = (
             "You curate an 'upcoming happenings' section for a resident of "
             "Pacific Beach, San Diego (near Crown Point and Kate Sessions Park, "
-            "covering the Pacific Beach / Mission Beach area).\n"
+            "covering the Pacific Beach / Mission Beach area). "
+            f"Today's date is {_today_str}.\n"
             "From these articles, select the TOP "
             f"{max_items} that represent genuine upcoming events or community "
             "happenings nearby -- festivals, concerts, farmers markets, beach "
             "cleanups, park events, planning/community meetings, restaurant "
             "openings, etc. DROP pure policy news, crime stories, and anything "
-            "not in or near the beach communities.\n\n"
+            "not in or near the beach communities. DROP any item whose event "
+            f"date has already passed as of {_today_str} -- never describe a "
+            "past event as upcoming. If an item's date is unstated, keep it "
+            "only if it is plausibly still upcoming (e.g. an ongoing exhibit "
+            "or a recurring weekly market); otherwise drop it.\n\n"
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each pick, respond in this exact format:\n"
             "[original_number] 1-2 sentence summary.\n\n"
@@ -1049,7 +1106,7 @@ class BriefingIntelligence:
         for idx, text in parsed:
             if 0 <= idx < len(happenings):
                 article = happenings[idx].copy()
-                article["brief_summary"] = text
+                article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked.append(article)
 
         if ranked:
@@ -1127,7 +1184,7 @@ class BriefingIntelligence:
             if 0 <= idx < len(blogs):
                 article = blogs[idx].copy()
                 score, summary = self.extract_score(text)
-                article["brief_summary"] = summary
+                article["brief_summary"] = _strip_trailing_rationale(summary)
                 if score:
                     article["score_combined"] = score
                 if article["brief_summary"]:

@@ -238,6 +238,17 @@ geo_filter:
     - "carlsbad"
     - "escondido"
     - "california"
+  # Pay-to-publish press-release portals: anyone can post unvetted marketing
+  # copy, and it mentions the neighborhood often enough to pass place_terms.
+  # Blocked beats both place_terms and trusted_sources.
+  blocked_sources:
+    - "openpr.com"
+    - "prnewswire.com"
+    - "einpresswire.com"
+    - "globenewswire.com"
+    - "businesswire.com"
+    - "accesswire.com"
+    - "newswire.com"
   trusted_sources:
     - "voiceofsandiego.org"
     - "timesofsandiego.com"
@@ -300,10 +311,16 @@ section_order: ["alerts", "happenings", "news", "blogs"]
 # than the main news ("pw" = past week) so event announcements published several
 # days ahead are caught.
 #
-# happenings_fetch_weekday: fetch fresh happenings only on this weekday
-# (0=Mon ... 6=Sun); on other days the previous fetch is reused from state so
-# we only hit Brave for events once a week.
-happenings_fetch_weekday: 5
+# happenings_fetch_weekday: fetch fresh happenings only on these weekdays
+# (0=Mon ... 6=Sun; a single value or a list); on other days the previous fetch
+# is reused from state, so Brave is hit for events twice a week rather than
+# every morning.
+#
+# Thursday previews the coming weekend, Monday refreshes for midweek and the
+# next weekend's announcements. A Saturday-only fetch used to leave the section
+# advertising a weekend that had already ended by Tuesday. The date-aware
+# ranking prompt drops anything past on top of this.
+happenings_fetch_weekday: [0, 3]
 happenings_queries:
   - "things to do this weekend San Diego"
   - "Pacific Beach San Diego events"

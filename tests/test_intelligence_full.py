@@ -18,6 +18,7 @@ from scripts.intelligence import (
     SYSTEM_PROMPT,
     _parse_numbered_list,
     _sanitize_prompt_input,
+    _strip_trailing_rationale,
 )
 
 
@@ -89,6 +90,54 @@ class TestSanitizePromptInput:
 
     def test_keeps_normal_text(self):
         assert _sanitize_prompt_input("Plain text here") == "Plain text here"
+
+
+class TestStripTrailingRationale:
+    def test_strips_verbatim_leaked_rationale(self):
+        leaked = (
+            "Skim it to find the beach-adjacent events before they fill up. "
+            "Dropped: [1], [2], [7] (Mission Bay funding/planning/policy), "
+            "[3], [4] (opinion/climate commentary), [5] (injury story), "
+            "[6] (San Mateo County — wrong area), [8] (restaurant promo, no "
+            "event), [12] (La Jolla, outside the beach communities), "
+            "[17]/[19] (duplicates), [18] (covered by [9]/[10])."
+        )
+        result = _strip_trailing_rationale(leaked)
+        assert result == (
+            "Skim it to find the beach-adjacent events before they fill up."
+        )
+
+    def test_each_marker_variant_is_stripped(self):
+        for marker in (
+            "Dropped",
+            "Excluded",
+            "Omitted",
+            "Not selected",
+            "Rejected",
+            "Skipped",
+        ):
+            text = f"Good summary here. {marker}: [1], [2] for reasons."
+            assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_marker_is_case_insensitive(self):
+        text = "Good summary here. DROPPED: [1] (duplicate)."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_does_not_damage_legitimate_midsentence_dropped(self):
+        text = "Charges were dropped: the DA declined to file."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_does_not_touch_unrelated_use_of_dropped(self):
+        text = "Attendance dropped by half this year."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_empty_and_none_pass_through(self):
+        assert _strip_trailing_rationale("") == ""
+        assert _strip_trailing_rationale(None) is None
+
+    def test_text_without_marker_is_unchanged(self):
+        text = "A perfectly ordinary summary with no rationale tail."
+        assert _strip_trailing_rationale(text) == text
 
 
 class TestParseNumberedList:
@@ -481,6 +530,14 @@ class TestRankAndSummarizeNews:
         # max_per_source=2 enforced
         assert len([r for r in result if r["source"] == "same"]) <= 2
 
+    def test_strips_leaked_rationale(self, intel, mock_client):
+        news = [{"title": "n1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = (
+            "[1] Real summary. Dropped: [2], [3] (not relevant)"
+        )
+        result = intel.rank_and_summarize_news(news, ["t"])
+        assert result[0]["brief_summary"] == "Real summary."
+
 
 # ---------- rank_and_summarize_blogs ----------
 
@@ -513,6 +570,70 @@ class TestRankAndSummarizeBlogs:
         # On total LLM failure, we still get top 5 with diversity enforced
         result = intel.rank_and_summarize_blogs(blogs, ["t"])
         assert len(result) <= 5
+
+    def test_strips_leaked_rationale(self, intel, mock_client):
+        blogs = [{"title": "b1", "source": "s", "summary": "s"}]
+        mock_client.invoke.return_value = (
+            "[1] SCORE:4/5 Real summary. Excluded: [2] (off topic)"
+        )
+        result = intel.rank_and_summarize_blogs(blogs, ["t"])
+        assert result[0]["brief_summary"] == "Real summary."
+
+
+# ---------- rank_and_summarize_happenings ----------
+
+
+class TestRankAndSummarizeHappenings:
+    def test_unavailable_returns_items_unchanged(self, intel_unavailable):
+        happenings = [
+            {"title": f"h{i}", "source": "s", "description": f"desc{i}"}
+            for i in range(3)
+        ]
+        result = intel_unavailable.rank_and_summarize_happenings(happenings)
+        assert len(result) == 3
+        for i, item in enumerate(result):
+            assert item["brief_summary"] == f"desc{i}"
+
+    def test_empty_returns_empty(self, intel):
+        assert intel.rank_and_summarize_happenings([]) == []
+
+    def test_prompt_includes_todays_date(self, intel, mock_client):
+        from datetime import datetime
+
+        today_str = datetime.now().strftime("%B %d, %Y")
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert today_str in prompt
+
+    def test_prompt_instructs_dropping_past_events(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "already passed" in prompt
+        assert "never describe a past event as upcoming" in prompt
+
+    def test_strips_leaked_rationale_end_to_end(self, intel, mock_client):
+        happenings = [
+            {"title": "h1", "source": "s", "description": "d"},
+            {"title": "h2", "source": "s2", "description": "d2"},
+            {"title": "h3", "source": "s3", "description": "d3"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] Real summary. Dropped: [2], [3] (not events)"
+        )
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert len(result) == 1
+        assert result[0]["brief_summary"] == "Real summary."
+        assert "Dropped:" not in result[0]["brief_summary"]
+
+    def test_fallback_when_llm_returns_none(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "desc"}]
+        mock_client.invoke.return_value = None
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert result[0]["brief_summary"] == "desc"
 
 
 # ---------- enforce_source_diversity ----------
