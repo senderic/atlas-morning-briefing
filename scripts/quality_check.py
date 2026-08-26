@@ -16,8 +16,9 @@ as pipeline "local"):
 
 All three layers report the shared ``Finding`` type from
 ``scripts/quality_findings.py``. The orchestrator merges, sorts, digests,
-and routes alerts (CRITICAL pushes to Telegram immediately; WARN/INFO land
-in the digest only), then returns an exit code cron can read.
+and routes alerts (CRITICAL sends an email immediately, through the same
+delivery path the morning briefing itself uses; WARN/INFO land in the
+digest only), then returns an exit code cron can read.
 
 See references/quality_monitoring_design.md for the design this implements.
 
@@ -34,9 +35,6 @@ import json
 import logging
 import os
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -745,29 +743,123 @@ def write_digest(content: str, today: date, path: Optional[str] = None) -> Path:
 # Alert routing
 # ---------------------------------------------------------------------------
 
+_SEVERITY_LABEL: Dict[str, str] = {CRITICAL: "critical", WARN: "warning", INFO: "info"}
 
-def notify(text: str) -> bool:
-    """Push text to Telegram via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
+_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
 
-    Logs and returns False (never raises) if either env var is missing or
-    the request fails -- CRITICAL findings still land in the digest either
-    way, this is only the immediate-push path.
+
+def _looks_like_email(addr: str) -> bool:
+    """Cheap sanity filter, not full RFC validation -- just enough to drop
+    an unresolved ``${VAR}`` placeholder or a stray blank rather than hand
+    it to SMTP as a destination."""
+    return bool(_EMAIL_RE.match(addr))
+
+
+def build_alert_subject(findings: List[Finding], today: date) -> str:
+    """Subject line for the alert email.
+
+    Leads with severity and counts so it is triageable from a phone lock
+    screen, e.g. "[CRITICAL] Briefing quality: 3 critical, 1 warning --
+    2026-08-25". A run with nothing to report (the daily_digest opt-in on a
+    clean day) gets an OK-flavored subject instead, e.g. "[OK] Briefing
+    quality: no findings -- 2026-08-25".
     """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        logger.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; alert logged only: %s", text)
+    worst = worst_severity(findings) or "OK"
+    counts = counts_by_severity(findings)
+    parts = [f"{counts[s]} {_SEVERITY_LABEL[s]}" for s in SEVERITY_ORDER if counts.get(s)]
+    summary = ", ".join(parts) if parts else "no findings"
+    return f"[{worst}] Briefing quality: {summary} — {today.isoformat()}"
+
+
+def resolve_alert_recipients(config: Dict[str, Any]) -> List[str]:
+    """Resolve alert-email recipients for one pipeline config.
+
+    Fallback chain:
+      1. ``config["quality_check"]["alert_email"]["recipients"]``
+      2. ``config["email_recipients"]`` -- the pipeline's own delivery list
+
+    Either may be a single comma-separated string, a list of addresses, or
+    a list mixing comma-separated strings with plain addresses -- the same
+    shape ``email_distributor.distribute()`` normalizes around line 436.
+    The result is deduped (first-seen order preserved) and filtered to
+    entries that look like an address, so an unresolved ``${VAR:-default}``
+    placeholder or a stray blank never becomes a send target.
+    """
+    qc_cfg = (config.get("quality_check") or {}).get("alert_email") or {}
+    raw = qc_cfg.get("recipients")
+    if not raw:
+        raw = config.get("email_recipients")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+
+    seen = set()
+    out: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        for piece in item.split(","):
+            addr = piece.strip()
+            if addr and _looks_like_email(addr) and addr not in seen:
+                seen.add(addr)
+                out.append(addr)
+    return out
+
+
+def _all_alert_recipients(configs: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Union of resolve_alert_recipients() across every pipeline config,
+    deduped -- one shared digest email covers every pipeline in the run."""
+    seen = set()
+    out: List[str] = []
+    for cfg in configs.values():
+        for addr in resolve_alert_recipients(cfg):
+            if addr not in seen:
+                seen.add(addr)
+                out.append(addr)
+    return out
+
+
+def _daily_digest_enabled(configs: Dict[str, Dict[str, Any]]) -> bool:
+    """True if any pipeline opts into ``quality_check.alert_email.daily_digest``
+    -- send the digest every run regardless of severity, not just on CRITICAL."""
+    return any(
+        bool(((cfg.get("quality_check") or {}).get("alert_email") or {}).get("daily_digest"))
+        for cfg in configs.values()
+    )
+
+
+def send_alert_email(subject: str, markdown_body: str, recipients: List[str]) -> bool:
+    """Send the quality digest by email, reusing the exact delivery path
+    the morning briefing itself uses (``scripts.email_distributor.EmailDistributor``)
+    so there is one delivery mechanism to keep working, not two.
+
+    Graceful degradation is a hard requirement here, same as the pipeline
+    itself: no recipients, missing GMAIL_USER/GMAIL_APP_PASSWORD, an import
+    error, or an SMTP failure must all log and return False -- never raise.
+    A quality checker that crashes because it could not report is worse
+    than one that stays quiet.
+    """
+    if not recipients:
+        logger.warning("No alert email recipients configured; digest not sent: %s", subject)
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text[:4096]}).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
+    sender_email = os.environ.get("GMAIL_USER")
+    sender_password = os.environ.get("GMAIL_APP_PASSWORD")
+    if not sender_email or not sender_password:
+        logger.warning("GMAIL_USER/GMAIL_APP_PASSWORD not set; alert email not sent: %s", subject)
+        return False
+
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
-        return True
-    except (urllib.error.URLError, OSError) as e:
-        logger.error("Telegram push failed: %s", e)
+        from scripts.email_distributor import EmailDistributor
+
+        distributor = EmailDistributor(sender_email=sender_email, sender_password=sender_password)
+        results = distributor.send_html_email(
+            recipients=recipients, markdown_content=markdown_body, subject=subject
+        )
+        return bool(results) and all(results.values())
+    except Exception as e:
+        logger.error("Quality alert email failed: %s", e)
         return False
 
 
@@ -790,25 +882,36 @@ def save_alert_state(state: Dict[str, Any], path: str = DEFAULT_ALERTS_PATH) -> 
 def route_alerts(
     findings: List[Finding],
     *,
+    digest_markdown: str,
+    configs: Dict[str, Dict[str, Any]],
+    today: date,
     state: Optional[Dict[str, Any]] = None,
     path: str = DEFAULT_ALERTS_PATH,
-    notify_fn: Optional[Callable[[str], bool]] = None,
+    send_fn: Optional[Callable[[str, str, List[str]], bool]] = None,
     now: Optional[datetime] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Push CRITICAL findings to Telegram, deduped within a 24h window.
+    """Route findings to a single alert email, deduped within a 24h window.
 
-    WARN/INFO never page -- they only ever reach the digest. A CRITICAL
-    that already paged within the last 24h is not re-pushed; it becomes a
-    standing digest item, tracked via ``Finding.dedupe_key``.
+    A CRITICAL finding pages (subject to the existing 24h dedupe keyed on
+    ``Finding.dedupe_key`` -- a dead feed pages once, then becomes a
+    standing digest item). WARN/INFO never page on their own. When any
+    pipeline config sets ``quality_check.alert_email.daily_digest``, the
+    digest is sent every run regardless of severity, with an OK-flavored
+    subject on a clean run.
 
-    In dry-run mode this computes nothing new to persist: it neither
-    notifies nor writes the alert-state file.
+    At most one email is sent per call: if several CRITICALs are present,
+    or the critical path and daily_digest would both fire, they share the
+    single send -- one email per run, not one per finding.
+
+    In dry-run mode this computes nothing new to persist: it neither sends
+    nor writes the alert-state file.
     """
     now = now or datetime.now().astimezone()
     state = dict(state) if state is not None else load_alert_state(path)
-    _notify = notify_fn or notify
+    _send = send_fn or send_alert_email
     changed = False
+    should_send = False
 
     for f in findings:
         if f.severity != CRITICAL:
@@ -833,13 +936,24 @@ def route_alerts(
         last_alerted = entry.get("last_alerted") if entry else None
 
         if should_push:
-            _notify(f"[{f.pipeline or '-'}] CRITICAL {f.code}: {f.message}")
+            should_send = True
             last_alerted = now.isoformat()
 
         state[key] = {"first_seen": first_seen, "last_alerted": last_alerted, "count": count}
         changed = True
 
-    if changed and not dry_run:
+    if dry_run:
+        return state
+
+    if not should_send and _daily_digest_enabled(configs):
+        should_send = True
+
+    if should_send:
+        subject = build_alert_subject(findings, today)
+        recipients = _all_alert_recipients(configs)
+        _send(subject, digest_markdown, recipients)
+
+    if changed:
         save_alert_state(state, path)
 
     return state
@@ -889,7 +1003,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # or malformed config file. We keep that as the effective outcome (a
     # config the checker can't even parse is an operational failure of the
     # monitoring tool, not a "reader got a broken briefing" CRITICAL, so it
-    # must not push to Telegram) but catch the SystemExit here so main()
+    # must not send an alert email) but catch the SystemExit here so main()
     # keeps its "always returns an int" contract instead of hard-killing the
     # interpreter -- needed for tests and any programmatic caller.
     configs: Dict[str, Dict[str, Any]] = {}
@@ -925,7 +1039,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(digest)
         if not args.dry_run:
             write_digest(digest, today)
-        route_alerts(findings, dry_run=args.dry_run)
+        route_alerts(
+            findings,
+            digest_markdown=digest,
+            configs=configs,
+            today=today,
+            dry_run=args.dry_run,
+        )
     except Exception as e:
         logger.error("Digest rendering / alert routing failed: %s", e)
         return 2

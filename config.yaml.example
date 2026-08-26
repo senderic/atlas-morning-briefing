@@ -150,6 +150,9 @@ status_file_path: "status.json"
 # quality_check:
 #   section_floors:
 #     news: 3
+#   alert_email:
+#     recipients: ["you@example.com"]
+#     daily_digest: false
 #   judge:
 #     dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
 #   source_health:

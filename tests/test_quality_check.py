@@ -21,6 +21,31 @@ import pytest
 from scripts.quality_findings import CRITICAL, INFO, WARN, Finding
 from scripts import quality_check as qc
 
+# Forces briefing_runner's module-level load_dotenv(override=True) to run
+# once, here, at collection time -- rather than lazily inside the first
+# test that happens to call qc.main() (which imports briefing_runner for
+# its config loader) or run_checks() (which imports it via
+# locate_briefing_path). This repo's real .env carries live GMAIL_USER /
+# GMAIL_APP_PASSWORD values; without this forced import, a test's own
+# monkeypatch.delenv("GMAIL_USER") could be raced by that lazy import
+# re-populating os.environ from .env with override=True mid-test. Doing it
+# here means every test-level setenv/delenv below is the last word for the
+# duration of that test.
+import scripts.briefing_runner  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _no_real_email(monkeypatch):
+    """Autouse across this whole module: guarantees no test can ever open a
+    real SMTP connection, no matter what GMAIL_USER/GMAIL_APP_PASSWORD end
+    up being in os.environ. Patches scripts.email_distributor.EmailDistributor
+    -- the exact name send_alert_email imports -- to the recording fake.
+    Tests that care what would have been sent read _FakeDistributor.instances;
+    tests that need SMTP to fail override this locally with _RaisingDistributor.
+    """
+    _FakeDistributor.instances.clear()
+    monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _FakeDistributor)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,6 +97,37 @@ def _no_op_layer1(harvest_records=None):
 
 def _no_op_layer2():
     return {"check_report": lambda markdown, config, today=None, pipeline="": []}
+
+
+class _FakeDistributor:
+    """Stands in for scripts.email_distributor.EmailDistributor. Records
+    every send_html_email call instead of touching SMTP. `instances` is a
+    class-level list so tests can inspect what was constructed/sent without
+    needing a fixture-scoped instance handed back to them."""
+
+    instances = []
+
+    def __init__(self, sender_email, sender_password):
+        self.sender_email = sender_email
+        self.sender_password = sender_password
+        self.sent = []
+        _FakeDistributor.instances.append(self)
+
+    def send_html_email(self, recipients, markdown_content, subject=None, attachment_path=None):
+        self.sent.append(
+            {"recipients": list(recipients), "markdown_content": markdown_content, "subject": subject}
+        )
+        return {r: True for r in recipients}
+
+
+class _RaisingDistributor:
+    """Stands in for EmailDistributor when the SMTP send itself blows up."""
+
+    def __init__(self, sender_email, sender_password):
+        pass
+
+    def send_html_email(self, recipients, markdown_content, subject=None, attachment_path=None):
+        raise RuntimeError("smtp exploded")
 
 
 def _stub_sibling_modules(monkeypatch, detect_rot_findings=None, check_report_findings=None):
@@ -400,87 +456,255 @@ class TestRenderDigest:
 
 
 class TestRouteAlerts:
-    def test_critical_pushes_once(self, tmp_path):
-        pushed = []
+    """route_alerts() dedupes CRITICALs on Finding.dedupe_key exactly as
+    before; only the notification mechanism changed (a single injected
+    send_fn(subject, body, recipients) in place of the old per-finding
+    notify_fn(text))."""
+
+    @staticmethod
+    def _configs():
+        return {"atlas": {"email_recipients": ["ops@example.com"]}}
+
+    def test_critical_sends_once(self, tmp_path):
+        sent = []
         findings = [Finding(CRITICAL, "briefing-missing", "gone", pipeline="atlas")]
-        state = qc.route_alerts(findings, state={}, notify_fn=pushed.append, path=str(tmp_path / "alerts.json"))
-        assert len(pushed) == 1
+        state = qc.route_alerts(
+            findings,
+            digest_markdown="# Digest",
+            configs=self._configs(),
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            path=str(tmp_path / "alerts.json"),
+        )
+        assert len(sent) == 1
         key = findings[0].dedupe_key
         assert state[key]["count"] == 1
         assert state[key]["last_alerted"] is not None
 
-    def test_second_push_within_24h_suppressed(self, tmp_path):
-        pushed = []
+    def test_second_send_within_24h_suppressed(self, tmp_path):
+        sent = []
         findings = [Finding(CRITICAL, "feed-dead", "dead", source="Anthropic", pipeline="atlas")]
         now = datetime(2026, 8, 25, 6, 0, 0)
         alerts_path = str(tmp_path / "alerts.json")
+        send_fn = lambda subject, body, recipients: sent.append((subject, body, recipients)) or True
 
-        state = qc.route_alerts(findings, state={}, notify_fn=pushed.append, now=now, path=alerts_path)
-        assert len(pushed) == 1
+        state = qc.route_alerts(
+            findings, digest_markdown="d", configs=self._configs(), today=date(2026, 8, 25),
+            state={}, send_fn=send_fn, now=now, path=alerts_path,
+        )
+        assert len(sent) == 1
 
         later = now + timedelta(hours=2)
-        state = qc.route_alerts(findings, state=state, notify_fn=pushed.append, now=later, path=alerts_path)
-        assert len(pushed) == 1  # still one -- suppressed
+        state = qc.route_alerts(
+            findings, digest_markdown="d", configs=self._configs(), today=date(2026, 8, 25),
+            state=state, send_fn=send_fn, now=later, path=alerts_path,
+        )
+        assert len(sent) == 1  # still one -- suppressed
         assert state[findings[0].dedupe_key]["count"] == 2
 
-    def test_push_allowed_after_24h(self, tmp_path):
-        pushed = []
+    def test_send_allowed_after_24h(self, tmp_path):
+        sent = []
         findings = [Finding(CRITICAL, "feed-dead", "dead", source="Anthropic", pipeline="atlas")]
         now = datetime(2026, 8, 25, 6, 0, 0)
         alerts_path = str(tmp_path / "alerts.json")
+        send_fn = lambda subject, body, recipients: sent.append((subject, body, recipients)) or True
 
-        state = qc.route_alerts(findings, state={}, notify_fn=pushed.append, now=now, path=alerts_path)
-        assert len(pushed) == 1
+        state = qc.route_alerts(
+            findings, digest_markdown="d", configs=self._configs(), today=date(2026, 8, 25),
+            state={}, send_fn=send_fn, now=now, path=alerts_path,
+        )
+        assert len(sent) == 1
 
         next_day = now + timedelta(hours=25)
-        state = qc.route_alerts(findings, state=state, notify_fn=pushed.append, now=next_day, path=alerts_path)
-        assert len(pushed) == 2
+        state = qc.route_alerts(
+            findings, digest_markdown="d", configs=self._configs(), today=date(2026, 8, 25),
+            state=state, send_fn=send_fn, now=next_day, path=alerts_path,
+        )
+        assert len(sent) == 2
 
-    def test_warn_and_info_never_push(self, tmp_path):
-        pushed = []
+    def test_warn_and_info_never_send(self, tmp_path):
+        sent = []
         findings = [
             Finding(WARN, "feed-dead", "dead", pipeline="atlas"),
             Finding(INFO, "judge-skipped", "skip", pipeline="atlas"),
         ]
-        qc.route_alerts(findings, state={}, notify_fn=pushed.append, path=str(tmp_path / "alerts.json"))
-        assert pushed == []
+        qc.route_alerts(
+            findings,
+            digest_markdown="d",
+            configs=self._configs(),
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            path=str(tmp_path / "alerts.json"),
+        )
+        assert sent == []
 
-    def test_dry_run_does_not_notify_or_persist(self, tmp_path):
-        pushed = []
+    def test_dry_run_does_not_send_or_persist(self, tmp_path):
+        sent = []
         findings = [Finding(CRITICAL, "briefing-missing", "gone", pipeline="atlas")]
         alerts_path = tmp_path / "quality-alerts.json"
-        qc.route_alerts(findings, state={}, notify_fn=pushed.append, dry_run=True, path=str(alerts_path))
-        assert pushed == []
+        qc.route_alerts(
+            findings,
+            digest_markdown="d",
+            configs=self._configs(),
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            dry_run=True,
+            path=str(alerts_path),
+        )
+        assert sent == []
         assert not alerts_path.exists()
 
-    def test_notify_missing_env_logs_and_continues(self, monkeypatch):
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
-        assert qc.notify("hello") is False
+    def test_multiple_criticals_share_one_email(self, tmp_path):
+        """One email per run, not one per finding -- even across pipelines."""
+        sent = []
+        findings = [
+            Finding(CRITICAL, "briefing-missing", "gone", pipeline="atlas"),
+            Finding(CRITICAL, "briefing-missing", "gone", pipeline="local"),
+        ]
+        qc.route_alerts(
+            findings,
+            digest_markdown="d",
+            configs=self._configs(),
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            path=str(tmp_path / "alerts.json"),
+        )
+        assert len(sent) == 1
 
-    def test_notify_posts_via_urllib(self, monkeypatch):
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-        monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
+    def test_daily_digest_sends_on_clean_run(self, tmp_path):
+        sent = []
+        configs = {"atlas": {"email_recipients": ["ops@example.com"], "quality_check": {"alert_email": {"daily_digest": True}}}}
+        qc.route_alerts(
+            [],
+            digest_markdown="d",
+            configs=configs,
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            path=str(tmp_path / "alerts.json"),
+        )
+        assert len(sent) == 1
+        assert sent[0][0].startswith("[OK]")
 
-        calls = []
+    def test_daily_digest_off_stays_silent_on_clean_run(self, tmp_path):
+        sent = []
+        qc.route_alerts(
+            [],
+            digest_markdown="d",
+            configs=self._configs(),
+            today=date(2026, 8, 25),
+            state={},
+            send_fn=lambda subject, body, recipients: sent.append((subject, body, recipients)) or True,
+            path=str(tmp_path / "alerts.json"),
+        )
+        assert sent == []
 
-        class _Resp:
-            def __enter__(self):
-                return self
 
-            def __exit__(self, *a):
-                return False
+class TestBuildAlertSubject:
+    def test_critical_and_warn_counts(self):
+        findings = [
+            Finding(CRITICAL, "a", "x"),
+            Finding(CRITICAL, "b", "y"),
+            Finding(CRITICAL, "c", "z"),
+            Finding(WARN, "d", "w"),
+        ]
+        subject = qc.build_alert_subject(findings, date(2026, 8, 25))
+        assert subject == "[CRITICAL] Briefing quality: 3 critical, 1 warning — 2026-08-25"
 
-            def read(self):
-                return b'{"ok": true}'
+    def test_clean_run_ok_subject(self):
+        subject = qc.build_alert_subject([], date(2026, 8, 25))
+        assert subject == "[OK] Briefing quality: no findings — 2026-08-25"
 
-        def fake_urlopen(req, timeout=15):
-            calls.append(req.full_url)
-            return _Resp()
+    def test_warn_only_subject(self):
+        findings = [Finding(WARN, "feed-dead", "dead", pipeline="atlas")]
+        subject = qc.build_alert_subject(findings, date(2026, 8, 25))
+        assert subject == "[WARN] Briefing quality: 1 warning — 2026-08-25"
 
-        monkeypatch.setattr(qc.urllib.request, "urlopen", fake_urlopen)
-        assert qc.notify("hello") is True
-        assert calls and "api.telegram.org" in calls[0]
+
+class TestResolveAlertRecipients:
+    def test_alert_email_recipients_used_when_present(self):
+        config = {
+            "quality_check": {"alert_email": {"recipients": ["a@example.com", "b@example.com"]}},
+            "email_recipients": ["c@example.com"],
+        }
+        assert qc.resolve_alert_recipients(config) == ["a@example.com", "b@example.com"]
+
+    def test_falls_back_to_email_recipients(self):
+        config = {"email_recipients": ["c@example.com"]}
+        assert qc.resolve_alert_recipients(config) == ["c@example.com"]
+
+    def test_comma_separated_strings_split_and_deduped(self):
+        config = {"email_recipients": ["a@example.com, b@example.com", "b@example.com", "a@example.com"]}
+        assert qc.resolve_alert_recipients(config) == ["a@example.com", "b@example.com"]
+
+    def test_non_address_entries_dropped(self):
+        config = {"email_recipients": ["${MISSING_VAR}", "", "not-an-email", "a@example.com"]}
+        assert qc.resolve_alert_recipients(config) == ["a@example.com"]
+
+    def test_no_recipients_anywhere_returns_empty(self):
+        assert qc.resolve_alert_recipients({}) == []
+
+    def test_single_string_recipients_value(self):
+        config = {"quality_check": {"alert_email": {"recipients": "solo@example.com"}}}
+        assert qc.resolve_alert_recipients(config) == ["solo@example.com"]
+
+
+class TestSendAlertEmail:
+    """send_alert_email() reuses scripts.email_distributor.EmailDistributor
+    exactly as briefing_runner.py does. Every test here patches
+    scripts.email_distributor.EmailDistributor so nothing opens a real SMTP
+    connection."""
+
+    def setup_method(self):
+        _FakeDistributor.instances.clear()
+
+    def test_sends_digest_body_with_subject(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _FakeDistributor)
+
+        ok = qc.send_alert_email(
+            "[CRITICAL] Briefing quality: 1 critical — 2026-08-25",
+            "# Quality Digest -- 2026-08-25\n",
+            ["a@example.com"],
+        )
+
+        assert ok is True
+        assert len(_FakeDistributor.instances) == 1
+        sent = _FakeDistributor.instances[0].sent[0]
+        assert sent["recipients"] == ["a@example.com"]
+        assert sent["markdown_content"] == "# Quality Digest -- 2026-08-25\n"
+        assert sent["subject"] == "[CRITICAL] Briefing quality: 1 critical — 2026-08-25"
+
+    def test_no_recipients_logs_and_returns_false(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _FakeDistributor)
+        assert qc.send_alert_email("subj", "body", []) is False
+        assert _FakeDistributor.instances == []
+
+    def test_missing_credentials_logs_and_returns_false(self, monkeypatch):
+        monkeypatch.delenv("GMAIL_USER", raising=False)
+        monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
+        monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _FakeDistributor)
+        assert qc.send_alert_email("subj", "body", ["a@example.com"]) is False
+        assert _FakeDistributor.instances == []
+
+    def test_smtp_failure_caught_and_returns_false(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _RaisingDistributor)
+        assert qc.send_alert_email("subj", "body", ["a@example.com"]) is False
+
+
+class TestNoTelegramReferences:
+    def test_module_source_has_no_telegram_references(self):
+        source = Path(qc.__file__).read_text(encoding="utf-8")
+        assert "telegram" not in source.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -491,8 +715,6 @@ class TestRouteAlerts:
 class TestDryRun:
     def test_dry_run_writes_no_files(self, tmp_path, monkeypatch):
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.chdir(tmp_path)
         (tmp_path / "briefings").mkdir()
         (tmp_path / "briefings" / "Atlas-2026.08.25.md").write_text("# Briefing\n")
@@ -541,8 +763,6 @@ class TestDryRun:
 class TestExitCodes:
     def test_exit_zero_on_clean_run(self, tmp_path, monkeypatch):
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.chdir(tmp_path)
         (tmp_path / "briefings").mkdir()
         (tmp_path / "briefings" / "Atlas-2026.08.25.md").write_text("# Briefing\n")
@@ -554,8 +774,6 @@ class TestExitCodes:
 
     def test_exit_one_on_critical(self, tmp_path, monkeypatch):
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.chdir(tmp_path)
         (tmp_path / "briefings").mkdir()
         # briefing file deliberately absent -> briefing-missing CRITICAL
@@ -591,6 +809,128 @@ class TestExitCodes:
         monkeypatch.setattr(qc, "run_checks", boom)
         rc = qc.main(["--config", str(config_path), "--date", "2026-08-25"])
         assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through main(): the alert email actually goes out (to the fake
+# distributor -- see the autouse _no_real_email fixture) on the right
+# conditions, with the right body and subject, and exit codes stay tied to
+# findings regardless of whether the email succeeded.
+# ---------------------------------------------------------------------------
+
+
+class TestMainAlertIntegration:
+    @staticmethod
+    def _write_config(tmp_path, *, daily_digest=False, recipients=("ops@example.com",)):
+        recipients_yaml = "\n".join(f'      - "{r}"' for r in recipients)
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "output_dir: briefings\n"
+            "file_naming: 'Atlas-{yyyy}.{mm}.{dd}'\n"
+            "quality_check:\n"
+            "  alert_email:\n"
+            f"    daily_digest: {str(daily_digest).lower()}\n"
+            "    recipients:\n"
+            f"{recipients_yaml}\n"
+        )
+        return config_path
+
+    def test_critical_sends_one_email_with_digest_body_and_subject(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(monkeypatch)
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        # briefing file deliberately absent -> briefing-missing CRITICAL
+        config_path = self._write_config(tmp_path)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--no-judge"])
+
+        assert rc == 1
+        assert len(_FakeDistributor.instances) == 1
+        sent = _FakeDistributor.instances[0].sent
+        assert len(sent) == 1  # one email, not one per finding
+        assert sent[0]["recipients"] == ["ops@example.com"]
+        assert "briefing-missing" in sent[0]["markdown_content"]
+        assert sent[0]["subject"].startswith("[CRITICAL] Briefing quality:")
+        assert "1 critical" in sent[0]["subject"]
+        assert "2026-08-25" in sent[0]["subject"]
+
+    def test_warn_and_info_only_sends_nothing(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(
+            monkeypatch, detect_rot_findings=[Finding(WARN, "feed-dead", "dead", pipeline="atlas")]
+        )
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        (tmp_path / "briefings" / "Atlas-2026.08.25.md").write_text("# Briefing\n")
+        config_path = self._write_config(tmp_path)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--no-judge"])
+
+        assert rc == 0
+        assert _FakeDistributor.instances == []
+
+    def test_daily_digest_sends_on_clean_run_with_ok_subject(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(monkeypatch)
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        (tmp_path / "briefings" / "Atlas-2026.08.25.md").write_text("# Briefing\n")
+        config_path = self._write_config(tmp_path, daily_digest=True)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--no-judge"])
+
+        assert rc == 0
+        assert len(_FakeDistributor.instances) == 1
+        sent = _FakeDistributor.instances[0].sent
+        assert len(sent) == 1
+        assert sent[0]["subject"].startswith("[OK] Briefing quality: no findings")
+
+    def test_dry_run_with_critical_sends_nothing_and_writes_nothing(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(monkeypatch)
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        # briefing absent -> would be CRITICAL, but --dry-run must send nothing
+        config_path = self._write_config(tmp_path)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--dry-run", "--no-judge"])
+
+        assert rc == 1  # exit code still reflects the finding
+        assert _FakeDistributor.instances == []
+        assert not (tmp_path / "logs").exists()
+
+    def test_no_credentials_logs_sends_nothing_exit_code_still_reflects_findings(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(monkeypatch)
+        monkeypatch.delenv("GMAIL_USER", raising=False)
+        monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        # briefing absent -> CRITICAL
+        config_path = self._write_config(tmp_path)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--no-judge"])
+
+        assert rc == 1  # findings-driven exit code, unaffected by missing creds
+        assert _FakeDistributor.instances == []
+
+    def test_smtp_failure_caught_exit_code_still_reflects_findings(self, tmp_path, monkeypatch):
+        _stub_sibling_modules(monkeypatch)
+        monkeypatch.setenv("GMAIL_USER", "bot@example.com")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "secret")
+        monkeypatch.setattr("scripts.email_distributor.EmailDistributor", _RaisingDistributor)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "briefings").mkdir()
+        # briefing absent -> CRITICAL
+        config_path = self._write_config(tmp_path)
+
+        rc = qc.main(["--config", str(config_path), "--date", "2026-08-25", "--no-judge"])
+
+        assert rc == 1  # findings-driven exit code, unaffected by the SMTP crash
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +1029,6 @@ class TestConfigInterpolationUsesRunnerLoader:
 
     def test_fallback_used_when_env_var_unset(self, tmp_path, monkeypatch):
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.delenv("QC_TEST_OUTPUT_DIR", raising=False)
         monkeypatch.chdir(tmp_path)
 
@@ -705,8 +1043,6 @@ class TestConfigInterpolationUsesRunnerLoader:
 
     def test_env_value_used_when_set(self, tmp_path, monkeypatch):
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.setenv("QC_TEST_OUTPUT_DIR", "real-dir")
         monkeypatch.chdir(tmp_path)
 
@@ -726,8 +1062,6 @@ class TestConfigInterpolationUsesRunnerLoader:
         the previous two tests aren't passing by accident (e.g. both dirs
         existing, or interpolation being skipped)."""
         _stub_sibling_modules(monkeypatch)
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
-        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         monkeypatch.setenv("QC_TEST_OUTPUT_DIR", "real-dir")
         monkeypatch.chdir(tmp_path)
 

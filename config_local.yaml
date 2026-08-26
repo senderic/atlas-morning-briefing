@@ -455,6 +455,13 @@ bedrock:
 # See references/quality_monitoring_design.md.
 quality_check:
   # Minimum item counts before a section is called thin (INFO only).
+  # Alerts reuse the briefing's own Gmail path (scripts/email_distributor.py).
+  # CRITICAL findings send one email per run, subject to the 24h dedupe.
+  # daily_digest: true also mails on a clean day; default keeps quiet mornings quiet.
+  alert_email:
+    recipients:
+      - "${RECIPIENT_EMAIL:-your-email@example.com}"
+    daily_digest: false
   section_floors:
     news: 3
     happenings: 2

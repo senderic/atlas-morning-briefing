@@ -216,6 +216,14 @@ quality_check:
     news: 3
     blogs: 3
 
+  # Where alerts go. Reuses the briefing's own Gmail path, so there is one
+  # delivery mechanism to keep working. CRITICAL findings mail immediately
+  # (subject to a 24h per-finding dedupe); set daily_digest to also mail on a
+  # clean day. Falls back to the pipeline's email_recipients when unset.
+  alert_email:
+    recipients: ["you@example.com"]
+    daily_digest: false
+
   # Dimensions the LLM judge scores, 0-2 each. Omit to score all six.
   # Scoring a pipeline on a goal it does not have produces a permanent red
   # that trains the reader to ignore the section.

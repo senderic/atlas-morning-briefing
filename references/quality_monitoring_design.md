@@ -99,7 +99,7 @@ flowchart LR
     subgraph outputs[Outputs]
         H["logs/source-health.jsonl"]
         Q["logs/quality-scores.jsonl"]
-        D["digest → Telegram / email"]
+        D["digest → email"]
     end
 
     J --> L1
@@ -236,11 +236,11 @@ The digest is only useful if a quiet day is genuinely quiet.
 
 | Severity | Meaning | Channel |
 |---|---|---|
-| CRITICAL | reader got a broken or wrong briefing, or got none | push immediately (Telegram) |
+| CRITICAL | reader got a broken or wrong briefing, or got none | email immediately |
 | WARN | a source or check degraded; briefing still shipped | daily digest |
 | INFO | worth knowing, no action | weekly roll-up only |
 
-`scripts/send_briefing_telegram.py` already exists and can carry the CRITICAL path with minor rework. The daily digest can piggyback on `email_distributor.py`, which already handles sanitization and address masking.
+Both paths reuse `email_distributor.py`, which already handles markdown-to-HTML rendering, sanitization, and address masking in logs — the same mechanism that delivers the briefing itself. One delivery path to keep working, not two. (`scripts/send_briefing_telegram.py` exists in the repo but is dead weight from an earlier machine and is not used.)
 
 **Deduplicate alerts.** A dead feed should page once, then appear in the digest as a standing item until fixed — not page every morning for a month. Track `first_seen` / `last_alerted` per finding in the health JSONL.
 
@@ -270,7 +270,7 @@ Per-pipeline status file. Add `references/` note. No behavior change.
 `scripts/quality_check.py` Layer 2 — pure functions over a markdown string, trivially testable. Feed it the three briefings from this week as fixtures; checks 4, 5 and 6 must fire on the Aug 25 local briefing and stay silent on the Aug 25 Atlas one.
 
 **Phase 3 — digest + alerting**
-Severity routing, dedupe, Telegram for CRITICAL, daily markdown digest. Cron:
+Severity routing, dedupe, email for CRITICAL, daily markdown digest. Cron:
 
 ```cron
 # after both briefings finish (Atlas ~06:15, Local ~06:24)
@@ -290,7 +290,8 @@ Phases 1 and 2 deliver most of the value and need no model at all. Phase 4 is th
 
 1. **Dead feeds — repair or remove?** Anthropic, Meta AI and MIT News AI need new URLs; Google AI Blog has been frozen since 2024 and probably wants deleting. Want me to fix those now, separately from building any of this?
 2. **Per-feed staleness thresholds.** A flat 90 days will nag about Lilian Weng and Benedict Evans forever. Worth a `stale_after_days` override per feed in config, or accept the noise on a handful?
-3. **Alert channel.** Telegram for CRITICAL, or keep everything in one morning email so there's only one thing to read?
+3. ~~**Alert channel.**~~ **Resolved:** email, through the briefing's own Gmail
+   path. Telegram is not used; there is now one delivery mechanism, not two.
 4. **Where the judge runs.** A plain script reusing the existing composite LLM client is simplest and needs no new auth. The alternative is a scheduled Claude Code routine, which is more capable but adds a moving part outside the repo.
 
 ---
@@ -379,6 +380,5 @@ entirely, `2` if the checker itself fails. Cron mails on nonzero.
 
 ### Not yet done
 
-- Telegram is unconfigured, so CRITICALs currently land in the digest and the
-  journal only. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to enable the
-  push path.
+- Nothing outstanding on delivery: CRITICAL findings email out through the
+  briefing's own Gmail path, using the credentials already in `.env`.
