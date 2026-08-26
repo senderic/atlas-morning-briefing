@@ -55,6 +55,11 @@ from scripts.llm_client import BaseLLMClient
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+SYNTHESIS_UNAVAILABLE_TEXT = (
+    "*Synthesis unavailable for today's briefing. Please see the individual "
+    "sections below for key updates in tech, defense, and research.*\n\n"
+)
+
 DEFAULT_FILE_NAMING = "Atlas-Briefing-{yyyy}.{mm}.{dd}"
 
 
@@ -117,6 +122,7 @@ class BriefingRunner:
             "news_found": 0,
             "happenings_found": 0,
             "alerts_found": 0,
+            "synthesis_degraded": False,
             "geo_filtered_out": 0,
             "intelligence_enabled": False,
             "errors": [],
@@ -791,10 +797,12 @@ class BriefingRunner:
                 md.append(f"{intro}\n\n")
             else:
                 md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
-                md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
+                md.append(SYNTHESIS_UNAVAILABLE_TEXT)
+                self._record_degraded_synthesis()
         else:
             md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
-            md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
+            md.append(SYNTHESIS_UNAVAILABLE_TEXT)
+            self._record_degraded_synthesis()
 
         if self.feature_solo_founder_angle:
             solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
@@ -1360,6 +1368,22 @@ class BriefingRunner:
             logger.error(f"Distribution failed: {e}")
             self.errors.append(f"Distribution: {e}")
             return {}
+
+    def _record_degraded_synthesis(self) -> None:
+        """
+        Record that the briefing shipped without its lead section.
+
+        Falling back to the placeholder is correct behavior when every LLM
+        backend is down, but a run that delivers no Executive Summary is not a
+        clean run. Without this the status file reported errors: [] on a
+        briefing whose most-read section was a stub -- which is exactly the
+        kind of silent degradation the quality check exists to surface.
+        """
+        message = "Executive summary unavailable (LLM synthesis failed)"
+        if message not in self.errors:
+            self.errors.append(message)
+        self.status["synthesis_degraded"] = True
+        logger.warning(message)
 
     def save_status(self, output_dir: str = ".") -> None:
         """

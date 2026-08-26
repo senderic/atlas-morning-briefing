@@ -15,6 +15,7 @@ from scripts import intelligence, report_invariants
 from scripts.quality_findings import CRITICAL, INFO, WARN
 from scripts.report_invariants import (
     check_blocked_sources,
+    check_degraded_content,
     check_near_duplicates,
     check_out_of_area,
     check_placeholder_text,
@@ -382,6 +383,166 @@ class TestCheckPlaceholderText:
     def test_silent_on_clean_copy(self):
         md = "Contact the newsroom at tips@voiceofsandiego.org.\n"
         assert check_placeholder_text(md) == []
+
+
+# ---------------------------------------------------------------------------
+# check_degraded_content
+# ---------------------------------------------------------------------------
+
+# Verbatim from production: the entire Executive Summary of the Aug 26
+# briefing, after the heavy-tier LLM timed out across every backend. The
+# fallback firing is correct (graceful degradation is a hard requirement);
+# nothing noticing was the defect -- status.json still said errors: [] and
+# the run was declared a success. See CLAUDE.md and
+# references/quality_monitoring_design.md.
+EXEC_SUMMARY_PLACEHOLDER_FIXTURE = (
+    "*Synthesis unavailable for today's briefing. Please see the individual "
+    "sections below for key updates in tech, defense, and research.*"
+)
+
+DEGRADED_MIN_CONFIG = {
+    "section_headings": {"executive_summary": "Executive Summary", "news": "AI & Tech News"}
+}
+
+
+def _section_markdown(heading, body):
+    return f"## {heading}\n\n{body}\n"
+
+
+class TestCheckDegradedContent:
+    def test_real_executive_summary_placeholder_is_critical(self):
+        # The verbatim fixture trips two default markers at once
+        # ("synthesis unavailable" and "unavailable for today's briefing")
+        # -- that is still one degraded section, so exactly one finding,
+        # with both matched markers recorded for debugging.
+        md = _section_markdown("Executive Summary", EXEC_SUMMARY_PLACEHOLDER_FIXTURE)
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.severity == CRITICAL
+        assert finding.code == "degraded-content"
+        assert "Executive Summary" in finding.message
+        assert "Synthesis unavailable for today's briefing" in finding.message
+        assert set(finding.detail["markers"]) == {
+            "synthesis unavailable",
+            "unavailable for today's briefing",
+        }
+
+    def test_same_placeholder_in_non_executive_section_is_warn(self):
+        md = _section_markdown("AI & Tech News", EXEC_SUMMARY_PLACEHOLDER_FIXTURE)
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.severity == WARN
+        assert finding.code == "degraded-content"
+        assert "AI & Tech News" in finding.message
+
+    def test_three_overlapping_markers_still_one_finding(self):
+        # A section whose text happens to trip three configured markers at
+        # once is one degraded section, not three findings -- the count is
+        # what a human reads first in the digest headline, and it must not
+        # inflate by however many synonyms happen to overlap.
+        md = _section_markdown(
+            "Executive Summary",
+            "Synthesis unavailable for today's briefing: summary unavailable "
+            "and the model was unable to generate a lead section.",
+        )
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert len(findings) == 1
+        assert set(findings[0].detail["markers"]) == {
+            "synthesis unavailable",
+            "unavailable for today's briefing",
+            "summary unavailable",
+            "unable to generate",
+        }
+        assert findings[0].severity == CRITICAL
+
+    def test_two_different_degraded_sections_are_two_findings(self):
+        # Two genuinely different degraded sections is still two findings,
+        # one each, with the right severity per section.
+        md = (
+            _section_markdown("Executive Summary", EXEC_SUMMARY_PLACEHOLDER_FIXTURE)
+            + _section_markdown("AI & Tech News", "Summary unavailable for this section today.")
+        )
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert len(findings) == 2
+        by_section = {f.source: f for f in findings}
+        assert set(by_section) == {"Executive Summary", "AI & Tech News"}
+        assert by_section["Executive Summary"].severity == CRITICAL
+        assert by_section["AI & Tech News"].severity == WARN
+
+    def test_silent_on_clean_briefing(self):
+        md = _section_markdown(
+            "Executive Summary",
+            "Two council votes land back to back this week, and a new "
+            "funding round reshapes the local defense-tech landscape.",
+        )
+        assert check_degraded_content(md, DEGRADED_MIN_CONFIG) == []
+
+    def test_silent_on_full_clean_briefing_fixture(self):
+        # The same multi-section clean fixture check_report's own
+        # clean-report guarantee is built on -- degraded-content adds no
+        # findings to it either.
+        assert check_degraded_content(CLEAN_MARKDOWN, CLEAN_CONFIG) == []
+
+    def test_custom_markers_from_config_are_honored(self):
+        md = _section_markdown("Executive Summary", "*Editorial desk offline for today.*")
+        config = {"quality_check": {"degraded_markers": ["editorial desk offline"]}}
+        findings = check_degraded_content(md, config)
+        assert len(findings) == 1
+        assert findings[0].severity == CRITICAL
+        assert findings[0].detail["markers"] == ["editorial desk offline"]
+
+    def test_built_in_defaults_apply_when_key_absent(self):
+        md = _section_markdown("Executive Summary", "Summary unavailable due to an upstream error.")
+        findings = check_degraded_content(md, {})
+        assert len(findings) == 1
+        assert findings[0].detail["markers"] == ["summary unavailable"]
+
+    def test_explicit_empty_marker_list_disables_the_check(self):
+        md = _section_markdown("Executive Summary", EXEC_SUMMARY_PLACEHOLDER_FIXTURE)
+        config = {"quality_check": {"degraded_markers": []}}
+        assert check_degraded_content(md, config) == []
+
+    def test_case_insensitive_matching(self):
+        md = _section_markdown(
+            "Executive Summary", "SYNTHESIS UNAVAILABLE today -- see below."
+        )
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert len(findings) == 1
+        assert findings[0].severity == CRITICAL
+        assert findings[0].detail["markers"] == ["synthesis unavailable"]
+
+    def test_news_item_merely_mentioning_unavailable_service_is_not_critical(self):
+        # A real outage story legitimately uses phrasing that overlaps a
+        # degradation marker ("unable to generate") without the briefing
+        # itself having degraded. Scoped to the news section, this is at
+        # worst a WARN, never a false CRITICAL.
+        md = _section_markdown(
+            "AI & Tech News",
+            "**[Billing Outage Hits Regional Cloud Host](https://example.org/outage)**\n"
+            "The provider's billing dashboard was unable to generate invoices "
+            "for several hours Tuesday after a database failover, the company "
+            "said in a status update.",
+        )
+        findings = check_degraded_content(md, DEGRADED_MIN_CONFIG)
+        assert all(f.severity != CRITICAL for f in findings)
+        if findings:
+            assert findings[0].severity == WARN
+
+    def test_usage_summary_appendix_is_skipped_entirely(self):
+        md = (
+            "## Gemini Usage Summary\n\n"
+            "Synthesis unavailable calls: 1 failed attempt on the heavy tier.\n"
+        )
+        assert check_degraded_content(md, DEGRADED_MIN_CONFIG) == []
+
+    def test_api_key_rotation_summary_appendix_is_skipped(self):
+        md = (
+            "## API Key Rotation Summary\n\n"
+            "Key 2 unable to generate a response after 3 attempts.\n"
+        )
+        assert check_degraded_content(md, DEGRADED_MIN_CONFIG) == []
 
 
 # ---------------------------------------------------------------------------

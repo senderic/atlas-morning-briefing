@@ -349,3 +349,84 @@ class TestStatusFilePerPipeline:
         runner.save_status()
         with open(tmp_path / "status.json") as f:
             assert json.load(f)["pipeline"] == "local"
+
+
+class TestDegradedSynthesisIsRecorded:
+    """A briefing without its lead section is not a clean run."""
+
+    def _runner(self, base_config, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        return BriefingRunner(base_config, dry_run=True)
+
+    def test_placeholder_summary_records_an_error(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        md = runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[],
+            news=[{"title": "A story", "url": "https://example.org/a"}],
+            top_papers=[], synthesis={},
+        )
+        assert "Synthesis unavailable" in md
+        assert any("Executive summary unavailable" in e for e in runner.errors)
+        assert runner.status["synthesis_degraded"] is True
+
+    def test_healthy_summary_records_nothing(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        md = runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[],
+            news=[{"title": "A story", "url": "https://example.org/a"}],
+            top_papers=[], synthesis={"editorial_intro": "**A real lead.**\n\nBody."},
+        )
+        assert "Synthesis unavailable" not in md
+        assert not any("Executive summary unavailable" in e for e in runner.errors)
+        assert runner.status["synthesis_degraded"] is False
+
+    def test_error_is_not_duplicated(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        for _ in range(3):
+            runner._record_degraded_synthesis()
+        assert sum("Executive summary unavailable" in e for e in runner.errors) == 1
+
+    def test_status_file_carries_the_flag(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        runner._record_degraded_synthesis()
+        runner.save_status()
+        with open(tmp_path / "status.json") as f:
+            saved = json.load(f)
+        assert saved["synthesis_degraded"] is True
+        assert any("Executive summary unavailable" in e for e in saved["errors"])
+
+
+class TestDegradedPlaceholderIsDetectable:
+    """
+    The placeholder the runner emits must be one the quality check recognizes.
+
+    These live in different modules, so nothing but this test stops someone
+    rewording the placeholder and silently blinding the check that exists to
+    catch it -- which is exactly how the Aug 26 briefing shipped with no
+    executive summary and a clean status file.
+    """
+
+    def test_runner_placeholder_trips_the_degraded_content_check(self):
+        from scripts.briefing_runner import SYNTHESIS_UNAVAILABLE_TEXT
+        from scripts.report_invariants import check_degraded_content
+
+        config = {"section_headings": {"executive_summary": "Executive Summary"}}
+        markdown = f"# Briefing\n\n## Executive Summary\n\n{SYNTHESIS_UNAVAILABLE_TEXT}"
+        findings = check_degraded_content(markdown, config, pipeline="atlas")
+
+        assert len(findings) == 1, "placeholder must produce exactly one finding"
+        assert findings[0].severity == "CRITICAL"
+        assert findings[0].code == "degraded-content"
+
+    def test_a_real_summary_does_not_trip_it(self):
+        from scripts.report_invariants import check_degraded_content
+
+        config = {"section_headings": {"executive_summary": "Executive Summary"}}
+        markdown = (
+            "# Briefing\n\n## Executive Summary\n\n"
+            "**A real lead sentence carrying the day's thesis.**\n\n"
+            "Supporting analysis with specifics.\n\n"
+        )
+        assert check_degraded_content(markdown, config, pipeline="atlas") == []

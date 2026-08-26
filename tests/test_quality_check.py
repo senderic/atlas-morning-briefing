@@ -91,7 +91,7 @@ def _no_op_layer1(harvest_records=None):
         "harvest_journal": lambda **kw: harvest_records or [],
         "append_history": lambda records, path=None: len(records or []),
         "load_history": lambda path=None, since=None: harvest_records or [],
-        "detect_rot": lambda history, probes=None, rules=None: [],
+        "detect_rot": lambda history, probes=None, rules=None, live_sources=None: [],
     }
 
 
@@ -142,7 +142,7 @@ def _stub_sibling_modules(monkeypatch, detect_rot_findings=None, check_report_fi
     sh.append_history = lambda records, path="logs/source-health.jsonl": len(records)
     sh.load_history = lambda path="logs/source-health.jsonl", since=None: []
     sh.probe_feeds = lambda feeds, timeout=20: []
-    sh.detect_rot = lambda history, probes=None, rules=None: detect_rot_findings or []
+    sh.detect_rot = lambda history, probes=None, rules=None, live_sources=None: detect_rot_findings or []
     monkeypatch.setitem(sys.modules, "scripts.source_health", sh)
 
     ri = types.ModuleType("scripts.report_invariants")
@@ -164,7 +164,7 @@ class TestRunChecksMerging:
         briefing.write_text("# Briefing\n\nSome content.\n")
 
         layer1 = _no_op_layer1()
-        layer1["detect_rot"] = lambda history, probes=None, rules=None: [
+        layer1["detect_rot"] = lambda history, probes=None, rules=None, live_sources=None: [
             Finding(WARN, "feed-dead", "Anthropic feed is dead", source="Anthropic", pipeline="atlas"),
         ]
         layer2 = {
@@ -185,6 +185,95 @@ class TestRunChecksMerging:
         assert findings[0].severity == CRITICAL
         assert findings[1].severity == WARN
         assert scores == {}
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: live_sources wiring -- a feed removed or renamed out of
+# config.yaml must stop firing from history alone, and feeds are
+# per-pipeline so the set handed to detect_rot must be the union across
+# every pipeline being checked, not just one.
+# ---------------------------------------------------------------------------
+
+
+class TestLiveSourceNames:
+    def test_union_across_pipelines(self):
+        configs = {
+            "atlas": {"blog_feeds": [{"name": "DeepMind", "url": "u"}, {"name": "Karpathy", "url": "u"}]},
+            "local": {"blog_feeds": [{"name": "KPBS Local", "url": "u"}]},
+        }
+        assert qc.live_source_names(configs) == {"DeepMind", "Karpathy", "KPBS Local"}
+
+    def test_feed_only_in_one_pipeline_is_still_live_for_the_other(self):
+        """A feed configured only under 'local' must not be treated as
+        missing when the union is checked against 'atlas' history, and
+        vice versa -- this is exactly what a single pipeline's blog_feeds
+        list alone would get wrong."""
+        configs = {
+            "atlas": {"blog_feeds": [{"name": "DeepMind", "url": "u"}]},
+            "local": {"blog_feeds": [{"name": "KPBS Local", "url": "u"}]},
+        }
+        names = qc.live_source_names(configs)
+        assert "KPBS Local" in names  # not in atlas's own list, but still live overall
+        assert "DeepMind" in names
+
+    def test_no_blog_feeds_anywhere_returns_empty_set(self):
+        assert qc.live_source_names({"atlas": {}, "local": {}}) == set()
+
+
+class TestRunChecksPassesLiveSourcesToDetectRot:
+    def test_correct_union_set_is_handed_to_detect_rot(self, tmp_path):
+        configs = {
+            "atlas": {
+                "output_dir": str(tmp_path),
+                "file_naming": "Atlas-{yyyy}.{mm}.{dd}",
+                "blog_feeds": [{"name": "DeepMind", "url": "u"}, {"name": "Karpathy", "url": "u"}],
+            },
+            "local": {
+                "output_dir": str(tmp_path),
+                "file_naming": "Local-{yyyy}.{mm}.{dd}",
+                "blog_feeds": [{"name": "KPBS Local", "url": "u"}],
+            },
+        }
+        (tmp_path / "Atlas-2026.08.25.md").write_text("# Briefing\n")
+        (tmp_path / "Local-2026.08.25.md").write_text("# Briefing\n")
+
+        captured = {}
+
+        def spy_detect_rot(history, probes=None, rules=None, live_sources=None):
+            captured["live_sources"] = live_sources
+            return []
+
+        layer1 = _no_op_layer1()
+        layer1["detect_rot"] = spy_detect_rot
+
+        qc.run_checks(
+            configs,
+            today=date(2026, 8, 25),
+            no_judge=True,
+            **layer1,
+            **_no_op_layer2(),
+        )
+
+        assert captured["live_sources"] == {"DeepMind", "Karpathy", "KPBS Local"}
+
+    def test_empty_union_passes_none_not_empty_set(self, tmp_path):
+        """No pipeline has any blog_feeds configured: treat as 'no filter'
+        (None) rather than silently suppressing every history finding."""
+        configs = {"atlas": {"output_dir": str(tmp_path), "file_naming": "Atlas-{yyyy}.{mm}.{dd}"}}
+        (tmp_path / "Atlas-2026.08.25.md").write_text("# Briefing\n")
+
+        captured = {}
+
+        def spy_detect_rot(history, probes=None, rules=None, live_sources=None):
+            captured["live_sources"] = live_sources
+            return []
+
+        layer1 = _no_op_layer1()
+        layer1["detect_rot"] = spy_detect_rot
+
+        qc.run_checks(configs, today=date(2026, 8, 25), no_judge=True, **layer1, **_no_op_layer2())
+
+        assert captured["live_sources"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +835,7 @@ class TestDryRun:
             harvest_journal=lambda **kw: [],
             append_history=fake_append_history,
             load_history=lambda path=None, since=None: [],
-            detect_rot=lambda history, probes=None, rules=None: [],
+            detect_rot=lambda history, probes=None, rules=None, live_sources=None: [],
             **_no_op_layer2(),
             build_client=lambda config: _fake_client(response=_judge_json()),
         )

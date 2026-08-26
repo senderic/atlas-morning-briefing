@@ -30,7 +30,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import feedparser
 import requests
@@ -225,17 +225,58 @@ def harvest_journal(
 # ---------------------------------------------------------------------------
 
 
+def _record_key(record: Dict[str, Any]) -> Tuple[Any, Any, Any, Any]:
+    """The identity of a history record: (ts, pipeline, kind, name).
+
+    Overlapping ``--since`` harvest windows (``-30d`` then ``-3d`` then
+    ``-2d``) re-harvest the same runs from journald; this key is what makes
+    re-appending them a no-op instead of an inflated streak.
+    """
+    return (record.get("ts"), record.get("pipeline"), record.get("kind"), record.get("name"))
+
+
+def _existing_keys(path: Path) -> Set[Tuple[Any, Any, Any, Any]]:
+    keys: Set[Tuple[Any, Any, Any, Any]] = set()
+    if not path.exists():
+        return keys
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            keys.add(_record_key(rec))
+    return keys
+
+
 def append_history(records: Iterable[Dict[str, Any]], path: str = HISTORY_PATH) -> int:
-    """Append records to the history JSONL, one JSON object per line."""
+    """Append records to the history JSONL, one JSON object per line.
+
+    Idempotent on ``(ts, pipeline, kind, name)``: a record already on disk
+    (or already written earlier in this same batch) is silently skipped
+    rather than duplicated, so re-harvesting an overlapping journald window
+    never inflates a streak.
+    """
     records = list(records)
     if not records:
         return 0
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    seen = _existing_keys(p)
+    written = 0
     with p.open("a") as f:
         for r in records:
+            key = _record_key(r)
+            if key in seen:
+                continue
+            seen.add(key)
             f.write(json.dumps(r, sort_keys=True) + "\n")
-    return len(records)
+            written += 1
+    return written
 
 
 def _resolve_since(since: Optional[str]) -> Optional[datetime]:
@@ -259,12 +300,21 @@ def _resolve_since(since: Optional[str]) -> Optional[datetime]:
 
 
 def load_history(path: str = HISTORY_PATH, since: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Load history records, skipping malformed lines, optionally filtered by ``since``."""
+    """Load history records, skipping malformed lines, optionally filtered by ``since``.
+
+    Defensively de-duplicates on ``(ts, pipeline, kind, name)`` while
+    reading, so a file that already accumulated duplicate lines (from
+    before ``append_history`` became idempotent, or from any other source)
+    stops skewing streak/median calculations without anyone hand-editing
+    the file. The first occurrence of a key wins; later duplicates are
+    dropped.
+    """
     p = Path(path)
     if not p.exists():
         return []
 
     cutoff = _resolve_since(since)
+    seen: Set[Tuple[Any, Any, Any, Any]] = set()
     records: List[Dict[str, Any]] = []
     with p.open() as f:
         for lineno, line in enumerate(f, 1):
@@ -276,6 +326,10 @@ def load_history(path: str = HISTORY_PATH, since: Optional[str] = None) -> List[
             except json.JSONDecodeError:
                 logger.warning("skipping malformed history line %d in %s", lineno, path)
                 continue
+            key = _record_key(rec)
+            if key in seen:
+                continue
+            seen.add(key)
             if cutoff is not None:
                 rec_dt = _safe_parse_ts(rec.get("ts", ""))
                 if rec_dt is not None and rec_dt < cutoff:
@@ -429,11 +483,25 @@ def _probe_is_dead(probe: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def _has_yield_in_window(records: List[Dict[str, Any]], window: int) -> bool:
+    """True if any of the trailing ``window`` records (oldest-first input)
+    recorded a nonzero yield.
+
+    Used to tell "dead" from "quiet with a cosmetic warning": a feed that
+    logs a hard_error on every run (e.g. an encoding-declaration mismatch)
+    but still delivered content somewhere in recent memory is degraded, not
+    dead, even if its most recent runs happen to string together an
+    error+zero streak past the threshold.
+    """
+    return any(r.get("yield") for r in records[-window:])
+
+
 def _detect_dead_url(
     history: List[Dict[str, Any]], probes: List[Dict[str, Any]], rules: Dict[str, Any]
 ) -> List[Finding]:
     findings: List[Finding] = []
     streak_threshold = rules["dead_url_streak"]
+    median_window = rules["median_window"]
     probes_by_name = {p.get("name"): p for p in probes}
     feed_groups = _group_by_pipeline_name(history, kind="feed")
 
@@ -441,13 +509,18 @@ def _detect_dead_url(
     for (pipeline, name), records in feed_groups.items():
         seen_names.add(name)
         streak = _trailing_error_streak(records)
+        # A raw streak past the threshold is only *confirmed* dead-by-history
+        # when there is also no successful delivery anywhere in the trailing
+        # window -- otherwise it's a live feed having a quiet spell that
+        # happens to also carry a noisy cosmetic warning on every run.
+        streak_confirmed = streak >= streak_threshold and not _has_yield_in_window(records, median_window)
         probe = probes_by_name.get(name)
         probe_bad, probe_reason = _probe_is_dead(probe) if probe else (False, None)
 
-        if streak < streak_threshold and not probe_bad:
+        if not streak_confirmed and not probe_bad:
             continue
 
-        severity = CRITICAL if streak >= streak_threshold else WARN
+        severity = CRITICAL if streak_confirmed else WARN
         reason = probe_reason or (records[-1].get("hard_error") if records else None) or "repeated fetch errors"
         streak_note = f" ({streak} consecutive runs with errors)" if streak else ""
         findings.append(
@@ -612,6 +685,7 @@ def detect_rot(
     history: List[Dict[str, Any]],
     probes: Optional[List[Dict[str, Any]]] = None,
     rules: Optional[Dict[str, Any]] = None,
+    live_sources: Optional[Set[str]] = None,
 ) -> List[Finding]:
     """
     Run all Layer 1 detection rules and return sorted findings.
@@ -619,9 +693,26 @@ def detect_rot(
     ``probes`` (from :func:`probe_feeds`) are only needed for Modes A/B live
     checks; Modes C, query dead-weight, and zone-unreachable work from
     ``history`` alone.
+
+    ``live_sources``, when given, is the set of feed ``name`` values still
+    configured (across all pipelines being checked). A feed deleted or
+    renamed in config.yaml has no way to recover on its own -- its
+    historical error records just keep firing every morning until someone
+    hand-edits the log file -- so any history-derived ``feed``-kind record
+    whose name isn't in ``live_sources`` is dropped before detection runs.
+    Leaving this ``None`` (the default) disables the filter entirely,
+    preserving prior behavior for callers that don't pass it. This only
+    filters *history*; a live probe result stands on its own regardless,
+    since a caller only probes feeds it still has configured.
     """
     merged_rules = {**DEFAULT_RULES, **(rules or {})}
     probes = probes or []
+
+    if live_sources is not None:
+        history = [
+            r for r in history
+            if r.get("kind") != "feed" or r.get("name") in live_sources
+        ]
 
     findings: List[Finding] = []
     findings.extend(_detect_dead_url(history, probes, merged_rules))
@@ -687,6 +778,10 @@ def _load_feeds(config_path: str) -> List[Dict[str, str]]:
     return config.get("blog_feeds") or []
 
 
+def _live_source_names(feeds: List[Dict[str, str]]) -> Set[str]:
+    return {f.get("name") for f in feeds if f.get("name")}
+
+
 def _print_findings(findings: List[Finding]) -> None:
     if not findings:
         print("No findings — all sources healthy.")
@@ -724,12 +819,16 @@ def main() -> int:
         print(build_report(history))
         return 0
 
+    feeds = _load_feeds(args.config)
+    # An empty/missing config is treated as "no filter" rather than "filter
+    # everything out" -- graceful degradation, same as the rest of this repo.
+    live_sources = _live_source_names(feeds) or None
+
     if args.probe:
-        feeds = _load_feeds(args.config)
         logger.info("probing %d feed(s) from %s", len(feeds), args.config)
         probes = probe_feeds(feeds)
         history = load_history(args.history)
-        findings = detect_rot(history, probes=probes, rules=rules)
+        findings = detect_rot(history, probes=probes, rules=rules, live_sources=live_sources)
         _print_findings(findings)
         return 0
 
@@ -738,7 +837,7 @@ def main() -> int:
     logger.info("appended %d record(s) to %s", appended, args.history)
 
     history = load_history(args.history)
-    findings = detect_rot(history, rules=rules)
+    findings = detect_rot(history, rules=rules, live_sources=live_sources)
     _print_findings(findings)
     return 0
 

@@ -623,7 +623,146 @@ def check_placeholder_text(
 
 
 # ---------------------------------------------------------------------------
-# Check 9 -- thin sections
+# Check 9 -- degraded content
+# ---------------------------------------------------------------------------
+
+# The pipeline's own LLM-fallback copy (briefing_runner.py's editorial-intro
+# fallback is the verbatim first entry here -- see the Aug 26 Executive
+# Summary this check exists to catch). Deliberately short and specific:
+# a false CRITICAL every morning is worse than a missed one, so the default
+# list only holds phrasing the pipeline itself is known to emit on a
+# degraded LLM step, not generic words like "unavailable" that ordinary
+# news prose says all the time.
+_DEFAULT_DEGRADED_MARKERS = (
+    "synthesis unavailable",
+    "unavailable for today's briefing",
+    "summary unavailable",
+    "unable to generate",
+)
+
+
+def _is_usage_appendix_heading(heading: str) -> bool:
+    """
+    True for the LLM cost/usage appendix headings -- ``## Gemini Usage
+    Summary``, ``## OpenRouter Usage Summary``, ``## Opencode Usage
+    Summary`` (gemini_client.py / openrouter_client.py / opencode_client.py)
+    and ``## API Key Rotation Summary`` (composite_client.py, or
+    gemini_client.py's own non-composite rendering of the same table).
+
+    This is operational metadata about the pipeline's own LLM calls -- it
+    routinely says things like "Failures" and can legitimately reference a
+    tier having zero successful calls -- not reader-facing briefing
+    content, so it is out of scope for check_degraded_content regardless
+    of what it says. Matched structurally by the heading shape every one
+    of those renderers emits, rather than an enumerated list of provider
+    names, so a future backend's usage-summary heading is skipped the same
+    way without this function needing an update.
+    """
+    text = heading.strip().lower()
+    return text.endswith("usage summary") or text == "api key rotation summary"
+
+
+def check_degraded_content(
+    markdown: str, config: Dict[str, Any], pipeline: str = ""
+) -> List[Finding]:
+    """
+    A known LLM-fallback placeholder rendered into the briefing.
+
+    Every ``[LLM]`` step in the pipeline has a deterministic fallback --
+    when a heavy-tier call times out or every backend fails, the pipeline
+    ships a placeholder like "Synthesis unavailable for today's briefing"
+    instead of crashing the run. That fallback firing is correct, required
+    behavior (see CLAUDE.md). What is a defect is nobody *noticing*: the
+    run still exits 0, status.json still records ``errors: []``, and a
+    reader gets a briefing with a placeholder where its lead section
+    should be. This check is that missing signal, made deterministic and
+    free -- no LLM judge required to catch a hard, string-matchable
+    default.
+
+    Scoping: markers are matched against each rendered section's own body
+    text -- walked one heading at a time via ``_parse_headings``, the same
+    structure ``_section_body`` uses -- rather than a single substring
+    search over the whole markdown file. That has two effects. First, the
+    LLM usage-summary appendix (see ``_is_usage_appendix_heading``) is
+    skipped outright -- it is pipeline cost/call metadata, not reader
+    content, and irrelevant to whether the briefing itself degraded.
+    Second, severity is attributable to *which* section the placeholder
+    landed in: a marker phrase that shows up inside an ordinary news
+    item's own summary (e.g. quoting some unrelated product's outage
+    notice) is scoped to that section and reads as a WARN like anything
+    else found there, never a false CRITICAL. Only a match inside the
+    executive summary's own body is CRITICAL, because that section is
+    always meant to be the pipeline's own synthesis, never a quote from a
+    source, and it is the one section every reader reads.
+
+    Reads markers from ``config["quality_check"]["degraded_markers"]``
+    (case-insensitive substring match); the key being absent falls back to
+    ``_DEFAULT_DEGRADED_MARKERS``, while an explicit empty list disables
+    the check entirely.
+
+    Count: at most one Finding per degraded section, no matter how many
+    configured markers match its body text -- the reportable fact is "this
+    section is degraded", not "N of my configured synonyms happen to
+    overlap in this one placeholder". The real Aug 26 placeholder trips
+    both "synthesis unavailable" and "unavailable for today's briefing" at
+    once; that is one defect, and a digest headline ("3 CRITICAL") that
+    inflates by however many synonyms overlap is exactly the kind of noise
+    this checker exists to avoid. Every marker that matched is still kept
+    in ``detail["markers"]`` for debugging. Two genuinely different
+    degraded sections still produce two findings, one each.
+    """
+    quality_cfg = config.get("quality_check") or {}
+    markers_cfg = quality_cfg.get("degraded_markers")
+    if markers_cfg is None:
+        markers_cfg = _DEFAULT_DEGRADED_MARKERS
+    markers = [str(m).strip().lower() for m in markers_cfg if str(m).strip()]
+    if not markers:
+        return []
+
+    exec_heading = (config.get("section_headings") or {}).get(
+        "executive_summary", "Executive Summary"
+    )
+
+    findings = []
+    for heading, start, end in _parse_headings(markdown):
+        if _is_usage_appendix_heading(heading):
+            continue
+        body = markdown[start:end]
+        body_lower = body.lower()
+        # A section is degraded or it isn't -- which configured synonym(s)
+        # happen to overlap is incidental and must not multiply the
+        # reported count. One finding per section, with every marker that
+        # matched kept in `detail` for debugging.
+        matched = [marker for marker in markers if marker in body_lower]
+        if not matched:
+            continue
+        line = next(
+            (
+                raw.strip()
+                for raw in body.splitlines()
+                if any(marker in raw.strip().lower() for marker in matched)
+            ),
+            body.strip(),
+        )
+        severity = CRITICAL if heading == exec_heading else WARN
+        findings.append(
+            Finding(
+                severity=severity,
+                code="degraded-content",
+                message=(
+                    f"Degradation placeholder found in '{heading}' "
+                    f'section: "{line}"'
+                ),
+                source=heading,
+                pipeline=pipeline,
+                detail={"markers": matched, "section": heading, "line": line},
+            )
+        )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 10 -- thin sections
 # ---------------------------------------------------------------------------
 
 
@@ -689,6 +828,7 @@ def check_report(
     findings += check_section_order(markdown, config, pipeline=pipeline)
     findings += check_stale_events(markdown, config, today=today, pipeline=pipeline)
     findings += check_scaffolding_leak(markdown, config, pipeline=pipeline)
+    findings += check_degraded_content(markdown, config, pipeline=pipeline)
     findings += check_blocked_sources(markdown, config, pipeline=pipeline)
     findings += check_out_of_area(markdown, config, pipeline=pipeline)
     findings += check_near_duplicates(markdown, config, pipeline=pipeline)

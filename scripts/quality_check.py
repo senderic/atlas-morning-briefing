@@ -37,7 +37,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from scripts.quality_findings import (
     CRITICAL,
@@ -191,6 +191,27 @@ def locate_briefing_path(config: Dict[str, Any], today: date) -> Path:
     file_naming = config.get("file_naming", DEFAULT_FILE_NAMING)
     filename = format_briefing_filename(file_naming, today)
     return Path(output_dir) / f"{filename}.md"
+
+
+def live_source_names(configs: Dict[str, Dict[str, Any]]) -> Set[str]:
+    """The union of ``blog_feeds`` names configured across every pipeline.
+
+    Feeds are per-pipeline (``config.yaml``'s Atlas feeds and
+    ``config_local.yaml``'s local feeds are disjoint lists), but
+    ``detect_rot``'s history-derived rot checks key a feed by name alone
+    (matching the existing ``feed_overrides`` design), not by
+    ``(pipeline, name)``. Taking the union across every pipeline being
+    checked -- rather than any single pipeline's list -- is what keeps a
+    feed configured only in "local" from being misjudged as missing when
+    checked against "atlas", and vice versa.
+    """
+    names: Set[str] = set()
+    for config in configs.values():
+        for feed in config.get("blog_feeds") or []:
+            name = feed.get("name") if isinstance(feed, dict) else None
+            if name:
+                names.add(name)
+    return names
 
 
 def _lazy_import(module_name: str, attr: str) -> Callable[..., Any]:
@@ -552,7 +573,12 @@ def run_checks(
                         Finding(WARN, "feed-probe-failed", str(e), source="probe_feeds", pipeline=pipeline)
                     )
 
-        findings.extend(_detect_rot(history, probes=probes))
+        # An empty union (no pipeline has any blog_feeds configured) is
+        # treated as "no filter" rather than "filter everything out" --
+        # graceful degradation, consistent with detect_rot's own None
+        # contract and source_health.py's CLI.
+        live_sources = live_source_names(configs) or None
+        findings.extend(_detect_rot(history, probes=probes, live_sources=live_sources))
     except Exception as e:
         findings.append(Finding(WARN, "source-health-unavailable", f"Layer 1 (source health) failed: {e}", source="layer1"))
 

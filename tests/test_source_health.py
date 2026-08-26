@@ -11,6 +11,7 @@ import pytest
 
 from scripts.quality_findings import CRITICAL, INFO, WARN
 from scripts.source_health import (
+    _trailing_error_streak,
     append_history,
     detect_rot,
     harvest_journal,
@@ -218,6 +219,65 @@ class TestHistoryRoundTrip:
         assert append_history([], path=str(path)) == 0
         assert not path.exists()
 
+    def test_append_same_batch_twice_is_idempotent(self, tmp_path):
+        """Overlapping --since harvest windows re-harvest the same runs;
+        re-appending that batch must not duplicate records or inflate a
+        streak computed from them."""
+        path = tmp_path / "h.jsonl"
+        batch = [
+            _feed_record("2026-08-25T06:01:13-07:00", "DeepMind", yield_=0, hard_error="bad xml"),
+            _feed_record("2026-08-24T06:01:13-07:00", "DeepMind", yield_=0, hard_error="bad xml"),
+        ]
+        n1 = append_history(batch, path=str(path))
+        n2 = append_history(batch, path=str(path))
+        assert n1 == 2
+        assert n2 == 0  # every record in the batch was already on disk
+
+        loaded = load_history(path=str(path))
+        assert len(loaded) == 2
+
+        history_before = load_history(path=str(path))
+        streak_before = _trailing_error_streak(
+            [r for r in history_before if r["name"] == "DeepMind"]
+        )
+        append_history(batch, path=str(path))  # re-append the exact same batch again
+        history_after = load_history(path=str(path))
+        streak_after = _trailing_error_streak(
+            [r for r in history_after if r["name"] == "DeepMind"]
+        )
+        assert streak_before == streak_after == 2
+
+    def test_append_idempotent_against_existing_file_content(self, tmp_path):
+        """A record already on disk from a *previous* run must also be
+        skipped, not just duplicates within a single append call."""
+        path = tmp_path / "h.jsonl"
+        rec = _feed_record("2026-08-25T06:01:13-07:00", "DeepMind", yield_=0, hard_error="bad xml")
+        append_history([rec], path=str(path))
+        n = append_history([dict(rec)], path=str(path))  # same key, fresh dict
+        assert n == 0
+        assert len(load_history(path=str(path))) == 1
+
+    def test_load_history_dedupes_file_with_duplicate_lines(self, tmp_path):
+        """A file that already accumulated duplicate lines (e.g. written
+        before append_history became idempotent) must be de-duplicated on
+        read, without anyone hand-editing the file."""
+        path = tmp_path / "h.jsonl"
+        line = json.dumps(
+            {"ts": "2026-08-25T06:01:13-07:00", "pipeline": "atlas", "kind": "feed",
+             "name": "DeepMind", "yield": 0, "hard_error": "bad xml", "newest_entry": None},
+            sort_keys=True,
+        )
+        other = json.dumps(
+            {"ts": "2026-08-24T06:01:13-07:00", "pipeline": "atlas", "kind": "feed",
+             "name": "DeepMind", "yield": 3, "hard_error": None, "newest_entry": None},
+            sort_keys=True,
+        )
+        # Same (ts, pipeline, kind, name) key written twice, plus one distinct record.
+        path.write_text(line + "\n" + line + "\n" + other + "\n")
+        loaded = load_history(path=str(path))
+        assert len(loaded) == 2
+        assert sorted(r["ts"] for r in loaded) == ["2026-08-24T06:01:13-07:00", "2026-08-25T06:01:13-07:00"]
+
     def test_since_filter(self, tmp_path):
         path = tmp_path / "h.jsonl"
         records = [
@@ -413,6 +473,116 @@ class TestDetectRotDeadUrl:
         dead = [f for f in findings if f.code == "feed-dead-url"]
         assert len(dead) == 1
         assert dead[0].severity == WARN
+
+
+# ---------------------------------------------------------------------------
+# detect_rot — Mode A refinement: a dead-by-history streak must ALSO have no
+# successful delivery anywhere in the trailing median_window, or it's a live
+# feed having a quiet spell (DeepMind, VentureBeat AI on 2026-08-26), not a
+# dead one (Anthropic, which never once yielded anything).
+# ---------------------------------------------------------------------------
+
+
+class TestDetectRotQuietSpellVsDead:
+    def test_deepmind_case_error_zero_streak_past_threshold_but_earlier_yield_is_silent(self):
+        """
+        DeepMind, real Aug 2026 shape: delivered content in 8 of 23 runs
+        this month, then hit a quiet spell -- the trailing 4 runs are all
+        hard_error + zero-yield, which clears the default streak threshold
+        (3) on its own. But it's not dead: it has nonzero yields earlier in
+        the trailing median_window (default 30), so this must NOT fire.
+        """
+        ts = _dates(23)
+        # 8 nonzero (delivering) runs among the first 19, the last of them
+        # right before a clean trailing 4-run zero streak.
+        yields = [1, 2, 0, 0, 1, 0, 3, 0, 2, 0, 0, 1, 0, 2, 0, 0, 0, 0, 1] + [0, 0, 0, 0]
+        assert len(yields) == 23
+        assert sum(1 for y in yields if y) == 8
+        history = [
+            _feed_record(t, "DeepMind", yield_=y, hard_error="document declared as us-ascii, but parsed as utf-8")
+            for t, y in zip(ts, yields)
+        ]
+        # Confirm the fixture actually produces a streak past the threshold,
+        # otherwise this test would pass for the wrong reason.
+        assert _trailing_error_streak(history) == 4
+        findings = detect_rot(history)
+        assert [f for f in findings if f.code == "feed-dead-url"] == []
+
+    def test_anthropic_case_error_zero_for_whole_window_no_yield_ever_is_critical(self):
+        """Anthropic, real Aug 2026 shape: hard_error + zero yield on every
+        single run this month -- no nonzero yield anywhere in the window --
+        so the streak IS confirmed dead-by-history and must fire CRITICAL."""
+        ts = _dates(23)
+        history = [
+            _feed_record(t, "Anthropic", yield_=0,
+                         hard_error="text/html; charset=utf-8 is not an XML media type")
+            for t in ts
+        ]
+        findings = detect_rot(history)
+        dead = [f for f in findings if f.code == "feed-dead-url"]
+        assert len(dead) == 1
+        assert dead[0].severity == CRITICAL
+        assert dead[0].source == "Anthropic"
+
+    def test_yield_outside_median_window_does_not_save_a_dead_streak(self):
+        """A nonzero yield that falls outside the trailing median_window
+        must not suppress a genuine dead-by-history finding."""
+        history = (
+            [_feed_record(_dates(1, start="2026-01-01")[0], "Stale", yield_=5)]
+            + [_feed_record(t, "Stale", yield_=0, hard_error="404") for t in _dates(5, start="2026-08-20")]
+        )
+        rules = {"median_window": 5}  # too small to reach back to the Jan yield
+        findings = detect_rot(history, rules=rules)
+        dead = [f for f in findings if f.code == "feed-dead-url"]
+        assert len(dead) == 1
+        assert dead[0].severity == CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# detect_rot — live_sources: a feed removed or renamed out of config.yaml
+# has no way to recover on its own, so its historical error records must
+# stop firing once it's no longer configured.
+# ---------------------------------------------------------------------------
+
+
+class TestDetectRotLiveSources:
+    def test_feed_absent_from_live_sources_produces_no_finding(self):
+        history = [
+            _feed_record(t, "Anthropic", yield_=0, hard_error="404")
+            for t in _dates(5)
+        ]
+        findings = detect_rot(history, live_sources={"DeepMind", "VentureBeat AI"})
+        assert [f for f in findings if f.code == "feed-dead-url"] == []
+
+    def test_feed_present_in_live_sources_still_fires(self):
+        history = [
+            _feed_record(t, "Anthropic", yield_=0, hard_error="404")
+            for t in _dates(5)
+        ]
+        findings = detect_rot(history, live_sources={"Anthropic", "DeepMind"})
+        dead = [f for f in findings if f.code == "feed-dead-url"]
+        assert len(dead) == 1
+        assert dead[0].source == "Anthropic"
+
+    def test_live_sources_none_preserves_current_behavior(self):
+        history = [
+            _feed_record(t, "Anthropic", yield_=0, hard_error="404")
+            for t in _dates(5)
+        ]
+        with_none = detect_rot(history, live_sources=None)
+        without_arg = detect_rot(history)
+        assert len(with_none) == len(without_arg) == 1
+
+    def test_live_sources_does_not_filter_query_or_zone_findings(self):
+        """The filter only applies to feed-kind history -- Brave query
+        dead-weight and NWS zone-unreachable findings are unaffected even
+        when their name isn't in the (feed-only) live_sources set."""
+        ts = _dates(14)
+        history = [_query_record(t, "condition-style query", 0) for t in ts]
+        history.append(_zone_record("2026-08-25T06:00:00-07:00", hard_error="503"))
+        findings = detect_rot(history, live_sources={"DeepMind"})
+        assert any(f.code == "query-dead-weight" for f in findings)
+        assert any(f.code == "zone-unreachable" for f in findings)
 
 
 # ---------------------------------------------------------------------------

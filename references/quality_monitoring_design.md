@@ -360,11 +360,26 @@ worse than no check, because the first thing it teaches is to stop reading.
 
 ### Scheduled
 
-Installed 2026-08-25, under the crontab's existing `CRON_TZ=America/Los_Angeles`:
+**Chained, not clock-scheduled.** The audit runs at the end of
+`run_briefing.sh`, right after both briefings finish.
+
+The first version used a fixed `40 6 * * 1-6`, chosen because the briefings had
+finished by 06:25 the day before. The next morning the Atlas run took 32 minutes
+instead of 15 — an LLM backend was failing and every call burned its retries —
+so the local briefing was still being written at 06:41 while the checker
+inspected the directory at 06:40 and reported `briefing-missing` CRITICAL. The
+briefing was fine; the schedule was wrong. Run length is a function of backend
+health, so no fixed time is safe.
+
+The weekly `--deep` probe rides along on Saturday rather than Sunday, because
+briefings run Mon-Sat and a Sunday audit would find no briefing to audit.
+
+One late backstop remains in cron for the case where `run_briefing.sh` dies
+before reaching the audit. The 24h alert dedupe means a duplicate run does not
+re-send:
 
 ```cron
-40 6 * * 1-6 /home/eric/atlas-morning-briefing/run_quality_check.sh
-15 7 * * 0   /home/eric/atlas-morning-briefing/run_quality_check.sh --deep
+30 8 * * 1-6 /home/eric/atlas-morning-briefing/run_quality_check.sh
 ```
 
 The wrapper pipes everything to journald under the `quality-check` tag, so a
