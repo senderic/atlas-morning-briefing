@@ -357,8 +357,28 @@ which is the best evidence available that the rubric encodes the actual goals.
 All three are the same lesson: a check that cries wolf on a healthy system is
 worse than no check, because the first thing it teaches is to stop reading.
 
+### Scheduled
+
+Installed 2026-08-25, under the crontab's existing `CRON_TZ=America/Los_Angeles`:
+
+```cron
+40 6 * * 1-6 /home/eric/atlas-morning-briefing/run_quality_check.sh
+15 7 * * 0   /home/eric/atlas-morning-briefing/run_quality_check.sh --deep
+```
+
+The wrapper pipes everything to journald under the `quality-check` tag, so a
+morning's digest is readable with:
+
+```bash
+journalctl -t quality-check --since today -o cat
+```
+
+Exit-code contract, verified end to end before scheduling: `0` on a clean
+briefing, `1` when a CRITICAL is present, `1` when a briefing is missing
+entirely, `2` if the checker itself fails. Cron mails on nonzero.
+
 ### Not yet done
 
-- Telegram is unconfigured, so CRITICALs currently land in the digest only.
-  Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to enable the push path.
-- The cron entries are written in `run_quality_check.sh` but not installed.
+- Telegram is unconfigured, so CRITICALs currently land in the digest and the
+  journal only. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to enable the
+  push path.
