@@ -139,6 +139,73 @@ class TestStripTrailingRationale:
         text = "A perfectly ordinary summary with no rationale tail."
         assert _strip_trailing_rationale(text) == text
 
+    def test_strips_verbatim_todays_leak(self):
+        # Verbatim text that shipped to a reader: same idea as "Dropped: ...",
+        # phrased differently, with a bulleted bracketed-index rationale list.
+        leaked = (
+            "The Union-Tribune's weekly roundup of upcoming street fairs, "
+            "festivals, concerts, art shows, and community meetings across "
+            "San Diego is the digest to check when scanning for PB-area "
+            "happenings. No specific events are listed in this item — it's "
+            "the recurring weekly guide, refreshed as dates firm up. "
+            "**The other 17 didn't qualify**, and it's worth saying why "
+            "rather than forcing eight: - **[1], [2], [5]** Mission Bay "
+            "restoration / rising-sea coverage — policy and news, no "
+            "upcoming event or meeting with a date. - **[3]** Lifeguard "
+            "internship injury — news, not a happening. - **[4]** New "
+            "beach park — on the San Mateo County coast, not San Diego. - "
+            "**[6]** Bahia Resort dining — hotel marketing, not an event "
+            "or an opening."
+        )
+        result = _strip_trailing_rationale(leaked)
+        assert result == (
+            "The Union-Tribune's weekly roundup of upcoming street fairs, "
+            "festivals, concerts, art shows, and community meetings across "
+            "San Diego is the digest to check when scanning for PB-area "
+            "happenings. No specific events are listed in this item — it's "
+            "the recurring weekly guide, refreshed as dates firm up."
+        )
+        assert "didn't qualify" not in result
+        assert "[1]" not in result
+
+    def test_strips_bare_bulleted_bracket_list_no_marker_phrase(self):
+        # The bulleted bracketed-index shape alone, with no marker word or
+        # phrase nearby, must still be cut -- it's the shape that's the tell.
+        text = (
+            "Good summary here.\n"
+            "- **[1], [2], [5]** Mission Bay restoration, policy and news."
+        )
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_bare_bulleted_bracket_list_plain_dash(self):
+        text = "Good summary here. - [3] Lifeguard internship injury, not a happening."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_bold_the_other_n_didnt_qualify(self):
+        text = "Good summary here. **The other 17 didn't qualify**, for reasons."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_each_new_marker_phrase(self):
+        cases = [
+            "Good summary here. The other 12 didn't qualify.",
+            "Good summary here. The other 3 did not qualify for inclusion.",
+            "Good summary here. Didn't qualify for inclusion.",
+            "Good summary here. Did not qualify due to missing dates.",
+            "Good summary here. Worth saying why: reasons follow.",
+        ]
+        for text in cases:
+            assert _strip_trailing_rationale(text) == "Good summary here.", text
+
+    def test_bracketed_citation_midsentence_is_not_truncated(self):
+        # A stray "[1]" mid-sentence, with no bullet-list shape, is legitimate
+        # prose (e.g. a footnote-style citation) and must survive untouched.
+        text = "See reference [1] for details on the matter at hand."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_legitimate_summary_with_dash_but_no_brackets_untouched(self):
+        text = "Good summary here - no bracketed rationale in sight."
+        assert _strip_trailing_rationale(text) == text
+
 
 class TestParseNumberedList:
     def test_handles_paren_format(self):
@@ -538,6 +605,13 @@ class TestRankAndSummarizeNews:
         result = intel.rank_and_summarize_news(news, ["t"])
         assert result[0]["brief_summary"] == "Real summary."
 
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        news = [{"title": "n1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] Real summary."
+        intel.rank_and_summarize_news(news, ["t"])
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
+
 
 # ---------- rank_and_summarize_blogs ----------
 
@@ -578,6 +652,13 @@ class TestRankAndSummarizeBlogs:
         )
         result = intel.rank_and_summarize_blogs(blogs, ["t"])
         assert result[0]["brief_summary"] == "Real summary."
+
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        blogs = [{"title": "b1", "source": "s", "summary": "s"}]
+        mock_client.invoke.return_value = "[1] SCORE:4/5 Real summary."
+        intel.rank_and_summarize_blogs(blogs, ["t"])
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
 
 
 # ---------- rank_and_summarize_happenings ----------
@@ -628,6 +709,37 @@ class TestRankAndSummarizeHappenings:
         assert len(result) == 1
         assert result[0]["brief_summary"] == "Real summary."
         assert "Dropped:" not in result[0]["brief_summary"]
+
+    def test_strips_bulleted_rationale_end_to_end(self, intel, mock_client):
+        # Reproduces the leak that shipped: the model returns a clean pick
+        # plus a trailing bulleted-bracketed-index rationale explaining what
+        # it rejected, phrased without any of the old "Dropped:"-style markers.
+        happenings = [
+            {"title": "h1", "source": "s", "description": "d"},
+            {"title": "h2", "source": "s2", "description": "d2"},
+            {"title": "h3", "source": "s3", "description": "d3"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] The weekly roundup is the digest to check, refreshed as "
+            "dates firm up. **The other 2 didn't qualify**, and it's worth "
+            "saying why: - **[2]** Lifeguard story — news, not a happening. "
+            "- **[3]** Restaurant promo — marketing, not an event."
+        )
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert len(result) == 1
+        assert result[0]["brief_summary"] == (
+            "The weekly roundup is the digest to check, refreshed as dates "
+            "firm up."
+        )
+        assert "didn't qualify" not in result[0]["brief_summary"]
+        assert "[2]" not in result[0]["brief_summary"]
+
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
 
     def test_fallback_when_llm_returns_none(self, intel, mock_client):
         happenings = [{"title": "h1", "source": "s", "description": "desc"}]

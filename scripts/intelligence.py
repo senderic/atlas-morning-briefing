@@ -68,8 +68,43 @@ _RATIONALE_MARKERS = (
     "Rejected",
     "Skipped",
 )
+
+# Rationale leaks the model has phrased WITHOUT the "Marker: ..." shape above
+# (e.g. "**The other 17 didn't qualify**, and it's worth saying why...").
+# Chasing every new phrasing is a losing game, but these are the wordings
+# seen in the wild so far. Same sentence/line-boundary discipline applies.
+_RATIONALE_PHRASES = (
+    r"didn[’']t qualify",
+    r"did not qualify",
+    r"the other \d+",
+    r"worth saying why",
+)
+
+# Markdown emphasis the model sometimes wraps a leak in (e.g. "**The other
+# 17 didn't qualify**"). Optional everywhere a leak can start.
+_BOLD = r"\*{0,2}"
+
+# Shape-based catch: a rendered summary never legitimately contains a
+# bulleted list of bracketed candidate numbers (e.g. "- **[1], [2], [5]**
+# Mission Bay ..."). That shape only occurs when the model is explaining
+# which candidates it rejected, so it's cut regardless of the wording next
+# to it -- this is what keeps a *third* new phrasing from getting through.
+_BULLET_INDEX_RE_PART = (
+    r"(?:[-•]\s+|\*(?!\*)\s+)"
+    + _BOLD + r"\[\d+\]"
+    + r"(?:\s*,\s*" + _BOLD + r"\[\d+\]" + _BOLD + r")*"
+    + _BOLD
+)
+
+_BOUNDARY = r"(?:^|(?<=[.!?])\s+|\n)"
+
 _TRAILING_RATIONALE_RE = re.compile(
-    r"(?:^|(?<=[.!?])\s+|\n)(?:" + "|".join(re.escape(m) for m in _RATIONALE_MARKERS) + r"):\s",
+    _BOUNDARY
+    + r"(?:"
+    + _BOLD + r"(?:" + "|".join(re.escape(m) for m in _RATIONALE_MARKERS) + r"):\s"
+    + r"|" + _BOLD + r"(?:" + "|".join(_RATIONALE_PHRASES) + r")"
+    + r"|" + _BULLET_INDEX_RE_PART
+    + r")",
     re.IGNORECASE,
 )
 
@@ -79,12 +114,17 @@ def _strip_trailing_rationale(text: str) -> str:
     Strip a trailing meta-commentary clause leaking the model's filtering
     rationale off the end of a reader-facing summary.
 
-    Models occasionally append text like "Dropped: [1], [2] (duplicates)"
-    to the last item in a ranked response, explaining which candidates they
-    excluded. That rationale is never meant for the reader. This only trims
-    a marker that begins a new sentence or line (case-insensitive), so
-    legitimate mid-sentence usage (e.g. "Charges were dropped: the DA
-    declined to file") and unrelated uses of the same words are left intact.
+    Models occasionally append text like "Dropped: [1], [2] (duplicates)",
+    or the same idea in different words (e.g. "**The other 17 didn't
+    qualify**, and it's worth saying why..." followed by a bulleted list of
+    bracketed candidate numbers), to the last item in a ranked response,
+    explaining which candidates they excluded. That rationale is never
+    meant for the reader. This trims both a known marker word/phrase and
+    the bulleted-bracketed-index shape itself, but only when it begins a
+    new sentence or line (case-insensitive), so legitimate mid-sentence
+    usage (e.g. "Charges were dropped: the DA declined to file") and
+    unrelated uses of the same words, or a stray "[1]" mid-sentence, are
+    left intact.
 
     Args:
         text: Candidate summary text, possibly with a leaked rationale tail.
@@ -964,6 +1004,8 @@ class BriefingIntelligence:
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
             "[original_number] 2-3 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which articles you left out.\n\n"
             "In each summary, lead with what actually happened and the concrete "
             "stakes, then deliver the 'so what' -- the implication or what it "
             "signals. Active voice, specific names and numbers, no hype, no "
@@ -1080,6 +1122,8 @@ class BriefingIntelligence:
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each pick, respond in this exact format:\n"
             "[original_number] 1-2 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which items you left out.\n\n"
             "In each summary, LEAD WITH the concrete details: what it is, when "
             "(date/time if mentioned), and where (venue/neighborhood if "
             "mentioned), then the 'so what' -- why it's worth the resident's "
@@ -1156,6 +1200,8 @@ class BriefingIntelligence:
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
             "[original_number] SCORE:X/5 1-2 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which posts you left out.\n\n"
             "In the summary, name the specific thing the post is about and state "
             "what it concretely claims, builds, or shows -- the actual takeaway a "
             "reader would quote. Lead with the subject (the product, method, or "
