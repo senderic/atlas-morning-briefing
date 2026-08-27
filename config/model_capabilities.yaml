@@ -1,0 +1,138 @@
+# Model Capability Registry
+# Defines reasoning control capabilities for each model.
+# Used by OpencodeClient and OpenRouterClient to apply reasoning control
+# without hardcoding model-specific logic.
+
+model_capabilities:
+  # ===== opencode models =====
+  opencode/nemotron-3-ultra-free:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode/nemotron-3.5-lightning-free:
+    supports_reasoning_control: false
+    reasoning_control_method: "model_swap"
+    known_cot_leakage: true
+    non_reasoning_variant: "opencode/mimo-v2.5-free"
+
+  opencode/mimo-v2.5-free:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode/deepseek-v4-flash-free:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode/deepseek-v4-flash:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode/glm-5.2:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode/glm-5.3:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # ===== openrouter models =====
+  openrouter/nvidia/nemotron-3-ultra-550b-a55b:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/nvidia/nemotron-3.5-lightning:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/minimax/minimax-m3:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/minimax/minimax-m2.7:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/z-ai/glm-5.2:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/google/gemma-4-31b-it:free:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/openrouter/free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/deepseek/deepseek-v4-pro:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/deepseek/deepseek-chat:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning_effort"
+    api_param_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+# Default capabilities for unknown models
+default_capabilities:
+  supports_reasoning_control: false
+  reasoning_control_method: "none"
+  known_cot_leakage: false
+  non_reasoning_variant: null

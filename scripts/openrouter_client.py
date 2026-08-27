@@ -6,6 +6,10 @@ OpenRouter LLM client.
 Calls the OpenRouter chat completions API (OpenAI-compatible) for tiered model
 access. Used as a fallback backend when other clients (opencode CLI, Gemini CLI)
 are unavailable. Requires an OPENROUTER_API_KEY in the environment.
+
+Reasoning control is handled via the capability registry (config/model_capabilities.yaml)
+which defines per-model how to disable reasoning (API params, model swap, etc.).
+CoT leakage is detected at runtime and triggers fallback automatically.
 """
 
 import json
@@ -28,11 +32,6 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Non-reasoning model to swap in when reasoning_enabled=False.
-_NON_REASONING_SWAPS = {
-    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free": "openrouter/nvidia/nemotron-3.5-lightning:free",
-}
 
 # Default model IDs per tier. These are common OpenRouter model slugs.
 DEFAULT_MODELS = {
@@ -162,17 +161,6 @@ class OpenRouterClient(BaseLLMClient):
             m for m in self.fallback_models.get(tier, []) if m != primary
         ]
 
-        # When reasoning is disabled, swap reasoning models for their
-        # non-reasoning equivalents so chain-of-thought cannot leak into
-        # the visible answer.
-        if not reasoning_enabled:
-            chain = [_NON_REASONING_SWAPS.get(m, m) for m in chain]
-            if any(m != orig for m, orig in zip(chain, [primary] + self.fallback_models.get(tier, []))):
-                logger.info(
-                    "OpenRouter reasoning disabled — swapped tier=%s models: "
-                    "%s -> %s", tier, primary, chain[0],
-                )
-
         # Enforce the per-run budget across the whole chain.
         budget_remaining = self.max_calls - self._call_count
         chain = chain[:budget_remaining]
@@ -192,6 +180,7 @@ class OpenRouterClient(BaseLLMClient):
                         prompt=prompt,
                         tier=tier,
                         system_prompt=system_prompt,
+                        reasoning_enabled=reasoning_enabled,
                     )
                 except Exception as e:
                     logger.error("OpenRouter call exception (model=%s): %s", model, e)
@@ -203,7 +192,7 @@ class OpenRouterClient(BaseLLMClient):
                         "OpenRouter out-of-usage for %s (tier=%s); skipping to next",
                         model, tier,
                     )
-                    break  # move to next model/providester
+                    break  # move to next model/provider
                 # Transient error: retry a bounded number of times with backoff.
                 attempts += 1
                 if attempts >= MAX_RETRIES_PER_MODEL:
@@ -235,6 +224,7 @@ class OpenRouterClient(BaseLLMClient):
         prompt: str,
         tier: str,
         system_prompt: Optional[str],
+        reasoning_enabled: bool = True,
     ):
         """Make one OpenRouter call. Returns (content_or_None, action).
 
@@ -257,6 +247,14 @@ class OpenRouterClient(BaseLLMClient):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
+
+        # Apply reasoning control via capability registry
+        payload = self.apply_reasoning_control(model, payload, reasoning_enabled)
+        # If apply_reasoning_control returns a string, it's a model swap
+        if isinstance(payload, str):
+            model = payload
+            payload["model"] = model
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -264,8 +262,8 @@ class OpenRouterClient(BaseLLMClient):
 
         start = time.time()
         logger.info(
-            "Invoking OpenRouter (tier=%s, model=%s, call=%d/%d)",
-            tier, model, self._call_count, self.max_calls,
+            "Invoking OpenRouter (tier=%s, model=%s, call=%d/%d, reasoning_enabled=%s)",
+            tier, model, self._call_count, self.max_calls, reasoning_enabled,
         )
         try:
             resp = requests.post(
@@ -302,6 +300,15 @@ class OpenRouterClient(BaseLLMClient):
             logger.warning("OpenRouter empty content (model=%s)", model)
             self._tier_failures[tier] += 1
             return None, "retry"
+
+        # Check for CoT leakage when reasoning was disabled
+        if not reasoning_enabled and self.detect_cot_leakage(content):
+            logger.warning(
+                "OpenRouter CoT leakage detected for %s (tier=%s) with reasoning disabled; "
+                "treating as failure and falling back",
+                model, tier,
+            )
+            return None, "fallback"
 
         # Track usage tokens for the cost summary.
         usage = data.get("usage", {}) or {}

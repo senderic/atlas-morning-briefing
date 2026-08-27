@@ -44,7 +44,7 @@ from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
-from scripts.llm_client import BaseLLMClient
+from scripts.llm_client import BaseLLMClient, ReasoningControlMixin
 
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
@@ -612,14 +612,9 @@ class BriefingRunner:
             # "Check verbatim entities/facts:" bullet lists).  If the cleaned
             # intro contains those telltales — drop it and fall back to the
             # unavailable placeholder.
-            _intro_lower = intro.lower()
-            _cot_markers = (
-                "strict grounding",
-                "check verbatim",
-                "is verbatim",
-                "entities/facts",
-            )
-            _looks_like_cot = any(m in _intro_lower for m in _cot_markers)
+            # Use shared CoT detection from ReasoningControlMixin for consistency
+            _cot_detector = ReasoningControlMixin()
+            _looks_like_cot = _cot_detector.detect_cot_leakage(intro)
             if _looks_like_cot:
                 logger.warning(
                     "Editorial intro looks like leaked CoT scaffolding; "

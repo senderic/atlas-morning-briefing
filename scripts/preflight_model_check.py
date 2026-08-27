@@ -6,6 +6,9 @@
 Runs concurrently (thread pool) against all free models to determine
 which are responsive before the 6:00 AM briefing run. Writes results to
 .model-availability.json for the briefing runner to consume.
+
+Also tests reasoning control (reasoning_enabled=False) for each model
+and detects CoT leakage, which is treated as a failure triggering fallback.
 """
 
 import json
@@ -27,6 +30,8 @@ load_dotenv(override=True)
 
 # Ensure scripts directory is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts.llm_client import get_model_capabilities, ReasoningControlMixin
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -68,11 +73,35 @@ FREE_MODELS = {
     },
 }
 
+# CoT leakage markers (from ReasoningControlMixin)
+COT_LEAKAGE_MARKERS = (
+    "strict grounding",
+    "check verbatim",
+    "is verbatim",
+    "entities/facts",
+    "grounding verification",
+    "verification scaffolding",
+    "chain of thought",
+    "reasoning trace",
+    "thinking process",
+    "internal monologue",
+)
 
-def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, Any]:
-    """Test a single opencode model."""
+
+def detect_cot_leakage(text: str) -> bool:
+    """Detect if response contains leaked chain-of-thought reasoning."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(marker in text_lower for marker in COT_LEAKAGE_MARKERS)
+
+
+def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT, reasoning_enabled: bool = True) -> Dict[str, Any]:
+    """Test a single opencode model with optional reasoning control."""
     start = time.monotonic()
-    cmd = [
+    
+    # Build base command
+    base_cmd = [
         "opencode", "run",
         "-m", model,
         "--format", "json",
@@ -81,6 +110,34 @@ def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, An
         "--pure",
         TEST_PROMPT,
     ]
+    
+    # Apply reasoning control via capability registry
+    caps = get_model_capabilities(model)
+    cmd = base_cmd
+    if not reasoning_enabled:
+        # Apply reasoning control
+        if caps.get("supports_reasoning_control", False):
+            method = caps.get("reasoning_control_method", "none")
+            if method == "cli_flag":
+                flag_name = caps.get("cli_flag_name", "variant")
+                flag_value = caps.get("cli_flag_value", "minimal")
+                if flag_name not in cmd:
+                    cmd = cmd + [f"--{flag_name}", flag_value]
+            elif method == "model_swap":
+                swap_model = caps.get("non_reasoning_variant")
+                if swap_model:
+                    logger.info(f"Preflight: reasoning disabled for {model}, swapping to {swap_model}")
+                    model = swap_model
+                    cmd = [
+                        "opencode", "run",
+                        "-m", model,
+                        "--format", "json",
+                        "--auto",
+                        "--dir", "/tmp",
+                        "--pure",
+                        TEST_PROMPT,
+                    ]
+    
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         elapsed = (time.monotonic() - start) * 1000
@@ -94,36 +151,65 @@ def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, An
                         text += event.get("part", {}).get("text", "")
                 except json.JSONDecodeError:
                     continue
+            
+            # Check for CoT leakage when reasoning was disabled
+            cot_leaked = False
+            if not reasoning_enabled and detect_cot_leakage(text):
+                logger.warning(f"Preflight: CoT leakage detected for {model} with reasoning disabled")
+                cot_leaked = True
+            
             if "OK" in text.upper() or text.strip():
-                return {"available": True, "latency_ms": round(elapsed), "fallback_used": False, "error": None}
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": result.stderr[:200] if result.stderr else "Empty response"}
+                if cot_leaked:
+                    return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": "CoT leakage detected", "cot_leaked": True}
+                return {"available": True, "latency_ms": round(elapsed), "fallback_used": False, "error": None, "cot_leaked": False}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": result.stderr[:200] if result.stderr else "Empty response", "cot_leaked": False}
     except subprocess.TimeoutExpired:
         elapsed = (time.monotonic() - start) * 1000
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"Timeout after {timeout}s"}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"Timeout after {timeout}s", "cot_leaked": False}
     except Exception as e:
         elapsed = (time.monotonic() - start) * 1000
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": str(e)[:200]}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": str(e)[:200], "cot_leaked": False}
 
 
-def test_openrouter_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, Any]:
-    """Test a single OpenRouter model via API."""
+def test_openrouter_model(model: str, timeout: int = TEST_TIMEOUT, reasoning_enabled: bool = True) -> Dict[str, Any]:
+    """Test a single OpenRouter model via API with optional reasoning control."""
     import requests
     start = time.monotonic()
     api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        return {"available": False, "latency_ms": 0, "fallback_used": False, "error": "No API key"}
+        return {"available": False, "latency_ms": 0, "fallback_used": False, "error": "No API key", "cot_leaked": False}
     
     # Strip 'openrouter/' prefix if present for API call
     api_model = model.replace("openrouter/", "")
     if api_model == "openrouter/free":
         api_model = "openrouter/auto"  # OpenRouter's free auto-router
     
+    # Build payload with reasoning control
+    caps = get_model_capabilities(model)
     payload = {
         "model": api_model,
         "messages": [{"role": "user", "content": TEST_PROMPT}],
         "max_tokens": 10,
         "temperature": 0,
     }
+    
+    # Apply reasoning control via capability registry
+    if not reasoning_enabled and caps.get("supports_reasoning_control", False):
+        method = caps.get("reasoning_control_method", "none")
+        if method == "api_param":
+            param_name = caps.get("api_param_name", "reasoning_effort")
+            param_value = caps.get("api_param_value", "minimal")
+            payload[param_name] = param_value
+        elif method == "model_swap":
+            swap_model = caps.get("non_reasoning_variant")
+            if swap_model:
+                logger.info(f"Preflight: reasoning disabled for {model}, swapping to {swap_model}")
+                swap_api_model = swap_model.replace("openrouter/", "")
+                if swap_api_model == "openrouter/free":
+                    swap_api_model = "openrouter/auto"
+                payload["model"] = swap_api_model
+                model = swap_model
+    
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -139,45 +225,78 @@ def test_openrouter_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, 
         if resp.status_code == 200:
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            # Check for CoT leakage when reasoning was disabled
+            cot_leaked = False
+            if not reasoning_enabled and detect_cot_leakage(content):
+                logger.warning(f"Preflight: CoT leakage detected for {model} with reasoning disabled")
+                cot_leaked = True
+            
             if "OK" in content.upper() or content.strip():
-                return {"available": True, "latency_ms": round(elapsed), "fallback_used": False, "error": None}
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+                if cot_leaked:
+                    return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": "CoT leakage detected", "cot_leaked": True}
+                return {"available": True, "latency_ms": round(elapsed), "fallback_used": False, "error": None, "cot_leaked": False}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}", "cot_leaked": False}
     except requests.Timeout:
         elapsed = (time.monotonic() - start) * 1000
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"Timeout after {timeout}s"}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": f"Timeout after {timeout}s", "cot_leaked": False}
     except Exception as e:
         elapsed = (time.monotonic() - start) * 1000
-        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": str(e)[:200]}
+        return {"available": False, "latency_ms": round(elapsed), "fallback_used": False, "error": str(e)[:200], "cot_leaked": False}
 
 
 def test_model_chain(provider: str, tier: str, models: Dict) -> Dict[str, Any]:
-    """Test primary model, then fallbacks if needed."""
+    """Test primary model, then fallbacks if needed.
+    
+    Tests both with reasoning_enabled=True and reasoning_enabled=False.
+    """
     primary = models["primary"]
     fallbacks = models["fallbacks"]
     
     test_func = test_opencode_model if provider == "opencode" else test_openrouter_model
     
-    # Test primary
-    result = test_func(primary)
+    # Test primary with reasoning enabled
+    result = test_func(primary, reasoning_enabled=True)
     result["model"] = primary
     result["tier"] = tier
     result["provider"] = provider
+    result["reasoning_enabled"] = True
     
-    if result["available"]:
+    # Test primary with reasoning disabled
+    result_reasoning_off = test_func(primary, reasoning_enabled=False)
+    result_reasoning_off["model"] = primary
+    result_reasoning_off["tier"] = tier
+    result_reasoning_off["provider"] = provider
+    result_reasoning_off["reasoning_enabled"] = False
+    
+    # Determine overall availability: both reasoning modes must work
+    reasoning_control_works = result_reasoning_off.get("available", False) and not result_reasoning_off.get("cot_leaked", False)
+    
+    if result["available"] and reasoning_control_works:
+        result["reasoning_control_works"] = True
+        result["reasoning_disabled_latency_ms"] = result_reasoning_off.get("latency_ms")
         return result
     
     # Try fallbacks
     for fb in fallbacks:
-        fb_result = test_func(fb)
-        fb_result["model"] = fb
-        fb_result["tier"] = tier
-        fb_result["provider"] = provider
-        fb_result["fallback_used"] = True
-        if fb_result["available"]:
+        fb_result = test_func(fb, reasoning_enabled=True)
+        fb_result_reasoning_off = test_func(fb, reasoning_enabled=False)
+        
+        fb_reasoning_control_works = fb_result_reasoning_off.get("available", False) and not fb_result_reasoning_off.get("cot_leaked", False)
+        
+        if fb_result.get("available", False) and fb_reasoning_control_works:
+            fb_result["model"] = fb
+            fb_result["tier"] = tier
+            fb_result["provider"] = provider
+            fb_result["fallback_used"] = True
+            fb_result["reasoning_control_works"] = True
+            fb_result["reasoning_disabled_latency_ms"] = fb_result_reasoning_off.get("latency_ms")
             logger.info(f"Preflight: {provider}/{tier} primary failed, fallback {fb} succeeded")
             return fb_result
     
     logger.warning(f"Preflight: {provider}/{tier} ALL models failed: primary={primary}, fallbacks={fallbacks}")
+    result["reasoning_control_works"] = False
+    result["reasoning_disabled_latency_ms"] = result_reasoning_off.get("latency_ms")
     return result
 
 
@@ -233,9 +352,10 @@ def main():
             try:
                 result = future.result()
                 results[provider][tier] = result
-                status = "✓" if result["available"] else "✗"
+                status = "✓" if result.get("available") else "✗"
                 fb = " (fallback)" if result.get("fallback_used") else ""
-                logger.info(f"  {status} {provider}/{tier}: {result['model']}{fb} ({result['latency_ms']}ms)")
+                rc = " reasoning_control_ok" if result.get("reasoning_control_works") else " reasoning_control_fail"
+                logger.info(f"  {status} {provider}/{tier}: {result['model']}{fb}{rc} ({result['latency_ms']}ms)")
             except Exception as e:
                 logger.error(f"  ✗ {provider}/{tier}: Exception: {e}")
                 results[provider][tier] = {
@@ -246,6 +366,7 @@ def main():
                     "model": "unknown",
                     "tier": tier,
                     "provider": provider,
+                    "reasoning_control_works": False,
                 }
     
     # Write results
@@ -258,7 +379,9 @@ def main():
     # Summary
     for provider in enabled_providers:
         available_tiers = [t for t, r in results[provider].items() if r.get("available")]
+        reasoning_control_tiers = [t for t, r in results[provider].items() if r.get("reasoning_control_works")]
         logger.info(f"{provider}: {len(available_tiers)}/3 tiers available: {available_tiers}")
+        logger.info(f"{provider}: {len(reasoning_control_tiers)}/3 tiers reasoning_control_ok: {reasoning_control_tiers}")
     
     return 0
 

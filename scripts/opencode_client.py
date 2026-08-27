@@ -6,6 +6,10 @@ Opencode CLI client.
 Calls `opencode run --format json` as a subprocess and parses the NDJSON
 event stream to extract response text. Uses free-tier OpenCode models
 (opencode/nemotron-3-ultra-free, opencode/deepseek-v4-flash-free) by default.
+
+Reasoning control is handled via the capability registry (config/model_capabilities.yaml)
+which defines per-model how to disable reasoning (CLI flags, model swap, etc.).
+CoT leakage is detected at runtime and triggers fallback automatically.
 """
 
 import json
@@ -27,11 +31,6 @@ DEFAULT_MODELS = {
     "heavy": "opencode/nemotron-3-ultra-free",
     "medium": "opencode/deepseek-v4-flash-free",
     "light": "opencode/deepseek-v4-flash-free",
-}
-
-# Non-reasoning model to swap in when reasoning_enabled=False.
-_NON_REASONING_SWAPS = {
-    "opencode/nemotron-3-ultra-free": "opencode/nemotron-3.5-lightning-free",
 }
 
 # Backup models tried in order if the primary model for a tier fails
@@ -168,12 +167,15 @@ class OpencodeClient(BaseLLMClient):
         server overload) get up to `self.max_retries` retries with
         exponential backoff before advancing to the next model.
 
+        If reasoning_enabled=False and the model leaks CoT, it's treated as
+        a failure and the fallback chain is triggered automatically.
+
         Args:
             prompt: The user prompt.
             tier: Model tier ("light", "medium", "heavy") — maps to model ID.
             system_prompt: Optional system-level instructions (prepended).
-            reasoning_enabled: When False, swaps reasoning models for their
-                non-reasoning equivalents so chain-of-thought cannot leak.
+            reasoning_enabled: When False, applies reasoning control via
+                capability registry (CLI flags, model swap, etc.).
 
         Returns:
             Response text, or None on failure.
@@ -193,14 +195,6 @@ class OpencodeClient(BaseLLMClient):
         chain = [primary] + [
             m for m in self.fallback_models.get(tier, []) if m != primary
         ]
-
-        if not reasoning_enabled:
-            chain = [_NON_REASONING_SWAPS.get(m, m) for m in chain]
-            if chain[0] != primary:
-                logger.info(
-                    "Opencode reasoning disabled — swapped tier=%s: %s -> %s",
-                    tier, primary, chain[0],
-                )
 
         if system_prompt:
             full_prompt = f"{system_prompt}\n\nUser Request: {prompt}"
@@ -225,7 +219,8 @@ class OpencodeClient(BaseLLMClient):
                 )
                 return None
 
-            cmd = [
+            # Build base command
+            base_cmd = [
                 "opencode", "run",
                 "-m", model,
                 "--format", "json",
@@ -234,6 +229,21 @@ class OpencodeClient(BaseLLMClient):
                 "--pure",
                 full_prompt,
             ]
+
+            # Apply reasoning control via capability registry
+            cmd = self.apply_reasoning_control(model, base_cmd, reasoning_enabled)
+            # If apply_reasoning_control returns a string, it's a model swap
+            if isinstance(cmd, str):
+                model = cmd
+                cmd = [
+                    "opencode", "run",
+                    "-m", model,
+                    "--format", "json",
+                    "--auto",
+                    "--dir", "/tmp",
+                    "--pure",
+                    full_prompt,
+                ]
 
             # Track whether we should try the next model in the chain.
             model_failed = True
@@ -322,6 +332,16 @@ class OpencodeClient(BaseLLMClient):
                             break
 
                     if text:
+                        # Check for CoT leakage when reasoning was disabled
+                        if not reasoning_enabled and self.detect_cot_leakage(text):
+                            logger.warning(
+                                "Opencode CoT leakage detected for %s (tier=%s) with reasoning disabled; "
+                                "treating as failure and falling back",
+                                model, tier,
+                            )
+                            model_failed = True
+                            break  # trigger fallback
+
                         # Success
                         self._call_count += 1
                         self._tier_calls[tier] += 1
