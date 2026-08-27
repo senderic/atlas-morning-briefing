@@ -282,7 +282,7 @@ pdf:
 # When `cli_binary` is omitted the client auto-detects, preferring `agy` if
 # present. Set explicitly to "agy" or "gemini" to pin a specific backend.
 gemini:
-  enabled: true
+  enabled: false
   # cli_binary: "agy"   # uncomment to force Antigravity even if both exist
   ignore_hard_quota: true
   track_hard_quotas: true
@@ -303,8 +303,13 @@ gemini:
 # When enabled, the pipeline uses `opencode run` with free-tier models
 # (e.g. opencode/deepseek-v4-flash-free) instead of the Gemini CLI.
 # Requires `opencode` binary on PATH. Use `--dry-run` to test.
+# Disabled 2026-08-27: opencode free models (mimo-v2.5-free,
+# nemotron-3.5-lightning-free) pass the tiny preflight "OK" test but time out
+# on real briefing prompts, stalling the composite chain 300s+ per call before
+# falling back to OpenRouter. OpenRouter's 1M-context nemotron-3-ultra free
+# model handles the full pipeline, so it is now the primary backend.
 opencode:
-  enabled: true
+  enabled: false
   models:
     heavy: "opencode/nemotron-3-ultra-free"
     medium: "opencode/deepseek-v4-flash-free"
@@ -336,11 +341,11 @@ openrouter:
   models:
     heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
     medium: "openrouter/minimax/minimax-m3:free"
-    light: "openrouter/google/gemma-4-31b-it:free"
+    light: "openrouter/minimax/minimax-m3:free"
   fallback_models:
     heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
-    light: ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"]
+    light: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
   max_calls_per_run: 100
   timeout: 120
   max_tokens: 4096

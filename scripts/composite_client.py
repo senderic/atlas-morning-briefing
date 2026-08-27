@@ -23,8 +23,9 @@ class CompositeClient(BaseLLMClient):
 
     Each back-end call is bounded by a per-client timeout so a single hanging
     back-end (e.g. Gemini stuck retrying quota-exhausted keys) cannot block the
-    rest of the chain. If a client exceeds the timeout it is skipped for this
-    call and marked slow so later calls in the run avoid it too.
+    rest of the chain. If a client exceeds the timeout it is skipped for THIS
+    call and the next client is tried. Clients are NOT permanently marked slow;
+    they are retried on subsequent calls.
     """
 
     def __init__(self, clients: List[BaseLLMClient], timeout: Optional[float] = None):
@@ -35,8 +36,6 @@ class CompositeClient(BaseLLMClient):
         # that a quota-exhausted / hanging client can't stall the run).
         self._timeout = timeout if timeout is not None else 240.0
         self._served_by: List[str] = []  # which client last handled each call
-        # Clients that timed out previously; skipped for the rest of the run.
-        self._slow_clients: set = set()
 
     @property
     def available(self) -> bool:
@@ -94,23 +93,15 @@ class CompositeClient(BaseLLMClient):
                     continue
             except Exception:
                 continue
-            if name in self._slow_clients:
-                logger.debug(
-                    "Composite: skipping slow client %s (timed out earlier) (tier=%s)",
-                    name, tier,
-                )
-                continue
             any_available = True
             result, timed_out = self._invoke_with_timeout(
                 client, prompt, tier, system_prompt, kwargs
             )
             if timed_out:
                 logger.warning(
-                    "Composite: client %s timed out after %.0fs for tier=%s; "
-                    "marking slow and trying next",
+                    "Composite: client %s timed out after %.0fs for tier=%s; trying next",
                     name, self._timeout, tier,
                 )
-                self._slow_clients.add(name)
                 continue
             if result:
                 self._served_by.append(name)

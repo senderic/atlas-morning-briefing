@@ -201,7 +201,7 @@ log_level: "DEBUG"
 
 # --- LLM CLI configuration (same as main pipeline) ---
 gemini:
-  enabled: true
+  enabled: false
   ignore_hard_quota: true
   track_hard_quotas: true
   internal_max_attempts: 1
@@ -215,7 +215,7 @@ gemini:
     light: "flash-lite"
 
 opencode:
-  enabled: true
+  enabled: false
   models:
     heavy: "opencode/nemotron-3-ultra-free"
     medium: "opencode/deepseek-v4-flash-free"
@@ -236,11 +236,11 @@ openrouter:
   models:
     heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
     medium: "openrouter/minimax/minimax-m3:free"
-    light: "openrouter/google/gemma-4-31b-it:free"
+    light: "openrouter/minimax/minimax-m3:free"
   fallback_models:
     heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
-    light: ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"]
+    light: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
   max_calls_per_run: 100
   timeout: 120
   max_tokens: 4096

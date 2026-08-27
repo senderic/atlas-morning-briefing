@@ -130,7 +130,6 @@ class TestCompositeClient:
         c = CompositeClient([_HangingClient("hanging"), fast], timeout=0.2)
         result = c.invoke("hi")
         assert result == "from-fast"
-        assert "_HangingClient" in c._slow_clients
 
     def test_timeout_returns_from_second_client(self):
         class _SlowThenOk(_FakeClient):

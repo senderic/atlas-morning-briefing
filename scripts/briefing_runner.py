@@ -123,29 +123,38 @@ class BriefingRunner:
         
         gemini_config = config.get("gemini", config.get("bedrock", {}))
         openrouter_config = config.get("openrouter", {})
+
+        # Build the backend chain from every enabled provider, in priority
+        # order: opencode, then Gemini CLI, then OpenRouter. Any disabled
+        # backend is skipped, so disabling opencode makes OpenRouter (or
+        # Gemini) the primary rather than dropping back to a lone Gemini.
+        from scripts.composite_client import CompositeClient
+        from scripts.opencode_client import OpencodeClient
+        from scripts.openrouter_client import OpenRouterClient
+
+        chain: List[BaseLLMClient] = []
         if config.get("opencode", {}).get("enabled"):
-            from scripts.opencode_client import OpencodeClient
-            opencode_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}), preflight_models=opencode_preflight)
-            fallback_clients = []
-            if gemini_config.get("enabled"):
-                fallback_clients.append(GeminiCLIClient(gemini_config))
-            if openrouter_config.get("enabled"):
-                from scripts.openrouter_client import OpenRouterClient
-                fallback_clients.append(OpenRouterClient(openrouter_config, preflight_models=openrouter_preflight))
-            if fallback_clients:
-                from scripts.composite_client import CompositeClient
-                composite_timeout = config.get("llm", {}).get(
-                    "fallback_timeout_seconds",
-                    config.get("composite", {}).get("timeout_seconds", 240),
-                )
-                self.llm_client = CompositeClient(
-                    [opencode_client] + fallback_clients,
-                    timeout=composite_timeout,
-                )
-            else:
-                self.llm_client = opencode_client
-        else:
+            chain.append(OpencodeClient(
+                config.get("opencode", {}), preflight_models=opencode_preflight
+            ))
+        if gemini_config.get("enabled"):
+            chain.append(GeminiCLIClient(gemini_config))
+        if openrouter_config.get("enabled"):
+            chain.append(OpenRouterClient(
+                openrouter_config, preflight_models=openrouter_preflight
+            ))
+
+        if not chain:
+            # No LLM backend enabled at all — deterministic mode.
             self.llm_client = GeminiCLIClient(gemini_config)
+        elif len(chain) == 1:
+            self.llm_client = chain[0]
+        else:
+            composite_timeout = config.get("llm", {}).get(
+                "fallback_timeout_seconds",
+                config.get("composite", {}).get("timeout_seconds", 240),
+            )
+            self.llm_client = CompositeClient(chain, timeout=composite_timeout)
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
