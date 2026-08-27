@@ -6,7 +6,7 @@ reused from state for the rest of the week.
 """
 
 from datetime import datetime as _datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -116,3 +116,55 @@ class TestSaveStateCache:
         import json
         state = json.loads((tmp_path / ".local-state.json").read_text())
         assert "cached_happenings" not in state
+
+
+class TestMultiDayHappeningsRefresh:
+    """happenings_fetch_weekday accepts one weekday or a list of them."""
+
+    def _runner(self, value, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        config = {
+            "arxiv_topics": [],
+            "blog_feeds": [],
+            "stocks": [],
+            "news_queries": [],
+            "paper_scoring": {"has_code": 5, "topic_match": 3, "recency": 2, "citation_count": 1},
+            "max_papers": 5, "max_blogs": 5, "max_news": 5, "arxiv_days_back": 3,
+            "output_format": "kindle", "file_naming": "T-{yyyy}",
+            "pdf": {"enabled": False}, "bedrock": {"enabled": False}, "gemini": {"enabled": False},
+        }
+        if value is not None:
+            config["happenings_fetch_weekday"] = value
+        return BriefingRunner(config, dry_run=True)
+
+    def test_absent_key_means_every_run(self, tmp_path, monkeypatch):
+        assert self._runner(None, tmp_path, monkeypatch)._happenings_fetch_days() is None
+
+    def test_single_int_is_normalized_to_a_set(self, tmp_path, monkeypatch):
+        assert self._runner(3, tmp_path, monkeypatch)._happenings_fetch_days() == {3}
+
+    def test_list_of_weekdays(self, tmp_path, monkeypatch):
+        assert self._runner([0, 3], tmp_path, monkeypatch)._happenings_fetch_days() == {0, 3}
+
+    def test_string_digits_are_coerced(self, tmp_path, monkeypatch):
+        assert self._runner(["0", "3"], tmp_path, monkeypatch)._happenings_fetch_days() == {0, 3}
+
+    def test_empty_list_falls_back_to_every_run(self, tmp_path, monkeypatch):
+        assert self._runner([], tmp_path, monkeypatch)._happenings_fetch_days() is None
+
+    def test_fetches_on_any_listed_day(self, tmp_path, monkeypatch):
+        runner = self._runner([0, 3], tmp_path, monkeypatch)
+        fetched = [{"title": "Fresh event"}]
+        for weekday, expect_fetch in ((0, True), (3, True), (1, False), (5, False)):
+            fake_now = MagicMock()
+            fake_now.weekday.return_value = weekday
+            fake_now.strftime.return_value = "2026-08-27"
+            with patch("scripts.briefing_runner.datetime") as dt:
+                dt.now.return_value = fake_now
+                with patch.object(runner, "run_happenings_aggregation", return_value=fetched) as agg:
+                    result = runner._load_or_fetch_happenings(
+                        {"cached_happenings": [{"title": "Stale event"}],
+                         "cached_happenings_date": "2026-08-20"}
+                    )
+            assert agg.called is expect_fetch, f"weekday {weekday}"
+            assert result[0]["title"] == ("Fresh event" if expect_fetch else "Stale event")

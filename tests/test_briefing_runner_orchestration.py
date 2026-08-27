@@ -276,3 +276,157 @@ class TestEnrichPapers:
         result = runner._enrich_papers(papers, ["topic"])
         assert result[0]["brief_summary"] == "s"
         assert result[0]["semantic_score"] == 7
+
+
+class TestMarkdownLeakGuards:
+    LEAKY_TEXT = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+
+    def test_leaky_editorial_intro_renders_placeholder(self, runner_with_data):
+        md = runner_with_data.generate_markdown_briefing(
+            [], [], [], [], [],
+            synthesis={"editorial_intro": self.LEAKY_TEXT},
+        )
+        assert "Synthesis unavailable" in md
+        assert "Strict Grounding" not in md
+
+    def test_leaky_weekly_deep_dive_omitted(self, runner_with_data):
+        md = runner_with_data.generate_markdown_briefing(
+            [], [], [], [], [],
+            weekly_deep_dive=self.LEAKY_TEXT,
+        )
+        assert "This Week in AI" not in md
+        assert "Strict Grounding" not in md
+
+
+class TestStatusFilePerPipeline:
+    """Two pipelines on one machine must not overwrite each other's status."""
+
+    def _runner(self, base_config, tmp_path, monkeypatch, **overrides):
+        monkeypatch.chdir(tmp_path)
+        config = dict(base_config)
+        config.update(overrides)
+        return BriefingRunner(config, dry_run=True)
+
+    def test_defaults_to_status_json(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        runner.save_status()
+        assert (tmp_path / "status.json").exists()
+
+    def test_honors_configured_filename(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(
+            base_config, tmp_path, monkeypatch, status_file_path="status-local.json"
+        )
+        runner.save_status()
+        assert (tmp_path / "status-local.json").exists()
+        assert not (tmp_path / "status.json").exists()
+
+    def test_two_pipelines_do_not_clobber_each_other(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        atlas = self._runner(
+            base_config, tmp_path, monkeypatch,
+            status_file_path="status.json", pipeline_name="atlas",
+        )
+        atlas.status["papers_found"] = 12
+        atlas.save_status()
+
+        local = self._runner(
+            base_config, tmp_path, monkeypatch,
+            status_file_path="status-local.json", pipeline_name="local",
+        )
+        local.status["papers_found"] = 0
+        local.save_status()
+
+        with open(tmp_path / "status.json") as f:
+            saved_atlas = json.load(f)
+        assert saved_atlas["papers_found"] == 12
+        assert saved_atlas["pipeline"] == "atlas"
+
+    def test_pipeline_name_is_recorded(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        runner = self._runner(base_config, tmp_path, monkeypatch, pipeline_name="local")
+        runner.save_status()
+        with open(tmp_path / "status.json") as f:
+            assert json.load(f)["pipeline"] == "local"
+
+
+class TestDegradedSynthesisIsRecorded:
+    """A briefing without its lead section is not a clean run."""
+
+    def _runner(self, base_config, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        return BriefingRunner(base_config, dry_run=True)
+
+    def test_placeholder_summary_records_an_error(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        md = runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[],
+            news=[{"title": "A story", "url": "https://example.org/a"}],
+            top_papers=[], synthesis={},
+        )
+        assert "Synthesis unavailable" in md
+        assert any("Executive summary unavailable" in e for e in runner.errors)
+        assert runner.status["synthesis_degraded"] is True
+
+    def test_healthy_summary_records_nothing(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        md = runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[],
+            news=[{"title": "A story", "url": "https://example.org/a"}],
+            top_papers=[], synthesis={"editorial_intro": "**A real lead.**\n\nBody."},
+        )
+        assert "Synthesis unavailable" not in md
+        assert not any("Executive summary unavailable" in e for e in runner.errors)
+        assert runner.status["synthesis_degraded"] is False
+
+    def test_error_is_not_duplicated(self, base_config, tmp_path, monkeypatch):
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        for _ in range(3):
+            runner._record_degraded_synthesis()
+        assert sum("Executive summary unavailable" in e for e in runner.errors) == 1
+
+    def test_status_file_carries_the_flag(self, base_config, tmp_path, monkeypatch):
+        import json
+
+        runner = self._runner(base_config, tmp_path, monkeypatch)
+        runner._record_degraded_synthesis()
+        runner.save_status()
+        with open(tmp_path / "status.json") as f:
+            saved = json.load(f)
+        assert saved["synthesis_degraded"] is True
+        assert any("Executive summary unavailable" in e for e in saved["errors"])
+
+
+class TestDegradedPlaceholderIsDetectable:
+    """
+    The placeholder the runner emits must be one the quality check recognizes.
+
+    These live in different modules, so nothing but this test stops someone
+    rewording the placeholder and silently blinding the check that exists to
+    catch it -- which is exactly how the Aug 26 briefing shipped with no
+    executive summary and a clean status file.
+    """
+
+    def test_runner_placeholder_trips_the_degraded_content_check(self):
+        from scripts.briefing_runner import SYNTHESIS_UNAVAILABLE_TEXT
+        from scripts.report_invariants import check_degraded_content
+
+        config = {"section_headings": {"executive_summary": "Executive Summary"}}
+        markdown = f"# Briefing\n\n## Executive Summary\n\n{SYNTHESIS_UNAVAILABLE_TEXT}"
+        findings = check_degraded_content(markdown, config, pipeline="atlas")
+
+        assert len(findings) == 1, "placeholder must produce exactly one finding"
+        assert findings[0].severity == "CRITICAL"
+        assert findings[0].code == "degraded-content"
+
+    def test_a_real_summary_does_not_trip_it(self):
+        from scripts.report_invariants import check_degraded_content
+
+        config = {"section_headings": {"executive_summary": "Executive Summary"}}
+        markdown = (
+            "# Briefing\n\n## Executive Summary\n\n"
+            "**A real lead sentence carrying the day's thesis.**\n\n"
+            "Supporting analysis with specifics.\n\n"
+        )
+        assert check_degraded_content(markdown, config, pipeline="atlas") == []

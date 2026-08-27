@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
 from scripts.interest_graph import generate_graph_queries, parse_graph
+from scripts.leak_detection import is_cot_leak
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,6 +55,92 @@ def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
     return text
 
 
+# Meta-commentary markers a model sometimes appends to a ranked summary,
+# leaking its own filtering rationale (e.g. "Dropped: [1], [2] (duplicates)").
+# Only matched when they start a new sentence or line -- never mid-sentence --
+# so legitimate prose like "Charges were dropped: the DA declined to file"
+# survives untouched.
+_RATIONALE_MARKERS = (
+    "Dropped",
+    "Excluded",
+    "Omitted",
+    "Not selected",
+    "Rejected",
+    "Skipped",
+)
+
+# Rationale leaks the model has phrased WITHOUT the "Marker: ..." shape above
+# (e.g. "**The other 17 didn't qualify**, and it's worth saying why...").
+# Chasing every new phrasing is a losing game, but these are the wordings
+# seen in the wild so far. Same sentence/line-boundary discipline applies.
+_RATIONALE_PHRASES = (
+    r"didn[’']t qualify",
+    r"did not qualify",
+    r"the other \d+",
+    r"worth saying why",
+)
+
+# Markdown emphasis the model sometimes wraps a leak in (e.g. "**The other
+# 17 didn't qualify**"). Optional everywhere a leak can start.
+_BOLD = r"\*{0,2}"
+
+# Shape-based catch: a rendered summary never legitimately contains a
+# bulleted list of bracketed candidate numbers (e.g. "- **[1], [2], [5]**
+# Mission Bay ..."). That shape only occurs when the model is explaining
+# which candidates it rejected, so it's cut regardless of the wording next
+# to it -- this is what keeps a *third* new phrasing from getting through.
+_BULLET_INDEX_RE_PART = (
+    r"(?:[-•]\s+|\*(?!\*)\s+)"
+    + _BOLD + r"\[\d+\]"
+    + r"(?:\s*,\s*" + _BOLD + r"\[\d+\]" + _BOLD + r")*"
+    + _BOLD
+)
+
+_BOUNDARY = r"(?:^|(?<=[.!?])\s+|\n)"
+
+_TRAILING_RATIONALE_RE = re.compile(
+    _BOUNDARY
+    + r"(?:"
+    + _BOLD + r"(?:" + "|".join(re.escape(m) for m in _RATIONALE_MARKERS) + r"):\s"
+    + r"|" + _BOLD + r"(?:" + "|".join(_RATIONALE_PHRASES) + r")"
+    + r"|" + _BULLET_INDEX_RE_PART
+    + r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_trailing_rationale(text: str) -> str:
+    """
+    Strip a trailing meta-commentary clause leaking the model's filtering
+    rationale off the end of a reader-facing summary.
+
+    Models occasionally append text like "Dropped: [1], [2] (duplicates)",
+    or the same idea in different words (e.g. "**The other 17 didn't
+    qualify**, and it's worth saying why..." followed by a bulleted list of
+    bracketed candidate numbers), to the last item in a ranked response,
+    explaining which candidates they excluded. That rationale is never
+    meant for the reader. This trims both a known marker word/phrase and
+    the bulleted-bracketed-index shape itself, but only when it begins a
+    new sentence or line (case-insensitive), so legitimate mid-sentence
+    usage (e.g. "Charges were dropped: the DA declined to file") and
+    unrelated uses of the same words, or a stray "[1]" mid-sentence, are
+    left intact.
+
+    Args:
+        text: Candidate summary text, possibly with a leaked rationale tail.
+
+    Returns:
+        The text with any trailing rationale clause removed and trailing
+        whitespace trimmed. Returns the input unchanged if no leak is found.
+    """
+    if not text:
+        return text
+    match = _TRAILING_RATIONALE_RE.search(text)
+    if not match:
+        return text
+    return text[: match.start()].rstrip()
+
+
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
@@ -76,12 +163,88 @@ class BriefingIntelligence:
         self.briefing_landscape = profile.get(
             "landscape", "the AI and technology landscape"
         )
+        # Ordered ranking tiers ("what matters most first"). Empty by default so
+        # briefings without a configured order keep their previous behavior.
+        self.briefing_priorities = [
+            str(p).strip()
+            for p in (profile.get("priorities") or [])
+            if str(p).strip()
+        ]
+        # When true, prompts ask for summaries that lead with the reader's
+        # action/decision (dates, deadlines, locations, costs) instead of
+        # analysis-first prose.
+        self.briefing_actionable = bool(profile.get("actionable", False))
+        # Cap on items from one outlet per section. A local briefing legitimately
+        # leans on two or three dominant papers, so the cap is config-driven.
+        self.max_per_source = int(
+            (config.get("source_diversity") or {}).get("max_per_source", 2)
+        )
         self.source_blurb_cache: Dict[str, str] = {}
 
     @property
     def available(self) -> bool:
         """Check if intelligence features are available."""
         return self.client.available
+
+    def _priority_block(self) -> str:
+        """
+        Render ``briefing_profile.priorities`` as a prompt block.
+
+        Returns an empty string when no priority order is configured, so
+        prompts stay byte-identical for briefings that don't use the feature.
+        """
+        if not self.briefing_priorities:
+            return ""
+        tiers = "\n".join(
+            f"{i + 1}. {tier}" for i, tier in enumerate(self.briefing_priorities)
+        )
+        return (
+            "<priority_order>\n"
+            "Rank by this order, not by how dramatic a story sounds. Tier 1 "
+            "takes the top slots and fills most of the list whenever tier-1 "
+            "items exist; lower tiers appear only when they are genuinely "
+            "consequential. Follow any per-tier instruction below:\n"
+            f"{tiers}\n"
+            "</priority_order>\n\n"
+        )
+
+    def _rank_directive(self) -> str:
+        """Ranking sentence: defer to the configured priority order if set."""
+        if self.briefing_priorities:
+            return "Rank by the priority order above, then by importance."
+        return "Rank by importance."
+
+    def _actionability_note(self) -> str:
+        """Render the action-first summary directive when it is enabled."""
+        if not self.briefing_actionable:
+            return ""
+        return (
+            "\nACTIONABILITY: write for a reader deciding what to do today. "
+            "Lead with the concrete hook -- the date, deadline, location, "
+            "street/route, dollar figure, or place to show up -- then the "
+            "consequence for them. If an item implies no action, give the one "
+            "fact worth knowing in a single sentence instead of padding it."
+        )
+
+    def _ranking_interests(self, topics: List[str]) -> List[str]:
+        """
+        Pick the interest terms used in ranking prompts.
+
+        Falls back to ``interest_profile`` topics (highest weight first) when no
+        arxiv topics are configured, so news/blog ranking still has a relevance
+        signal in paper-free briefings such as the local one.
+        """
+        usable = [t for t in (topics or []) if str(t).strip()]
+        if usable:
+            return usable[:5]
+        profile = self.config.get("interest_profile", []) or []
+        weighted = [
+            (float(item.get("weight", 0.5)), str(item.get("topic", "")).strip())
+            for item in profile
+            if isinstance(item, dict) and str(item.get("topic", "")).strip()
+        ]
+        weighted.sort(key=lambda pair: pair[0], reverse=True)
+        return [topic for _, topic in weighted[:5]]
 
     @staticmethod
     def extract_score(text: str) -> Tuple[int, str]:
@@ -833,17 +996,21 @@ class BriefingIntelligence:
         prompt = (
             f"You are curating a daily {self.briefing_domain} intelligence briefing. "
             f"From these news articles, select the TOP 5 that genuinely matter to "
-            f"{self.briefing_audience} -- prioritize real signal (shipped "
-            "capabilities, deals, policy, money, hard numbers) over press-release "
-            "noise.\n\n"
-            f"<interests>{', '.join(topics[:5])}</interests>\n\n"
+            f"{self.briefing_audience} -- prioritize real signal (concrete "
+            "decisions, dates, deals, policy, money, hard numbers) over "
+            "press-release noise.\n\n"
+            f"{self._priority_block()}"
+            f"<interests>{', '.join(self._ranking_interests(topics))}</interests>\n\n"
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
             "[original_number] 2-3 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which articles you left out.\n\n"
             "In each summary, lead with what actually happened and the concrete "
             "stakes, then deliver the 'so what' -- the implication or what it "
             "signals. Active voice, specific names and numbers, no hype, no "
-            "filler. Rank by importance. Be factual. Do not invent details."
+            f"filler. {self._rank_directive()} Be factual. Do not invent details."
+            f"{self._actionability_note()}"
         )
 
         result = self.client.invoke(
@@ -861,11 +1028,11 @@ class BriefingIntelligence:
         for idx, text in parsed:
             if 0 <= idx < len(news):
                 article = news[idx].copy()
-                article["brief_summary"] = text
+                article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked_news.append(article)
 
         if ranked_news:
-            diversified = self._enforce_source_diversity(ranked_news, max_per_source=2)
+            diversified = self._enforce_source_diversity(ranked_news, max_per_source=self.max_per_source)
             logger.info(f"Ranked and summarized {len(diversified)} news articles")
             return diversified[:5]
 
@@ -881,10 +1048,10 @@ class BriefingIntelligence:
             for idx, text in parsed_retry:
                 if 0 <= idx < len(news):
                     article = news[idx].copy()
-                    article["brief_summary"] = text
+                    article["brief_summary"] = _strip_trailing_rationale(text)
                     ranked_news.append(article)
             if ranked_news:
-                diversified = self._enforce_source_diversity(ranked_news, max_per_source=2)
+                diversified = self._enforce_source_diversity(ranked_news, max_per_source=self.max_per_source)
                 logger.info(f"Ranked {len(diversified)} news on retry")
                 return diversified[:5]
 
@@ -931,25 +1098,39 @@ class BriefingIntelligence:
             lines.append(f"[{i+1}] {title} ({source}): {snippet}")
 
         articles_block = "\n".join(lines)
+
+        # Inject today's date so the LLM doesn't hallucinate one and can tell
+        # which events have already happened.
+        from datetime import datetime as _dt
+        _today_str = _dt.now().strftime("%B %d, %Y")
+
         prompt = (
             "You curate an 'upcoming happenings' section for a resident of "
             "Pacific Beach, San Diego (near Crown Point and Kate Sessions Park, "
-            "covering the Pacific Beach / Mission Beach area).\n"
+            "covering the Pacific Beach / Mission Beach area). "
+            f"Today's date is {_today_str}.\n"
             "From these articles, select the TOP "
             f"{max_items} that represent genuine upcoming events or community "
             "happenings nearby -- festivals, concerts, farmers markets, beach "
             "cleanups, park events, planning/community meetings, restaurant "
             "openings, etc. DROP pure policy news, crime stories, and anything "
-            "not in or near the beach communities.\n\n"
+            "not in or near the beach communities. DROP any item whose event "
+            f"date has already passed as of {_today_str} -- never describe a "
+            "past event as upcoming. If an item's date is unstated, keep it "
+            "only if it is plausibly still upcoming (e.g. an ongoing exhibit "
+            "or a recurring weekly market); otherwise drop it.\n\n"
             f"<articles>\n{articles_block}\n</articles>\n\n"
             "For each pick, respond in this exact format:\n"
             "[original_number] 1-2 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which items you left out.\n\n"
             "In each summary, LEAD WITH the concrete details: what it is, when "
             "(date/time if mentioned), and where (venue/neighborhood if "
             "mentioned), then the 'so what' -- why it's worth the resident's "
             "attention. Active voice, specific names, no hype, no filler. "
             "Do not invent details. If an item has no clear date/venue and is "
             "not clearly in the area, drop it."
+            f"{self._actionability_note()}"
         )
 
         result = self.client.invoke(
@@ -969,11 +1150,11 @@ class BriefingIntelligence:
         for idx, text in parsed:
             if 0 <= idx < len(happenings):
                 article = happenings[idx].copy()
-                article["brief_summary"] = text
+                article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked.append(article)
 
         if ranked:
-            diversified = self._enforce_source_diversity(ranked, max_per_source=2)
+            diversified = self._enforce_source_diversity(ranked, max_per_source=self.max_per_source)
             logger.info(f"Ranked and summarized {len(diversified)} happenings")
             return diversified[:max_items]
 
@@ -1014,10 +1195,13 @@ class BriefingIntelligence:
         prompt = (
             f"You are curating a daily {self.briefing_domain} briefing. From these "
             f"blog posts, select the TOP 5 most relevant for {self.briefing_audience}.\n\n"
-            f"<interests>{', '.join(topics[:5])}</interests>\n\n"
+            f"{self._priority_block()}"
+            f"<interests>{', '.join(self._ranking_interests(topics))}</interests>\n\n"
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
             "[original_number] SCORE:X/5 1-2 sentence summary.\n\n"
+            "Return only the numbered picks in that exact format -- never "
+            "explain, list, or justify which posts you left out.\n\n"
             "In the summary, name the specific thing the post is about and state "
             "what it concretely claims, builds, or shows -- the actual takeaway a "
             "reader would quote. Lead with the subject (the product, method, or "
@@ -1030,6 +1214,7 @@ class BriefingIntelligence:
             "SCORE is a combined rating (1-5) of impact, complexity, and innovation. "
             "5 = groundbreaking, 1 = routine.\n"
             "Rank by relevance. Be concise."
+            f"{self._actionability_note()}"
         )
 
         result = self.client.invoke(
@@ -1045,7 +1230,7 @@ class BriefingIntelligence:
             if 0 <= idx < len(blogs):
                 article = blogs[idx].copy()
                 score, summary = self.extract_score(text)
-                article["brief_summary"] = summary
+                article["brief_summary"] = _strip_trailing_rationale(summary)
                 if score:
                     article["score_combined"] = score
                 if article["brief_summary"]:
@@ -1053,11 +1238,11 @@ class BriefingIntelligence:
 
         if ranked_blogs:
             # Enforce source diversity: max 2 per source
-            diversified = self._enforce_source_diversity(ranked_blogs, max_per_source=2)
+            diversified = self._enforce_source_diversity(ranked_blogs, max_per_source=self.max_per_source)
             logger.info(f"Ranked and summarized {len(diversified)} blog articles")
             return diversified[:5]
 
-        return self._enforce_source_diversity(blogs, max_per_source=2)[:5]
+        return self._enforce_source_diversity(blogs, max_per_source=self.max_per_source)[:5]
 
     @staticmethod
     def _enforce_source_diversity(
@@ -1376,7 +1561,9 @@ class BriefingIntelligence:
             "compare or contrast signals — otherwise stick to short paragraphs.\n"
             "- End with **Watch:** or **The bottom line:** in bold, followed by "
             "the single call-out worth tracking.\n\n"
-            "Voice: plain, vigorous, active. Concrete nouns and numbers.\n\n"
+            "Voice: plain, vigorous, active. Concrete nouns and numbers."
+            f"{self._actionability_note()}"
+            "\n\n"
             "GROUND RULES:\n"
             "- Every specific fact, number, ticker, company name, product name, "
             "or personnel name you state must appear verbatim in the <data> "
@@ -1384,11 +1571,14 @@ class BriefingIntelligence:
             "- If a concrete figure is not in <data>, describe the trend "
             "qualitatively. A vaguer true sentence beats a precise invented one.\n"
             f"- Today's date is exactly {_today_str} — do not infer a different "
-            "date if you reference one.\n\n"
+            "date if you reference one.\n"
+            "- Never output your internal reasoning, verification, or grounding "
+            "steps; output only the final editorial text.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
             "independent sources — treat them as the strongest signal and build "
             "your through-line around them where they fit. If emerging themes or "
             "multi-day trends are present, work them in.\n\n"
+            f"{self._priority_block()}"
             f"<data>\n{all_data}\n</data>"
             f"{cross_source_note}"
         )
@@ -1397,8 +1587,21 @@ class BriefingIntelligence:
             prompt,
             tier="heavy",
             system_prompt=SYSTEM_PROMPT,
-            reasoning_enabled=False,
+            reasoning_enabled=True,
         )
+        if result and is_cot_leak(result):
+            logger.warning(
+                "Editorial synthesis leaked CoT scaffolding; "
+                "retrying without reasoning."
+            )
+            result = self.client.invoke(
+                prompt,
+                tier="heavy",
+                system_prompt=SYSTEM_PROMPT,
+                reasoning_enabled=False,
+            )
+            if not result or is_cot_leak(result):
+                result = None
         if not result:
             return {}
 
@@ -1886,6 +2089,19 @@ class BriefingIntelligence:
         result = self.client.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
+        if result and is_cot_leak(result):
+            logger.warning(
+                "Weekly Deep Dive leaked CoT scaffolding; "
+                "retrying without reasoning."
+            )
+            result = self.client.invoke(
+                prompt,
+                tier="heavy",
+                system_prompt=SYSTEM_PROMPT,
+                reasoning_enabled=False,
+            )
+            if not result or is_cot_leak(result):
+                result = None
 
         if result:
             logger.info("Weekly Deep Dive generated successfully")
