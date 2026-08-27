@@ -103,17 +103,35 @@ class BriefingRunner:
         # Chain: opencode/DeepSeek first (its own per-tier fallbacks run
         # internally), then the Gemini CLI, then OpenRouter as fallbacks when
         # the respective backends are enabled.
+        
+        # Load preflight model availability results
+        preflight_path = Path(".model-availability.json")
+        preflight_data = {}
+        if preflight_path.exists():
+            try:
+                with open(preflight_path) as f:
+                    preflight_data = json.load(f)
+                logger.info(f"Loaded preflight model availability: {preflight_path}")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to load preflight data: {e}")
+        else:
+            logger.info("No preflight model availability data found, using config defaults")
+        
+        # Extract preflight models for each provider
+        opencode_preflight = preflight_data.get("opencode", {})
+        openrouter_preflight = preflight_data.get("openrouter", {})
+        
         gemini_config = config.get("gemini", config.get("bedrock", {}))
         openrouter_config = config.get("openrouter", {})
         if config.get("opencode", {}).get("enabled"):
             from scripts.opencode_client import OpencodeClient
-            opencode_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}))
+            opencode_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}), preflight_models=opencode_preflight)
             fallback_clients = []
             if gemini_config.get("enabled"):
                 fallback_clients.append(GeminiCLIClient(gemini_config))
             if openrouter_config.get("enabled"):
                 from scripts.openrouter_client import OpenRouterClient
-                fallback_clients.append(OpenRouterClient(openrouter_config))
+                fallback_clients.append(OpenRouterClient(openrouter_config, preflight_models=openrouter_preflight))
             if fallback_clients:
                 from scripts.composite_client import CompositeClient
                 composite_timeout = config.get("llm", {}).get(

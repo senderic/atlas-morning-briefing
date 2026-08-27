@@ -161,17 +161,16 @@ pdf:
 opencode:
   enabled: false
   models:
-    heavy: "opencode/deepseek-v4-flash-free"
+    heavy: "opencode/nemotron-3-ultra-free"
     medium: "opencode/deepseek-v4-flash-free"
     light: "opencode/deepseek-v4-flash-free"
   # Fallback chain tried (in order) when the primary model for a tier fails
   # (non-zero exit, empty NDJSON response, or timeout) — e.g. when the free
-  # opencode quota is exhausted. opencode-go/glm-5.2 has the largest free
-  # quota on OpenCode Zen, so it goes first. Set to `[]` to disable.
+  # opencode quota is exhausted.
   fallback_models:
-    heavy: ["opencode-go/glm-5.2"]
-    medium: ["opencode-go/glm-5.2"]
-    light: ["opencode-go/glm-5.2"]
+    heavy: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    medium: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    light: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
   max_calls_per_run: 50
   # Per-call timeout. Fast failures (model not found, insufficient balance,
   # rate limit) are detected immediately via NDJSON error events and skip

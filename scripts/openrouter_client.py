@@ -31,21 +31,21 @@ API_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Non-reasoning model to swap in when reasoning_enabled=False.
 _NON_REASONING_SWAPS = {
-    "deepseek/deepseek-v4-pro": "deepseek/deepseek-chat",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free": "openrouter/nvidia/nemotron-3.5-lightning:free",
 }
 
 # Default model IDs per tier. These are common OpenRouter model slugs.
 DEFAULT_MODELS = {
-    "heavy": "deepseek/deepseek-v4-pro",
-    "medium": "deepseek/deepseek-chat",
-    "light": "deepseek/deepseek-chat",
+    "heavy": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "medium": "openrouter/minimax/minimax-m3:free",
+    "light": "openrouter/google/gemma-4-31b-it:free",
 }
 
 # Fallback model slugs tried per tier when the primary fails.
 DEFAULT_FALLBACK_MODELS = {
-    "heavy": ["openrouter/auto"],
-    "medium": ["openrouter/auto"],
-    "light": ["openrouter/auto"],
+    "heavy": ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"],
+    "medium": ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"],
+    "light": ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"],
 }
 
 DEFAULT_PRICING = {
@@ -61,8 +61,9 @@ RETRY_BACKOFF_MAX = 15
 class OpenRouterClient(BaseLLMClient):
     """LLM client that calls OpenRouter's OpenAI-compatible completions API."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, preflight_models: Optional[Dict[str, Dict]] = None):
         config = config or {}
+        preflight_models = preflight_models or {}
         self.enabled = config.get("enabled", True)
         self.provider = config.get("provider", "openrouter")
         self.render_key_rotation = True  # CompositeClient sets False to unify
@@ -75,17 +76,23 @@ class OpenRouterClient(BaseLLMClient):
         self.api_base = config.get("api_base", API_BASE_URL)
 
         models_config = config.get("models", {})
-        self.models = {
-            "heavy": models_config.get("heavy", DEFAULT_MODELS["heavy"]),
-            "medium": models_config.get("medium", DEFAULT_MODELS["medium"]),
-            "light": models_config.get("light", DEFAULT_MODELS["light"]),
-        }
-
         fallback_config = config.get("fallback_models", {})
-        self.fallback_models = {
-            tier: list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
-            for tier in ("heavy", "medium", "light")
-        }
+        self.models = {}
+        self.fallback_models = {}
+
+        for tier in ("heavy", "medium", "light"):
+            # Check preflight first
+            pf = preflight_models.get(tier, {})
+            if pf.get("available") and pf.get("model"):
+                self.models[tier] = pf["model"]
+                logger.info(f"OpenRouter preflight override {tier}: using {pf['model']}")
+            else:
+                self.models[tier] = models_config.get(tier, DEFAULT_MODELS[tier])
+
+            # Build fallback chain: config fallbacks minus the selected primary
+            primary = self.models[tier]
+            config_fallbacks = list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
+            self.fallback_models[tier] = [m for m in config_fallbacks if m != primary]
 
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 120)

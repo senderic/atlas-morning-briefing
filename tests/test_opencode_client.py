@@ -166,7 +166,7 @@ class TestInvoke:
             client.invoke("test", tier="heavy")
             cmd = mock_run.call_args[0][0]
             model_idx = cmd.index("-m") + 1
-            assert cmd[model_idx] == "opencode-go/deepseek-v4-pro"
+            assert cmd[model_idx] == "opencode/nemotron-3-ultra-free"
 
     def test_tier_model_selection_light(self):
         with (
@@ -342,7 +342,7 @@ class TestUsageSummary:
 class TestDefaults:
     def test_default_models(self):
         client = OpencodeClient({})
-        assert client.models["heavy"] == "opencode-go/deepseek-v4-pro"
+        assert client.models["heavy"] == "opencode/nemotron-3-ultra-free"
         assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
         assert client.models["light"] == "opencode/deepseek-v4-flash-free"
 
@@ -378,7 +378,7 @@ class TestFallback:
     def test_default_fallback_models_set(self):
         client = OpencodeClient({})
         for tier in ("heavy", "medium", "light"):
-            assert client.fallback_models[tier] == ["opencode-go/deepseek-v4-flash"]
+            assert client.fallback_models[tier] == ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
 
     def test_custom_fallback_models(self):
         client = OpencodeClient({
@@ -406,14 +406,14 @@ class TestFallback:
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._call_count == 1
-        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-flash"
+        assert client._tier_served_by["heavy"] == "opencode/mimo-v2.5-free"
         assert client._tier_fallback_hits["heavy"] == 1
         # Primary then first fallback were tried
         assert mock_run.call_count == 2
         first_cmd = mock_run.call_args_list[0][0][0]
         second_cmd = mock_run.call_args_list[1][0][0]
-        assert first_cmd[first_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-pro"
-        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-flash"
+        assert first_cmd[first_cmd.index("-m") + 1] == "opencode/nemotron-3-ultra-free"
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode/mimo-v2.5-free"
 
     def test_fallback_after_empty_ndjson(self):
         # Primary returns rc=0 but empty NDJSON; fallback succeeds.
@@ -446,12 +446,11 @@ class TestFallback:
         assert client._tier_fallback_hits["heavy"] == 1
 
     def test_all_models_fail_returns_none(self):
-        # Default chain after dedup: [deepseek-v4-flash-free, glm-5.2]
-        # (the second default fallback duplicates the primary, so only 2
-        # distinct models are tried).
+        # Default chain after dedup: [nemotron-3-ultra-free, mimo-v2.5-free, nemotron-3.5-lightning-free]
         side_effects = [
             make_mock_run(1, "", "fail1"),
             make_mock_run(1, "", "fail2"),
+            make_mock_run(1, "", "fail3"),
         ]
         with (
             patch("shutil.which", return_value="/usr/bin/opencode"),
@@ -462,8 +461,8 @@ class TestFallback:
         assert result is None
         assert client._call_count == 0
         assert client._tier_failures["heavy"] == 1
-        # primary + 1 unique fallback = 2 invocations
-        assert mock_run.call_count == 2
+        # primary + 2 unique fallbacks = 3 invocations
+        assert mock_run.call_count == 3
 
     def test_all_models_fail_with_distinct_fallbacks(self):
         # Three distinct models: primary + two unique fallbacks.
@@ -478,8 +477,8 @@ class TestFallback:
         ):
             client = OpencodeClient({
                 "max_retries_per_model": 0,
-                "models": {"heavy": "opencode-zen/deepseek-v4-flash-free"},
-                "fallback_models": {"heavy": ["opencode-go/deepseek-v4-flash", "opencode/mimo-v2.5-free"]},
+                "models": {"heavy": "opencode/nemotron-3-ultra-free"},
+                "fallback_models": {"heavy": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]},
             })
             result = client.invoke("test", tier="heavy")
         assert result is None
@@ -508,17 +507,17 @@ class TestFallback:
         ):
             client = OpencodeClient({
                 "max_retries_per_model": 0,
-                "models": {"heavy": "opencode-zen/deepseek-v4-flash-free"},
+                "models": {"heavy": "opencode/nemotron-3-ultra-free"},
                 "fallback_models": {"heavy": [
-                    "opencode-zen/deepseek-v4-flash-free",  # duplicates primary
-                    "opencode-go/deepseek-v4-flash",
+                    "opencode/nemotron-3-ultra-free",  # duplicates primary
+                    "opencode/mimo-v2.5-free",
                 ]},
             })
             client.invoke("test", tier="heavy")
-        # Primary dedup'd, so only 2 calls (primary + deepseek-v4-flash)
+        # Primary dedup'd, so only 2 calls (primary + mimo-v2.5-free)
         assert mock_run.call_count == 2
         second_cmd = mock_run.call_args_list[1][0][0]
-        assert second_cmd[second_cmd.index("-m") + 1] == "opencode-go/deepseek-v4-flash"
+        assert second_cmd[second_cmd.index("-m") + 1] == "opencode/mimo-v2.5-free"
 
     def test_no_fallback_invoked_when_primary_succeeds(self):
         with (
@@ -644,7 +643,7 @@ class TestRetryThenFallback:
             result = client.invoke("test", tier="heavy")
         assert result == "Hello there"
         assert client._tier_fallback_hits["heavy"] == 0  # no fallback
-        assert client._tier_served_by["heavy"] == "opencode-go/deepseek-v4-pro"
+        assert client._tier_served_by["heavy"] == "opencode/nemotron-3-ultra-free"
         assert mock_run.call_count == 2  # initial + retry
 
     def test_nonzero_exit_retries_then_fallback(self):

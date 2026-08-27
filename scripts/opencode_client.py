@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Junjie Tang. MIT License. See LICENSE file for details.
 """
-OpenCode CLI client.
+Opencode CLI client.
 
 Calls `opencode run --format json` as a subprocess and parses the NDJSON
-event stream to extract response text. Uses free-tier OpenCode Zen models
-(opencode/deepseek-v4-flash-free) by default.
+event stream to extract response text. Uses free-tier OpenCode models
+(opencode/nemotron-3-ultra-free, opencode/deepseek-v4-flash-free) by default.
 """
 
 import json
@@ -24,22 +24,22 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
-    "heavy": "opencode-go/deepseek-v4-pro",
+    "heavy": "opencode/nemotron-3-ultra-free",
     "medium": "opencode/deepseek-v4-flash-free",
     "light": "opencode/deepseek-v4-flash-free",
 }
 
 # Non-reasoning model to swap in when reasoning_enabled=False.
 _NON_REASONING_SWAPS = {
-    "opencode-go/deepseek-v4-pro": "opencode-go/deepseek-v4-flash",
+    "opencode/nemotron-3-ultra-free": "opencode/nemotron-3.5-lightning-free",
 }
 
 # Backup models tried in order if the primary model for a tier fails
 # (non-zero exit, empty response, or timeout).
 DEFAULT_FALLBACK_MODELS = {
-    "heavy": ["opencode-go/deepseek-v4-flash"],
-    "medium": ["opencode-go/deepseek-v4-flash"],
-    "light": ["opencode-go/deepseek-v4-flash"],
+    "heavy": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
+    "medium": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
+    "light": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
 }
 
 DEFAULT_PRICING = {
@@ -58,7 +58,7 @@ RETRY_BACKOFF_MAX = 15
 class OpencodeClient(BaseLLMClient):
     """LLM client that calls the `opencode` CLI in headless mode."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, preflight_models: Optional[Dict[str, Dict]] = None):
         """
         Initialize OpencodeClient.
 
@@ -66,25 +66,36 @@ class OpencodeClient(BaseLLMClient):
             config: Optional opencode configuration from config.yaml.
                     Keys: models (dict of tier->model_id),
                     max_calls_per_run, pricing.
+            preflight_models: Optional dict from preflight check with per-tier
+                    available models. If provided, uses the first available
+                    model per tier (primary or fallback) instead of config.
         """
         config = config or {}
+        preflight_models = preflight_models or {}
         self.enabled = config.get("enabled", True)
         self.provider = config.get("provider", "opencode")
         self.render_key_rotation = True  # CompositeClient sets False to unify
+
+        # Determine models: use preflight results if available, else config, else defaults
         models_config = config.get("models", {})
-        self.models = {
-            "heavy": models_config.get("heavy", DEFAULT_MODELS["heavy"]),
-            "medium": models_config.get("medium", DEFAULT_MODELS["medium"]),
-            "light": models_config.get("light", DEFAULT_MODELS["light"]),
-        }
-        # Per-tier fallback chain. The primary model is always tried first;
-        # if it fails (rc != 0, empty NDJSON, or timeout) we walk this list.
-        # Set to an empty list to disable fallback for a tier.
         fallback_config = config.get("fallback_models", {})
-        self.fallback_models: Dict[str, list] = {
-            tier: list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
-            for tier in ("heavy", "medium", "light")
-        }
+        self.models = {}
+        self.fallback_models = {}
+
+        for tier in ("heavy", "medium", "light"):
+            # Check preflight first
+            pf = preflight_models.get(tier, {})
+            if pf.get("available") and pf.get("model"):
+                self.models[tier] = pf["model"]
+                logger.info(f"Opencode preflight override {tier}: using {pf['model']}")
+            else:
+                self.models[tier] = models_config.get(tier, DEFAULT_MODELS[tier])
+
+            # Build fallback chain: config fallbacks minus the selected primary
+            primary = self.models[tier]
+            config_fallbacks = list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
+            # Remove primary from fallbacks if present
+            self.fallback_models[tier] = [m for m in config_fallbacks if m != primary]
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 600)
         self.max_retries = config.get("max_retries_per_model", MAX_RETRIES_PER_MODEL)
@@ -544,7 +555,7 @@ class OpencodeClient(BaseLLMClient):
             f"*Costs estimated at ${in_rate:.2f}/1M input and ${out_rate:.2f}/1M output "
             f"(DeepSeek V4 Flash paid-tier rates). "
             f"Tokens estimated at ~4 bytes per token. "
-            f"This run used the free `opencode/deepseek-v4-flash-free` model "
+            f"This run used free opencode models (nemotron-3-ultra-free / deepseek-v4-flash-free) "
             f"via the opencode CLI — actual cost was $0.00.*\n\n"
         )
 

@@ -306,15 +306,15 @@ gemini:
 opencode:
   enabled: true
   models:
-    heavy: "opencode-go/deepseek-v4-pro"
+    heavy: "opencode/nemotron-3-ultra-free"
     medium: "opencode/deepseek-v4-flash-free"
     light: "opencode/deepseek-v4-flash-free"
   # Fallback chain tried (in order) when the primary model for a tier fails
   # (non-zero exit, empty response, or timeout).
   fallback_models:
-    heavy: ["opencode-go/deepseek-v4-flash"]
-    medium: ["opencode-go/deepseek-v4-flash"]
-    light: ["opencode-go/deepseek-v4-flash"]
+    heavy: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    medium: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    light: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
   max_calls_per_run: 50
   # Per-call timeout. 120s is generous — fast failures (model not found,
   # insufficient balance, rate limit) are detected immediately via NDJSON
@@ -334,13 +334,13 @@ openrouter:
   enabled: true
   api_base: "https://openrouter.ai/api/v1/chat/completions"
   models:
-    heavy: "deepseek/deepseek-v4-pro"
-    medium: "deepseek/deepseek-chat"
-    light: "deepseek/deepseek-chat"
+    heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+    medium: "openrouter/minimax/minimax-m3:free"
+    light: "openrouter/google/gemma-4-31b-it:free"
   fallback_models:
-    heavy: ["openrouter/auto"]
-    medium: ["openrouter/auto"]
-    light: ["openrouter/auto"]
+    heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
+    medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
+    light: ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"]
   max_calls_per_run: 50
   timeout: 120
   max_tokens: 4096
