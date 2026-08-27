@@ -261,14 +261,14 @@ max_blogs: 12
 max_news: 15
 
 # Concurrency settings
-max_workers: 1
+max_workers: 6
 
 # LLM fallback chain tuning
 composite:
   # Max seconds to wait on any single backend before skipping it and moving to
   # the next fallback. Prevents a quota-exhausted/hanging backend (e.g. Gemini
   # heavy-tier retry loop) from stalling the run and blocking email delivery.
-  timeout_seconds: 240
+  timeout_seconds: 400
 
 # PDF settings
 pdf:
@@ -320,7 +320,7 @@ opencode:
   # insufficient balance, rate limit) are detected immediately via NDJSON
   # error events and skip straight to the fallback chain without waiting
   # for the timeout.
-  timeout: 120
+  timeout: 300
   # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
   # instead of the free opencode model. Used in the usage summary footer.
   pricing:
@@ -341,7 +341,7 @@ openrouter:
     heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     light: ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"]
-  max_calls_per_run: 50
+  max_calls_per_run: 100
   timeout: 120
   max_tokens: 4096
   temperature: 0.3

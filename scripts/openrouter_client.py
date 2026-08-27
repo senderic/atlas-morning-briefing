@@ -255,6 +255,14 @@ class OpenRouterClient(BaseLLMClient):
             model = payload
             payload["model"] = model
 
+        # Strip 'openrouter/' prefix for API call (OpenRouter expects provider/model format)
+        api_model = payload["model"]
+        if api_model.startswith("openrouter/"):
+            api_model = api_model[len("openrouter/"):]
+            if api_model == "openrouter/free":
+                api_model = "openrouter/auto"
+            payload["model"] = api_model
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

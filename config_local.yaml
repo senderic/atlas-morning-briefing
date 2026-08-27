@@ -183,7 +183,7 @@ max_news: 15
 arxiv_days_back: 3
 
 # --- Concurrency ---
-max_workers: 1
+max_workers: 6
 
 # --- PDF disabled ---
 pdf:
@@ -241,7 +241,7 @@ openrouter:
     heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
     light: ["openrouter/nvidia/nemotron-3.5-lightning:free", "openrouter/openrouter/free"]
-  max_calls_per_run: 50
+  max_calls_per_run: 100
   timeout: 120
   max_tokens: 4096
   temperature: 0.3
