@@ -36,6 +36,10 @@ from scripts.arxiv_scanner import ArxivScanner, create_scanner
 from scripts.snapshot_manager import SnapshotManager
 from scripts.blog_scanner import BlogScanner
 from scripts.stock_fetcher import StockFetcher
+from scripts.text_similarity import DEDUP_STOPWORDS, headline_terms
+from scripts.alerts_scanner import create_scanner as create_alerts_scanner
+from scripts.geo_filter import apply_config_filter
+from scripts.interest_graph import query_freshness
 from scripts.news_aggregator import NewsAggregator
 from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
@@ -44,11 +48,37 @@ from scripts.email_distributor import EmailDistributor
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
-from scripts.llm_client import BaseLLMClient, ReasoningControlMixin
+from scripts.leak_detection import is_cot_leak
+from scripts.llm_client import BaseLLMClient
 
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+SYNTHESIS_UNAVAILABLE_TEXT = (
+    "*Synthesis unavailable for today's briefing. Please see the individual "
+    "sections below for key updates in tech, defense, and research.*\n\n"
+)
+
+DEFAULT_FILE_NAMING = "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+
+
+def format_briefing_filename(file_naming: str, now: datetime) -> str:
+    """
+    Render a briefing filename from its config pattern.
+
+    Module-level so anything that needs to *find* today's briefing -- the
+    quality check, for one -- derives the name from the same rule that wrote
+    it, instead of keeping a second copy that drifts.
+    """
+    known_vars = {
+        "yyyy": now.strftime("%Y"),
+        "mm": now.strftime("%m"),
+        "dd": now.strftime("%d"),
+        "type": "Daily",
+    }
+    return (file_naming or DEFAULT_FILE_NAMING).format_map(known_vars)
+
 
 class BriefingRunner:
     """Main orchestrator for morning briefing generation."""
@@ -91,6 +121,9 @@ class BriefingRunner:
             "stocks_fetched": 0,
             "news_found": 0,
             "happenings_found": 0,
+            "alerts_found": 0,
+            "synthesis_degraded": False,
+            "geo_filtered_out": 0,
             "intelligence_enabled": False,
             "errors": [],
             "pdf_generated": False,
@@ -100,60 +133,16 @@ class BriefingRunner:
         }
 
         # Initialize LLM client and intelligence layer.
-        # Chain: opencode/DeepSeek first (its own per-tier fallbacks run
-        # internally), then the Gemini CLI, then OpenRouter as fallbacks when
-        # the respective backends are enabled.
-
         preflight_data = self._load_preflight_models()
-        opencode_preflight = preflight_data.get("opencode", {})
-        openrouter_preflight = preflight_data.get("openrouter", {})
-
         gemini_config = config.get("gemini", config.get("bedrock", {}))
-        openrouter_config = config.get("openrouter", {})
 
-        # Build the backend chain from every enabled provider. Order matters:
-        # the chain is tried front to back, so the cheapest backend goes first
-        # and any paid one goes LAST, reached only when every free model in
-        # front of it has failed. Disabled backends are skipped, so the next
-        # one in the list simply becomes primary.
+        # Chain construction lives in scripts.llm_chain so the briefing runner
+        # and the quality checker cannot drift on backend ordering. Order is
+        # cost: free backends first, any paid one last.
         from scripts.composite_client import CompositeClient
-        from scripts.opencode_client import OpencodeClient
-        from scripts.openrouter_client import OpenRouterClient
+        from scripts.llm_chain import build_llm_chain, chain_timeout
 
-        builders = {
-            "openrouter": lambda: OpenRouterClient(
-                openrouter_config, preflight_models=openrouter_preflight
-            ),
-            "gemini": lambda: GeminiCLIClient(gemini_config),
-            "opencode": lambda: OpencodeClient(
-                config.get("opencode", {}), preflight_models=opencode_preflight
-            ),
-        }
-        enabled = {
-            "openrouter": bool(openrouter_config.get("enabled")),
-            "gemini": bool(gemini_config.get("enabled")),
-            "opencode": bool(config.get("opencode", {}).get("enabled")),
-        }
-        priority = config.get("llm", {}).get(
-            "backend_priority", ["openrouter", "gemini", "opencode"]
-        )
-        unknown = [name for name in priority if name not in builders]
-        if unknown:
-            logger.warning("Ignoring unknown llm.backend_priority entries: %s", unknown)
-        # Any backend omitted from the priority list still runs, appended last,
-        # so a typo in config cannot silently drop a configured backend.
-        ordered = [n for n in priority if n in builders]
-        ordered += [n for n in builders if n not in ordered]
-
-        chain: List[BaseLLMClient] = []
-        for name in ordered:
-            if enabled[name]:
-                chain.append(builders[name]())
-        if chain:
-            logger.info(
-                "LLM backend chain (first tried to last): %s",
-                " -> ".join(type(c).__name__ for c in chain),
-            )
+        chain = build_llm_chain(config, preflight_models=preflight_data)
 
         if not chain:
             # No LLM backend enabled at all — deterministic mode.
@@ -161,11 +150,7 @@ class BriefingRunner:
         elif len(chain) == 1:
             self.llm_client = chain[0]
         else:
-            composite_timeout = config.get("llm", {}).get(
-                "fallback_timeout_seconds",
-                config.get("composite", {}).get("timeout_seconds", 240),
-            )
-            self.llm_client = CompositeClient(chain, timeout=composite_timeout)
+            self.llm_client = CompositeClient(chain, timeout=chain_timeout(config))
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
@@ -282,7 +267,11 @@ class BriefingRunner:
         self, queries: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Run news aggregation.
+        Run news aggregation, honoring each query's freshness binding.
+
+        Interest-graph queries carry the freshness window their branch asked
+        for (hyperlocal branches need a wider window than market branches), so
+        queries are grouped by window and each group is fetched separately.
 
         Args:
             queries: Optional list of queries. If None, uses config.
@@ -305,12 +294,33 @@ class BriefingRunner:
                 logger.warning("No news_queries configured, skipping")
                 return []
 
-            aggregator = NewsAggregator(
-                api_key=api_key,
-                queries=queries,
-                max_results=max_news,
-            )
-            articles = aggregator.aggregate_all_queries()
+            default_freshness = self.config.get("news_freshness", "pd")
+            groups: Dict[str, List[str]] = {}
+            for query in queries:
+                groups.setdefault(
+                    query_freshness(query, default_freshness), []
+                ).append(str(query))
+
+            articles: List[Dict[str, Any]] = []
+            seen_urls = set()
+            for freshness, group in groups.items():
+                logger.info(
+                    "News group freshness=%s queries=%d", freshness, len(group)
+                )
+                aggregator = NewsAggregator(
+                    api_key=api_key,
+                    queries=group,
+                    max_results=max_news,
+                    freshness=freshness,
+                )
+                for article in aggregator.aggregate_all_queries():
+                    url = article.get("url", "")
+                    if url and url in seen_urls:
+                        continue
+                    if url:
+                        seen_urls.add(url)
+                    articles.append(article)
+
             self.status["news_found"] = len(articles)
             logger.info(f"Found {len(articles)} news articles")
             return articles
@@ -319,6 +329,41 @@ class BriefingRunner:
             logger.error(f"News aggregation failed: {e}")
             self.errors.append(f"News aggregation: {e}")
             return []
+
+    def run_alerts_scan(self) -> List[Dict[str, Any]]:
+        """
+        Fetch active public-safety alerts (NWS) for the configured zones.
+
+        Deterministic and LLM-free: alerts are rendered as fetched, so this
+        section survives an LLM outage intact.
+
+        Returns:
+            List of active alerts, most severe first.
+        """
+        try:
+            scanner = create_alerts_scanner(self.config)
+            if scanner is None:
+                return []
+            logger.info("=== Fetching Public-Safety Alerts ===")
+            alerts = scanner.fetch()
+            self.status["alerts_found"] = len(alerts)
+            logger.info(f"Found {len(alerts)} active alerts")
+            return alerts
+        except Exception as e:
+            logger.error(f"Alerts scan failed: {e}")
+            self.errors.append(f"Alerts scan: {e}")
+            return []
+
+    def _apply_geo_filter(
+        self, items: List[Dict[str, Any]], label: str
+    ) -> List[Dict[str, Any]]:
+        """Drop items with no reference to the configured area (config-driven)."""
+        before = len(items)
+        kept = apply_config_filter(items, self.config, label=label)
+        dropped = before - len(kept)
+        if dropped:
+            self.status["geo_filtered_out"] += dropped
+        return kept
 
     def run_happenings_aggregation(self) -> List[Dict[str, Any]]:
         """
@@ -361,12 +406,30 @@ class BriefingRunner:
             self.errors.append(f"Happenings aggregation: {e}")
             return []
 
+    def _happenings_fetch_days(self) -> Optional[set]:
+        """
+        Weekdays on which happenings are re-fetched (0=Mon ... 6=Sun).
+
+        Accepts a single weekday or a list of them; returns None when the key
+        is absent, meaning "fetch every run". A list lets a cache refresh land
+        both before the weekend and again midweek, so the section does not
+        spend the back half of its cycle advertising events that have passed.
+        """
+        raw = self.config.get("happenings_fetch_weekday")
+        if raw is None:
+            return None
+        if isinstance(raw, (list, tuple, set)):
+            days = {int(d) for d in raw}
+            return days or None
+        return {int(raw)}
+
     def _load_or_fetch_happenings(
         self, previous_state: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         today = datetime.now()
+        fetch_days = self._happenings_fetch_days()
         fetch_weekday = self.config.get("happenings_fetch_weekday")
-        should_fetch = fetch_weekday is None or today.weekday() == int(fetch_weekday)
+        should_fetch = fetch_days is None or today.weekday() in fetch_days
         if should_fetch:
             logger.info(
                 "Fetching fresh happenings (fetch weekday=%s, today=%s)",
@@ -524,6 +587,83 @@ class BriefingRunner:
             _filter(happenings or [], prev_happenings),
         )
 
+    # Defined in scripts/text_similarity.py so the quality check measures
+    # duplicates exactly the way this collapse does -- two copies of the rule
+    # would silently drift apart.
+    _DEDUP_STOPWORDS = DEDUP_STOPWORDS
+
+    @classmethod
+    def _headline_terms(cls, title: str) -> set:
+        """Content words of a headline, for cross-outlet duplicate detection."""
+        return headline_terms(title)
+
+    def deduplicate_similar_news(
+        self, news: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Collapse the same story reported by many outlets.
+
+        A viral local story ("Darth Vader speaks at city council") arrives from
+        a dozen syndicating outlets with different headlines, crowding out
+        everything else. URL dedup does not catch it and title SequenceMatcher
+        is unreliable across rewrites, so this uses Jaccard overlap of headline
+        content words.
+
+        Threshold calibrated on real Brave results: cross-outlet retellings of
+        one story scored 0.23-0.47, while genuinely distinct local stories
+        scored 0.00-0.17. The default 0.3 sits in that gap.
+
+        When a duplicate is found, the copy from a local outlet
+        (``geo_filter.trusted_sources``) wins over a national aggregator.
+        """
+        cfg = self.config.get("news_similarity_dedup") or {}
+        if not cfg.get("enabled") or len(news) <= 1:
+            return news
+
+        threshold = float(cfg.get("threshold", 0.3))
+        trusted = {
+            t.lower() for t in
+            (self.config.get("geo_filter", {}) or {}).get("trusted_sources", [])
+        }
+
+        def is_trusted(article: Dict[str, Any]) -> bool:
+            host = (article.get("source") or "").lower()
+            return any(host == t or host.endswith("." + t) for t in trusted)
+
+        kept: List[Dict[str, Any]] = []
+        kept_terms: List[set] = []
+        for article in news:
+            terms = self._headline_terms(article.get("title", ""))
+            if not terms:
+                kept.append(article)
+                kept_terms.append(terms)
+                continue
+
+            dup_index = None
+            for i, other in enumerate(kept_terms):
+                if not other:
+                    continue
+                overlap = len(terms & other) / len(terms | other)
+                if overlap >= threshold:
+                    dup_index = i
+                    break
+
+            if dup_index is None:
+                kept.append(article)
+                kept_terms.append(terms)
+            elif is_trusted(article) and not is_trusted(kept[dup_index]):
+                # Prefer the local outlet's version of the same story.
+                kept[dup_index] = article
+                kept_terms[dup_index] = terms
+
+        removed = len(news) - len(kept)
+        if removed:
+            logger.info(
+                "Dedup: collapsed %d syndicated copies of stories already kept",
+                removed,
+            )
+        return kept
+
     def deduplicate_similar_papers(
         self, papers: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -571,6 +711,7 @@ class BriefingRunner:
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         happenings: Optional[List[Dict[str, Any]]] = None,
+        alerts: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Generate markdown briefing from all data.
@@ -587,6 +728,7 @@ class BriefingRunner:
             start_time: Optional briefing start unix timestamp.
             end_time: Optional briefing end unix timestamp.
             happenings: Optional neighborhood happenings (Pacific Beach area).
+            alerts: Optional active public-safety alerts (NWS).
 
         Returns:
             Markdown string.
@@ -634,9 +776,7 @@ class BriefingRunner:
             # "Check verbatim entities/facts:" bullet lists).  If the cleaned
             # intro contains those telltales — drop it and fall back to the
             # unavailable placeholder.
-            # Use shared CoT detection from ReasoningControlMixin for consistency
-            _cot_detector = ReasoningControlMixin()
-            _looks_like_cot = _cot_detector.detect_cot_leakage(intro)
+            _looks_like_cot = is_cot_leak(intro)
             if _looks_like_cot:
                 logger.warning(
                     "Editorial intro looks like leaked CoT scaffolding; "
@@ -649,10 +789,12 @@ class BriefingRunner:
                 md.append(f"{intro}\n\n")
             else:
                 md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
-                md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
+                md.append(SYNTHESIS_UNAVAILABLE_TEXT)
+                self._record_degraded_synthesis()
         else:
             md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
-            md.append("*Synthesis unavailable for today's briefing. Please see the individual sections below for key updates in tech, defense, and research.*\n\n")
+            md.append(SYNTHESIS_UNAVAILABLE_TEXT)
+            self._record_degraded_synthesis()
 
         if self.feature_solo_founder_angle:
             solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
@@ -681,6 +823,7 @@ class BriefingRunner:
             "top_papers": top_papers,
             "papers": papers,
             "happenings": happenings or [],
+            "alerts": alerts or [],
         }
         logger.debug(
             "Generating markdown: section_order=%s headings_keys=%s "
@@ -707,11 +850,21 @@ class BriefingRunner:
                 md.append(self._render_papers(data))
             elif section == "happenings":
                 md.append(self._render_happenings(data))
+            elif section == "alerts":
+                md.append(self._render_alerts(data))
 
         # Feature 2: Weekly Deep Dive section (Saturday only)
         if self.feature_weekly_deep_dive and weekly_deep_dive:
-            md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
-            md.append(f"{weekly_deep_dive}\n\n")
+            # Guard: drop leaked reasoning / verification scaffolding.
+            if weekly_deep_dive and is_cot_leak(weekly_deep_dive):
+                logger.warning(
+                    "Weekly deep dive looks like leaked CoT scaffolding; "
+                    "omitting section."
+                )
+                weekly_deep_dive = ""
+            if weekly_deep_dive:
+                md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
+                md.append(f"{weekly_deep_dive}\n\n")
 
         # Errors section
         if self.errors:
@@ -781,14 +934,9 @@ class BriefingRunner:
 
     def _format_filename(self, now: datetime) -> str:
         """Format the output filename from config pattern, ignoring unknown keys."""
-        file_naming = self.config.get("file_naming", "Atlas-Briefing-{yyyy}.{mm}.{dd}")
-        known_vars = {
-            "yyyy": now.strftime("%Y"),
-            "mm": now.strftime("%m"),
-            "dd": now.strftime("%d"),
-            "type": "Daily",
-        }
-        return file_naming.format_map(known_vars)
+        return format_briefing_filename(
+            self.config.get("file_naming", DEFAULT_FILE_NAMING), now
+        )
 
     def _enrich_papers(self, papers: list, topics: list) -> list:
         """Run paper summarization + semantic scoring sequentially (used in parallel batch)."""
@@ -902,6 +1050,51 @@ class BriefingRunner:
                 md.append(f"\n#### Source Information\n{author_blurb}\n")
 
             md.append("\n")
+        return "".join(md)
+
+    @staticmethod
+    def _format_alert_window(onset: str, expires: str) -> str:
+        """Render an alert's active window as a compact local-time range."""
+        def fmt(value: str) -> str:
+            if not value:
+                return ""
+            try:
+                return datetime.fromisoformat(value).strftime("%a %b %-d, %-I:%M %p")
+            except (ValueError, TypeError):
+                return value
+
+        start, end = fmt(onset), fmt(expires)
+        if start and end:
+            return f"{start} → {end}"
+        return start or end
+
+    def _render_alerts(self, alerts: List[Dict[str, Any]]) -> str:
+        """Render active public-safety alerts (deterministic, no LLM needed)."""
+        max_alerts = self.config.get("alerts", {}).get("max_alerts", 5)
+        items = alerts[:max_alerts]
+        if not items:
+            return ""
+
+        md = [f"## {self._headings.get('alerts', 'Active Alerts')}\n\n"]
+        for alert in items:
+            event = alert.get("event", "Alert")
+            severity = alert.get("severity", "")
+            window = self._format_alert_window(
+                alert.get("onset", ""), alert.get("expires", "")
+            )
+            md.append(f"**{event}**" + (f" — {severity}" if severity else "") + "\n")
+            if window:
+                md.append(f"{window}\n")
+            area = alert.get("area", "")
+            if area:
+                md.append(f"{area}\n")
+            instruction = (alert.get("instruction") or "").replace("\n", " ").strip()
+            if instruction:
+                if len(instruction) > 300:
+                    instruction = instruction[:297].rstrip() + "..."
+                md.append(f"\n{instruction}\n")
+            md.append("\n")
+        md.append(f"_Source: {items[0].get('source', 'National Weather Service')}_\n\n")
         return "".join(md)
 
     def _render_happenings(self, happenings: List[Dict[str, Any]]) -> str:
@@ -1221,6 +1414,22 @@ class BriefingRunner:
             self.errors.append(f"Distribution: {e}")
             return {}
 
+    def _record_degraded_synthesis(self) -> None:
+        """
+        Record that the briefing shipped without its lead section.
+
+        Falling back to the placeholder is correct behavior when every LLM
+        backend is down, but a run that delivers no Executive Summary is not a
+        clean run. Without this the status file reported errors: [] on a
+        briefing whose most-read section was a stub -- which is exactly the
+        kind of silent degradation the quality check exists to surface.
+        """
+        message = "Executive summary unavailable (LLM synthesis failed)"
+        if message not in self.errors:
+            self.errors.append(message)
+        self.status["synthesis_degraded"] = True
+        logger.warning(message)
+
     def save_status(self, output_dir: str = ".") -> None:
         """
         Save run status to JSON file for monitoring.
@@ -1334,6 +1543,9 @@ class BriefingRunner:
             happenings = self._load_snapshot(
                 f"snapshots/{self.use_snapshots}/happenings.json"
             )
+            alerts = self._load_snapshot(
+                f"snapshots/{self.use_snapshots}/alerts.json"
+            )
             topics = self.config.get("arxiv_topics", [])
             news_queries = self.config.get("news_queries", [])
             self.status["papers_found"] = len(papers)
@@ -1341,6 +1553,7 @@ class BriefingRunner:
             self.status["stocks_fetched"] = len(stocks)
             self.status["news_found"] = len(news)
             self.status["happenings_found"] = len(happenings)
+            self.status["alerts_found"] = len(alerts)
         else:
             # --- Topic expansion (intelligence layer) ---
             topics = self.config.get("arxiv_topics", [])
@@ -1356,10 +1569,12 @@ class BriefingRunner:
                 fut_papers = pool.submit(self.run_arxiv_scan, topics)
                 fut_blogs = pool.submit(self.run_blog_scan)
                 fut_stocks = pool.submit(self.run_stock_fetch)
+                fut_alerts = pool.submit(self.run_alerts_scan)
 
                 papers = fut_papers.result()
                 blogs = fut_blogs.result()
                 stocks = fut_stocks.result()
+                alerts = fut_alerts.result()
 
             # --- Generate news queries (interest graph, or static + dynamic) ---
             news_queries = self.config.get("news_queries", [])
@@ -1372,17 +1587,25 @@ class BriefingRunner:
             news = self.run_news_aggregation(queries=news_queries)
             happenings = self._load_or_fetch_happenings(previous_state)
 
+            # Geographic relevance gate: news search treats a place name as a
+            # ranking hint, not a constraint, so drop out-of-area results
+            # before they reach the LLM ranking layer.
+            news = self._apply_geo_filter(news, "news")
+            happenings = self._apply_geo_filter(happenings, "happenings")
+
             # --- Save raw data snapshots ---
             logger.info("=== Saving raw data snapshots ===")
             self.snapshot_manager.save_stocks(stocks)
             self.snapshot_manager.save_news(news)
             self.snapshot_manager.save_happenings(happenings)
+            self.snapshot_manager.save_alerts(alerts)
             self.snapshot_manager.save_blogs(blogs)
             self.snapshot_manager.save_papers(papers)
             self.snapshot_manager.save_manifest()
 
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
+        news = self.deduplicate_similar_news(news)
         happenings = self.deduplicate_happenings(happenings, news)
 
         # --- Deduplicate similar papers by title ---
@@ -1541,7 +1764,7 @@ class BriefingRunner:
                 weekly_items = []
 
         # --- Check if we have any data ---
-        has_data = any([papers, blogs, stocks, news, happenings])
+        has_data = any([papers, blogs, stocks, news, happenings, alerts])
         if not has_data:
             logger.error("No data collected from any source")
             self.status["elapsed_seconds"] = round(time.time() - start_time, 1)
@@ -1562,6 +1785,7 @@ class BriefingRunner:
             start_time=start_time,
             end_time=time.time(),
             happenings=happenings,
+            alerts=alerts,
         )
 
         # --- Save markdown ---

@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 
 import yaml
 
+from scripts.leak_detection import STRONG_MARKERS, WEAK_MARKERS, is_cot_leak
+
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -68,30 +70,10 @@ def get_model_capabilities(model: str) -> Dict[str, Any]:
 class ReasoningControlMixin:
     """Mixin providing model-agnostic reasoning control via capability registry."""
 
-    # Phrases that only appear when a model spills its own reasoning
-    # scaffolding into the answer.
-    #
-    # These must stay narrow. The briefing is ABOUT AI research, so bare topic
-    # words ("chain of thought", "reasoning trace", "thinking process") occur
-    # legitimately in paper summaries and would cause good output to be thrown
-    # away. Match the scaffolding's own phrasing instead of its subject matter.
-    COT_LEAKAGE_MARKERS = (
-        "strict grounding",
-        "check verbatim",
-        "is verbatim",
-        "entities/facts",
-        "grounding verification",
-        "verification scaffolding",
-        "let me think through",
-        "let me reason through",
-        "first, i need to",
-        "the user wants me to",
-        "the user is asking",
-        "okay, so the user",
-        "my chain of thought",
-        "my reasoning trace",
-        "my internal monologue",
-    )
+    # CoT-leakage vocabulary and the predicate live in scripts.leak_detection
+    # so the renderer and the LLM clients cannot drift apart on what counts as
+    # a leak. Re-exported here for callers that hold only a client.
+    COT_LEAKAGE_MARKERS = STRONG_MARKERS + WEAK_MARKERS
 
     def get_model_capabilities(self, model: str) -> Dict[str, Any]:
         """Get capabilities for a model. Override in subclass if needed."""
@@ -157,16 +139,16 @@ class ReasoningControlMixin:
         """
         Detect if response contains leaked chain-of-thought reasoning.
 
+        Delegates to :func:`scripts.leak_detection.is_cot_leak` — a single
+        strong marker is conclusive, otherwise two markers must co-occur.
+
         Args:
             text: Response text to check
 
         Returns:
             True if CoT leakage detected
         """
-        if not text:
-            return False
-        text_lower = text.lower()
-        return any(marker in text_lower for marker in self.COT_LEAKAGE_MARKERS)
+        return is_cot_leak(text)
 
 
 class BaseLLMClient(ABC, ReasoningControlMixin):

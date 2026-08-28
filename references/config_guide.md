@@ -84,7 +84,169 @@ news_queries:
 **Tips**:
 - Use specific queries for targeted results
 - Combine related terms in one query
-- Results are filtered to past 24 hours
+- Results are filtered to past 24 hours by default (`news_freshness`)
+
+**Query shape** (measured against the live Brave news API):
+Brave treats a place name as a ranking hint, not a filter. Long keyword
+strings drift out of the area -- `"San Diego road closure construction traffic
+detour this week"` returned 15 results, none of them from San Diego. Quoting
+returns 0 results and `site:` is unsupported on the news endpoint. Use 2-4
+words built on one distinctive proper noun instead (`Crown Point San Diego`).
+
+### Freshness Windows
+
+Each interest-graph branch declares the window its topic needs, inherited by
+child nodes. Hyperlocal branches need a wider window than market branches --
+a neighborhood does not generate news every 24 hours, and a starved `pd` query
+gets backfilled with national noise.
+
+```yaml
+news_freshness: "pd"          # default for queries with no branch binding
+
+interest_graph:
+  roots:
+    - id: "neighborhood"
+      query: "Pacific Beach San Diego"
+      freshness: "pw"          # inherited by every child below
+      children:
+        - id: "crown_point"
+          query: "Crown Point San Diego"
+          priority: 1.35       # multiplies the per-run signal score
+```
+
+### Geographic Relevance Gate
+
+Drops results that never mention a configured place term, before they reach
+the LLM ranking layer. Items from `trusted_sources` pass without a match, since
+a local outlet is local even when its headline does not say so. Omit the block
+(or set `enabled: false`) to keep every result.
+
+```yaml
+geo_filter:
+  enabled: true
+  place_terms: ["san diego", "pacific beach", "california"]
+  trusted_sources: ["voiceofsandiego.org", "kpbs.org"]
+  blocked_sources: ["openpr.com", "prnewswire.com"]
+```
+
+`blocked_sources` drops a source outright, even when the item mentions a place
+term -- blocked beats both `place_terms` and `trusted_sources`. It exists for
+pay-to-publish press-release portals: a local briefing once ran "Seaside Pizza
+Co. Adds Beer and Wine to Its Pacific Beach Pizza Takeout Experience" from
+`openpr.com`, which passed the gate because it does say "Pacific Beach".
+
+### Happenings Refresh Days
+
+`happenings_fetch_weekday` takes a weekday or a list of them (0=Mon ... 6=Sun).
+On other days the previous fetch is replayed from state, so an events section
+costs a handful of API calls per week instead of per morning.
+
+```yaml
+happenings_fetch_weekday: [0, 3]    # Monday and Thursday
+```
+
+Pick days that sit *ahead* of what the section advertises. A Saturday-only
+fetch left the section promoting a weekend that had already ended by Tuesday;
+Thursday previews the coming weekend and Monday refreshes for midweek. The
+happenings ranking prompt is also date-aware and drops events whose date has
+passed, so a stale cache degrades to a shorter section rather than a wrong one.
+
+### Cross-Outlet Duplicate Collapse
+
+One viral story arrives from a dozen syndicating outlets under different
+headlines. Compares Jaccard overlap of headline content words; the copy from a
+`trusted_sources` outlet wins. Disabled unless configured.
+
+```yaml
+news_similarity_dedup:
+  enabled: true
+  threshold: 0.3     # retellings measured 0.23-0.47, distinct stories 0.00-0.17
+```
+
+## Public-Safety Alerts
+
+Active National Weather Service alerts for specific zones. Free, no API key,
+and rendered without the LLM, so the section survives an LLM outage. This is
+the reliable answer to "is there a heat warning where I live today" -- news
+search answers it with whatever storm is trending nationally.
+
+```yaml
+alerts:
+  enabled: true
+  provider: "nws"
+  zones: ["CAZ043", "CAZ243"]   # forecast zone + fire weather zone
+  max_alerts: 4
+  timeout: 20
+  user_agent: "atlas-morning-briefing (you@example.com)"
+```
+
+Find your zones with `curl 'https://api.weather.gov/points/<lat>,<lon>'` and
+read `forecastZone`, `fireWeatherZone`, and `county` from the response. Prefer
+the narrowest zone that covers you: a county zone fires for inland alerts that
+may not apply at the coast.
+
+Add `"alerts"` to `section_order` to render the section, and a matching
+`section_headings.alerts` label.
+
+## Pipeline Identity
+
+Each pipeline on a machine needs its own status file. `run_briefing.sh` runs the
+main briefing and then the local one about fifteen minutes later; with a shared
+filename the second run silently overwrites the first run's counters, and any
+monitoring reading that file reports one pipeline's numbers as if they were both.
+
+```yaml
+pipeline_name: "atlas"          # recorded inside the status file
+status_file_path: "status.json" # local pipeline uses "status-local.json"
+```
+
+Both keys are optional; omitting them keeps the previous behavior
+(`status.json`, no pipeline label).
+
+## Daily Quality Check
+
+Configuration for `scripts/quality_check.py`, which runs after the briefings and
+reviews what they produced. See `references/quality_monitoring_design.md` for the
+design and `run_quality_check.sh` for the cron entry.
+
+```yaml
+quality_check:
+  # Item counts below which a section is called thin (INFO only).
+  section_floors:
+    news: 3
+    blogs: 3
+
+  # Where alerts go. Reuses the briefing's own Gmail path, so there is one
+  # delivery mechanism to keep working. CRITICAL findings mail immediately
+  # (subject to a 24h per-finding dedupe); set daily_digest to also mail on a
+  # clean day. Falls back to the pipeline's email_recipients when unset.
+  alert_email:
+    recipients: ["you@example.com"]
+    daily_digest: false
+
+  # Dimensions the LLM judge scores, 0-2 each. Omit to score all six.
+  # Scoring a pipeline on a goal it does not have produces a permanent red
+  # that trains the reader to ignore the section.
+  judge:
+    dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
+
+  source_health:
+    dead_url_runs: 3        # consecutive error+zero-yield runs before CRITICAL
+    stale_after_days: 90    # a feed that still returns 200 but stopped publishing
+    zero_run_threshold: 7   # consecutive zero-yield runs before suspicion
+    median_window: 30       # ...only when this window's median yield was >= 1
+    query_window: 14        # news queries whose mean yield falls below 1
+    feed_overrides:
+      "Karpathy":
+        stale_after_days: 400
+```
+
+**Why the median window matters.** A feed returning nothing means four different
+things: a dead URL, a feed frozen at HTTP 200, a live feed that stopped reaching
+the briefing, and a blogger who simply posts twice a year. Only that feed's own
+history separates them, which is why the zero-yield rule fires solely when the
+trailing median says the feed used to contribute. `feed_overrides` exempts known
+slow publishers from the frozen-feed rule so a normal week stays silent.
 
 ## Paper Scoring
 

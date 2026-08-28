@@ -49,7 +49,9 @@ These are the things that mislead a fresh reader of this repo:
 
 4. **`.gitignore` ignores all `*.md` except a whitelist.** New top-level markdown docs won't be committed unless added to the `!<name>.md` whitelist in `.gitignore` (this CLAUDE.md was added to it). Generated artifacts (`*.pdf`, `*.epub`, `*.log`, `status.json`, `.atlas-state.json`, `*.json` state files, `logs/*.jsonl`) are all gitignored — do not commit run outputs.
 
-5. **`config.yaml` is a live, checked-in config with a defense/military topic profile.** That theming (autonomous weapons, ISR, defense contractors, defense-tilted stock watchlist) is intentional and user-specific, not placeholder text. `config.yaml.example` is the generic template. Don't "fix" config.yaml's topics.
+5. **Notifications go out by email, never Telegram.** The user does not use Telegram. Alerts (quality check, failures) reuse `scripts/email_distributor.py` — `EmailDistributor.send_html_email()` with `GMAIL_USER`/`GMAIL_APP_PASSWORD` — the same path that delivers the briefing. `scripts/send_briefing_telegram.py` is dead weight from an earlier machine; don't build on it.
+
+6. **`config.yaml` is a live, checked-in config with a defense/military topic profile.** That theming (autonomous weapons, ISR, defense contractors, defense-tilted stock watchlist) is intentional and user-specific, not placeholder text. `config.yaml.example` is the generic template. Don't "fix" config.yaml's topics.
 
 ## Architecture
 

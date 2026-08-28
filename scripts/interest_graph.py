@@ -27,6 +27,29 @@ _STOPWORDS = {
 }
 
 
+class Query(str):
+    """
+    A query string that carries its retrieval parameters.
+
+    Subclasses ``str`` so every existing consumer (dedup sets, logging,
+    ``NewsAggregator``) keeps working unchanged, while the runner can read the
+    ``freshness`` the owning graph node asked for.
+    """
+
+    __slots__ = ("freshness", "node_id")
+
+    def __new__(cls, text: str, freshness: Optional[str] = None, node_id: str = ""):
+        obj = super().__new__(cls, text)
+        obj.freshness = freshness
+        obj.node_id = node_id
+        return obj
+
+
+def query_freshness(query: Any, default: str) -> str:
+    """Read a query's freshness binding, falling back to the pipeline default."""
+    return getattr(query, "freshness", None) or default
+
+
 @dataclass
 class Node:
     """A node in the interest taxonomy tree."""
@@ -34,11 +57,19 @@ class Node:
     id: str
     query: str
     priority: float = 1.0
+    # Brave freshness window for this branch ("pd", "pw", "pm"). Inherited from
+    # the parent when unset: hyperlocal branches need a wider window than
+    # national/market branches, which is a property of the topic, not the run.
+    freshness: Optional[str] = None
     children: List["Node"] = field(default_factory=list)
     parent: Optional["Node"] = None
 
     def is_leaf(self) -> bool:
         return not self.children
+
+    def as_query(self) -> "Query":
+        """Bind this node's query text to its retrieval parameters."""
+        return Query(self.query, freshness=self.freshness, node_id=self.id)
 
 
 class InterestGraph:
@@ -51,12 +82,25 @@ class InterestGraph:
     def collect_roots(self) -> List[str]:
         return [n.query for n in self.roots]
 
+    def collect_root_queries(self) -> List["Query"]:
+        """Root queries bound to their retrieval parameters."""
+        return [n.as_query() for n in self.roots]
+
     def leaves(self) -> List[Node]:
+        """
+        Dig candidates: leaf nodes below the roots.
+
+        A childless root is excluded -- it already fires every run as a
+        baseline query, so selecting it again would burn a dynamic slot and a
+        API call on a duplicate.
+        """
         out = []
+        root_ids = {id(r) for r in self.roots}
 
         def walk(node: Node) -> None:
             if not node.children:
-                out.append(node)
+                if id(node) not in root_ids:
+                    out.append(node)
             else:
                 for child in node.children:
                     walk(child)
@@ -91,10 +135,15 @@ def parse_graph(config: Dict[str, Any]) -> Optional[InterestGraph]:
 
 
 def _parse_node(cfg: Dict[str, Any], parent: Optional[Node] = None) -> Node:
+    # Freshness flows down the tree unless a node overrides it.
+    freshness = cfg.get("freshness")
+    if freshness is None and parent is not None:
+        freshness = parent.freshness
     node = Node(
         id=str(cfg.get("id", "")),
         query=str(cfg.get("query", "")),
         priority=float(cfg.get("priority", 1.0)),
+        freshness=str(freshness) if freshness else None,
         parent=parent,
     )
     for child_cfg in cfg.get("children", []) or []:
@@ -182,7 +231,7 @@ def generate_graph_queries(
     today_blogs: Optional[List[Dict[str, Any]]] = None,
     llm_client: Optional[Any] = None,
 ) -> List[str]:
-    roots = graph.collect_roots()
+    roots = graph.collect_root_queries()
     leaves = graph.leaves()
     if not leaves:
         return roots
@@ -200,4 +249,4 @@ def generate_graph_queries(
         "Interest graph: %d roots + %d dig queries (%d leaves available)",
         len(roots), len(selected), len(leaves),
     )
-    return roots + [n.query for n in selected]
+    return roots + [n.as_query() for n in selected]

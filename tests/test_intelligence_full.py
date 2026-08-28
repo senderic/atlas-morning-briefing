@@ -18,6 +18,7 @@ from scripts.intelligence import (
     SYSTEM_PROMPT,
     _parse_numbered_list,
     _sanitize_prompt_input,
+    _strip_trailing_rationale,
 )
 
 
@@ -89,6 +90,121 @@ class TestSanitizePromptInput:
 
     def test_keeps_normal_text(self):
         assert _sanitize_prompt_input("Plain text here") == "Plain text here"
+
+
+class TestStripTrailingRationale:
+    def test_strips_verbatim_leaked_rationale(self):
+        leaked = (
+            "Skim it to find the beach-adjacent events before they fill up. "
+            "Dropped: [1], [2], [7] (Mission Bay funding/planning/policy), "
+            "[3], [4] (opinion/climate commentary), [5] (injury story), "
+            "[6] (San Mateo County — wrong area), [8] (restaurant promo, no "
+            "event), [12] (La Jolla, outside the beach communities), "
+            "[17]/[19] (duplicates), [18] (covered by [9]/[10])."
+        )
+        result = _strip_trailing_rationale(leaked)
+        assert result == (
+            "Skim it to find the beach-adjacent events before they fill up."
+        )
+
+    def test_each_marker_variant_is_stripped(self):
+        for marker in (
+            "Dropped",
+            "Excluded",
+            "Omitted",
+            "Not selected",
+            "Rejected",
+            "Skipped",
+        ):
+            text = f"Good summary here. {marker}: [1], [2] for reasons."
+            assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_marker_is_case_insensitive(self):
+        text = "Good summary here. DROPPED: [1] (duplicate)."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_does_not_damage_legitimate_midsentence_dropped(self):
+        text = "Charges were dropped: the DA declined to file."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_does_not_touch_unrelated_use_of_dropped(self):
+        text = "Attendance dropped by half this year."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_empty_and_none_pass_through(self):
+        assert _strip_trailing_rationale("") == ""
+        assert _strip_trailing_rationale(None) is None
+
+    def test_text_without_marker_is_unchanged(self):
+        text = "A perfectly ordinary summary with no rationale tail."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_strips_verbatim_todays_leak(self):
+        # Verbatim text that shipped to a reader: same idea as "Dropped: ...",
+        # phrased differently, with a bulleted bracketed-index rationale list.
+        leaked = (
+            "The Union-Tribune's weekly roundup of upcoming street fairs, "
+            "festivals, concerts, art shows, and community meetings across "
+            "San Diego is the digest to check when scanning for PB-area "
+            "happenings. No specific events are listed in this item — it's "
+            "the recurring weekly guide, refreshed as dates firm up. "
+            "**The other 17 didn't qualify**, and it's worth saying why "
+            "rather than forcing eight: - **[1], [2], [5]** Mission Bay "
+            "restoration / rising-sea coverage — policy and news, no "
+            "upcoming event or meeting with a date. - **[3]** Lifeguard "
+            "internship injury — news, not a happening. - **[4]** New "
+            "beach park — on the San Mateo County coast, not San Diego. - "
+            "**[6]** Bahia Resort dining — hotel marketing, not an event "
+            "or an opening."
+        )
+        result = _strip_trailing_rationale(leaked)
+        assert result == (
+            "The Union-Tribune's weekly roundup of upcoming street fairs, "
+            "festivals, concerts, art shows, and community meetings across "
+            "San Diego is the digest to check when scanning for PB-area "
+            "happenings. No specific events are listed in this item — it's "
+            "the recurring weekly guide, refreshed as dates firm up."
+        )
+        assert "didn't qualify" not in result
+        assert "[1]" not in result
+
+    def test_strips_bare_bulleted_bracket_list_no_marker_phrase(self):
+        # The bulleted bracketed-index shape alone, with no marker word or
+        # phrase nearby, must still be cut -- it's the shape that's the tell.
+        text = (
+            "Good summary here.\n"
+            "- **[1], [2], [5]** Mission Bay restoration, policy and news."
+        )
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_bare_bulleted_bracket_list_plain_dash(self):
+        text = "Good summary here. - [3] Lifeguard internship injury, not a happening."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_bold_the_other_n_didnt_qualify(self):
+        text = "Good summary here. **The other 17 didn't qualify**, for reasons."
+        assert _strip_trailing_rationale(text) == "Good summary here."
+
+    def test_strips_each_new_marker_phrase(self):
+        cases = [
+            "Good summary here. The other 12 didn't qualify.",
+            "Good summary here. The other 3 did not qualify for inclusion.",
+            "Good summary here. Didn't qualify for inclusion.",
+            "Good summary here. Did not qualify due to missing dates.",
+            "Good summary here. Worth saying why: reasons follow.",
+        ]
+        for text in cases:
+            assert _strip_trailing_rationale(text) == "Good summary here.", text
+
+    def test_bracketed_citation_midsentence_is_not_truncated(self):
+        # A stray "[1]" mid-sentence, with no bullet-list shape, is legitimate
+        # prose (e.g. a footnote-style citation) and must survive untouched.
+        text = "See reference [1] for details on the matter at hand."
+        assert _strip_trailing_rationale(text) == text
+
+    def test_legitimate_summary_with_dash_but_no_brackets_untouched(self):
+        text = "Good summary here - no bracketed rationale in sight."
+        assert _strip_trailing_rationale(text) == text
 
 
 class TestParseNumberedList:
@@ -481,6 +597,21 @@ class TestRankAndSummarizeNews:
         # max_per_source=2 enforced
         assert len([r for r in result if r["source"] == "same"]) <= 2
 
+    def test_strips_leaked_rationale(self, intel, mock_client):
+        news = [{"title": "n1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = (
+            "[1] Real summary. Dropped: [2], [3] (not relevant)"
+        )
+        result = intel.rank_and_summarize_news(news, ["t"])
+        assert result[0]["brief_summary"] == "Real summary."
+
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        news = [{"title": "n1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] Real summary."
+        intel.rank_and_summarize_news(news, ["t"])
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
+
 
 # ---------- rank_and_summarize_blogs ----------
 
@@ -513,6 +644,108 @@ class TestRankAndSummarizeBlogs:
         # On total LLM failure, we still get top 5 with diversity enforced
         result = intel.rank_and_summarize_blogs(blogs, ["t"])
         assert len(result) <= 5
+
+    def test_strips_leaked_rationale(self, intel, mock_client):
+        blogs = [{"title": "b1", "source": "s", "summary": "s"}]
+        mock_client.invoke.return_value = (
+            "[1] SCORE:4/5 Real summary. Excluded: [2] (off topic)"
+        )
+        result = intel.rank_and_summarize_blogs(blogs, ["t"])
+        assert result[0]["brief_summary"] == "Real summary."
+
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        blogs = [{"title": "b1", "source": "s", "summary": "s"}]
+        mock_client.invoke.return_value = "[1] SCORE:4/5 Real summary."
+        intel.rank_and_summarize_blogs(blogs, ["t"])
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
+
+
+# ---------- rank_and_summarize_happenings ----------
+
+
+class TestRankAndSummarizeHappenings:
+    def test_unavailable_returns_items_unchanged(self, intel_unavailable):
+        happenings = [
+            {"title": f"h{i}", "source": "s", "description": f"desc{i}"}
+            for i in range(3)
+        ]
+        result = intel_unavailable.rank_and_summarize_happenings(happenings)
+        assert len(result) == 3
+        for i, item in enumerate(result):
+            assert item["brief_summary"] == f"desc{i}"
+
+    def test_empty_returns_empty(self, intel):
+        assert intel.rank_and_summarize_happenings([]) == []
+
+    def test_prompt_includes_todays_date(self, intel, mock_client):
+        from datetime import datetime
+
+        today_str = datetime.now().strftime("%B %d, %Y")
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert today_str in prompt
+
+    def test_prompt_instructs_dropping_past_events(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "already passed" in prompt
+        assert "never describe a past event as upcoming" in prompt
+
+    def test_strips_leaked_rationale_end_to_end(self, intel, mock_client):
+        happenings = [
+            {"title": "h1", "source": "s", "description": "d"},
+            {"title": "h2", "source": "s2", "description": "d2"},
+            {"title": "h3", "source": "s3", "description": "d3"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] Real summary. Dropped: [2], [3] (not events)"
+        )
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert len(result) == 1
+        assert result[0]["brief_summary"] == "Real summary."
+        assert "Dropped:" not in result[0]["brief_summary"]
+
+    def test_strips_bulleted_rationale_end_to_end(self, intel, mock_client):
+        # Reproduces the leak that shipped: the model returns a clean pick
+        # plus a trailing bulleted-bracketed-index rationale explaining what
+        # it rejected, phrased without any of the old "Dropped:"-style markers.
+        happenings = [
+            {"title": "h1", "source": "s", "description": "d"},
+            {"title": "h2", "source": "s2", "description": "d2"},
+            {"title": "h3", "source": "s3", "description": "d3"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] The weekly roundup is the digest to check, refreshed as "
+            "dates firm up. **The other 2 didn't qualify**, and it's worth "
+            "saying why: - **[2]** Lifeguard story — news, not a happening. "
+            "- **[3]** Restaurant promo — marketing, not an event."
+        )
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert len(result) == 1
+        assert result[0]["brief_summary"] == (
+            "The weekly roundup is the digest to check, refreshed as dates "
+            "firm up."
+        )
+        assert "didn't qualify" not in result[0]["brief_summary"]
+        assert "[2]" not in result[0]["brief_summary"]
+
+    def test_prompt_instructs_not_to_explain_exclusions(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "d"}]
+        mock_client.invoke.return_value = "[1] A happening summary."
+        intel.rank_and_summarize_happenings(happenings)
+        prompt = mock_client.invoke.call_args.args[0].lower()
+        assert "never explain, list, or justify" in prompt
+
+    def test_fallback_when_llm_returns_none(self, intel, mock_client):
+        happenings = [{"title": "h1", "source": "s", "description": "desc"}]
+        mock_client.invoke.return_value = None
+        result = intel.rank_and_summarize_happenings(happenings)
+        assert result[0]["brief_summary"] == "desc"
 
 
 # ---------- enforce_source_diversity ----------
@@ -669,6 +902,29 @@ class TestSynthesizeBriefing:
         )
         assert result == {}
 
+    def test_leaky_response_triggers_retry(self, intel, mock_client):
+        leaky = (
+            "Strict Grounding Verification**:\n"
+            "- Check verbatim entities/facts: every number cited.\n"
+        )
+        clean = "Today's briefing highlights X, Y, and Z."
+        mock_client.invoke.side_effect = [leaky, clean]
+        result = intel.synthesize_briefing(
+            papers=[{"title": "P1"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+        assert result["editorial_intro"] == clean
+        assert mock_client.invoke.call_count == 2
+        assert mock_client.invoke.call_args_list[0].kwargs.get("reasoning_enabled") is True
+        assert mock_client.invoke.call_args_list[1].kwargs.get("reasoning_enabled") is False
+
+    def test_leaky_then_leaky_returns_empty(self, intel, mock_client):
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        mock_client.invoke.side_effect = [leaky, leaky]
+        result = intel.synthesize_briefing(
+            papers=[{"title": "P1"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+        assert result == {}
+
 
 # ---------- detect_cross_source_signals ----------
 
@@ -772,6 +1028,25 @@ class TestGenerateWeeklyDeepDive:
     def test_llm_failure(self, intel, mock_client):
         mock_client.invoke.return_value = None
         assert intel.generate_weekly_deep_dive([{"date": "d", "title": "t"}]) == ""
+
+    def test_leaky_response_triggers_retry(self, intel, mock_client):
+        items = [{"date": "2026-05-19", "type": "paper", "title": "A"}]
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        clean = "Weekly synthesis: themes were X, Y, Z."
+        mock_client.invoke.side_effect = [leaky, clean]
+        result = intel.generate_weekly_deep_dive(items)
+        assert result == clean
+        assert mock_client.invoke.call_count == 2
+        # First call runs on the reasoning model by default (no override).
+        assert mock_client.invoke.call_args_list[0].kwargs.get("reasoning_enabled") is not False
+        assert mock_client.invoke.call_args_list[1].kwargs.get("reasoning_enabled") is False
+
+    def test_leaky_then_leaky_returns_empty(self, intel, mock_client):
+        items = [{"date": "2026-05-19", "type": "paper", "title": "A"}]
+        leaky = "Strict Grounding Verification:\n- Check verbatim entities/facts."
+        mock_client.invoke.side_effect = [leaky, leaky]
+        result = intel.generate_weekly_deep_dive(items)
+        assert result == ""
 
 
 # ---------- track_trending ----------
@@ -920,3 +1195,182 @@ class TestBriefingProfile:
             papers=[{"title": "P"}], blogs=[], stocks=[], news=[], top_papers=[]
         )
         assert "climate science" in self._prompt_arg(mock_client)
+
+
+# ---------- life-first priority ordering + actionable summaries ----------
+
+
+class TestBriefingPriorities:
+    """`briefing_profile.priorities` / `.actionable` steer ranking prompts."""
+
+    LIFE_FIRST = {
+        "domain": "San Diego neighborhood life",
+        "audience": "a Pacific Beach resident",
+        "actionable": True,
+        "priorities": [
+            "Daily life nearby: closures, events, outages.",
+            "Dated obligations: public comment, fee deadlines.",
+            "Investment and business angles. Secondary.",
+        ],
+    }
+
+    def _prompt_arg(self, mock_client):
+        call = mock_client.invoke.call_args
+        return call.args[0] if call.args else call.kwargs.get("prompt", "")
+
+    def _intel(self, mock_client, default_config, profile):
+        config = dict(default_config)
+        config["briefing_profile"] = profile
+        return BriefingIntelligence(mock_client, config)
+
+    def test_defaults_are_off(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        assert intel.briefing_priorities == []
+        assert intel.briefing_actionable is False
+        assert intel._priority_block() == ""
+        assert intel._actionability_note() == ""
+
+    def test_blank_priority_entries_dropped(self, mock_client, default_config):
+        intel = self._intel(
+            mock_client, default_config, {"priorities": ["  ", "Life first", ""]}
+        )
+        assert intel.briefing_priorities == ["Life first"]
+
+    def test_priorities_ordered_in_news_prompt(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
+        )
+        prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in prompt
+        life = prompt.index("1. Daily life nearby")
+        dated = prompt.index("2. Dated obligations")
+        money = prompt.index("3. Investment and business")
+        assert life < dated < money
+        assert "ACTIONABILITY:" in prompt
+
+    def test_priorities_in_blog_and_synthesis_prompts(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+
+        mock_client.invoke.return_value = "[1] SCORE:4/5 summary"
+        intel.rank_and_summarize_blogs(
+            [{"title": "T", "source": "S", "summary": "s"}], topics=["x"]
+        )
+        blog_prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in blog_prompt
+        assert "ACTIONABILITY:" in blog_prompt
+
+        mock_client.invoke.return_value = "out"
+        intel.synthesize_briefing(
+            papers=[], blogs=[], stocks=[], news=[{"title": "N"}], top_papers=[]
+        )
+        synth_prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" in synth_prompt
+        assert "1. Daily life nearby" in synth_prompt
+        assert "ACTIONABILITY:" in synth_prompt
+
+    def test_no_priority_block_without_config(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=["x"]
+        )
+        prompt = self._prompt_arg(mock_client)
+        assert "<priority_order>" not in prompt
+        assert "ACTIONABILITY:" not in prompt
+
+    def test_happenings_prompt_gets_actionability(self, mock_client, default_config):
+        intel = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_happenings(
+            [{"title": "Street fair", "source": "S", "description": "d"}]
+        )
+        assert "ACTIONABILITY:" in self._prompt_arg(mock_client)
+
+    def test_rank_directive_defers_to_priority_order(self, mock_client, default_config):
+        plain = BriefingIntelligence(mock_client, default_config)
+        assert plain._rank_directive() == "Rank by importance."
+        ranked = self._intel(mock_client, default_config, self.LIFE_FIRST)
+        assert ranked._rank_directive() == (
+            "Rank by the priority order above, then by importance."
+        )
+
+
+class TestRankingInterests:
+    """News/blog ranking falls back to interest_profile when no arxiv topics."""
+
+    def test_uses_topics_when_present(self, intel):
+        assert intel._ranking_interests(["Agents", "Evals"]) == ["Agents", "Evals"]
+
+    def test_caps_topics_at_five(self, intel):
+        assert intel._ranking_interests([f"t{i}" for i in range(9)]) == [
+            f"t{i}" for i in range(5)
+        ]
+
+    def test_falls_back_to_interest_profile_by_weight(self, mock_client):
+        config = {
+            "arxiv_topics": [],
+            "interest_profile": [
+                {"topic": "Investment angles", "weight": 0.4},
+                {"topic": "Road closures nearby", "weight": 0.96},
+                {"topic": "Local events", "weight": 0.98},
+            ],
+        }
+        intel = BriefingIntelligence(mock_client, config)
+        assert intel._ranking_interests([]) == [
+            "Local events",
+            "Road closures nearby",
+            "Investment angles",
+        ]
+
+    def test_empty_when_nothing_configured(self, mock_client):
+        intel = BriefingIntelligence(mock_client, {})
+        assert intel._ranking_interests([]) == []
+
+    def test_local_profile_reaches_news_prompt(self, mock_client):
+        config = {
+            "arxiv_topics": [],
+            "interest_profile": [
+                {"topic": "Beach water quality advisories", "weight": 0.94},
+                {"topic": "Commercial real estate deals", "weight": 0.38},
+            ],
+        }
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "[1] summary"
+        intel.rank_and_summarize_news(
+            [{"title": "T", "source": "S", "description": "d"}], topics=[]
+        )
+        call = mock_client.invoke.call_args
+        prompt = call.args[0] if call.args else call.kwargs.get("prompt", "")
+        assert "Beach water quality advisories" in prompt
+
+
+class TestSourceDiversityConfig:
+    """The per-outlet cap is config-driven (a small local press corps needs slack)."""
+
+    def _articles(self, n=5, source="sandiegouniontribune.com"):
+        return [
+            {"title": f"Story {i}", "source": source, "description": "d"}
+            for i in range(n)
+        ]
+
+    def test_defaults_to_two(self, mock_client, default_config):
+        intel = BriefingIntelligence(mock_client, default_config)
+        assert intel.max_per_source == 2
+
+    def test_reads_config(self, mock_client, default_config):
+        config = dict(default_config)
+        config["source_diversity"] = {"max_per_source": 3}
+        intel = BriefingIntelligence(mock_client, config)
+        assert intel.max_per_source == 3
+
+    def test_cap_applied_to_news_ranking(self, mock_client, default_config):
+        config = dict(default_config)
+        config["source_diversity"] = {"max_per_source": 3}
+        intel = BriefingIntelligence(mock_client, config)
+        mock_client.invoke.return_value = "\n".join(
+            f"[{i + 1}] summary {i}" for i in range(5)
+        )
+        result = intel.rank_and_summarize_news(self._articles(), topics=["x"])
+        assert len(result) == 3

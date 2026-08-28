@@ -298,3 +298,46 @@ class TestStatusFileIsPerPipeline:
         assert saved["papers_found"] == 172, "local run clobbered the main run"
         assert saved["pipeline"] == "main"
         assert json.loads((tmp_path / "status-local.json").read_text())["pipeline"] == "local"
+
+
+class TestSharedChainBuilder:
+    """The runner and the quality checker must not drift on backend order.
+
+    They each built their own chain, and did drift: quality_check kept
+    opencode (paid) first long after the runner moved to openrouter (free)
+    first, so every daily quality run billed the paid backstop.
+    """
+
+    def _config(self, minimal_config, **over):
+        cfg = dict(minimal_config)
+        cfg.update({
+            "openrouter": {"enabled": True, "api_key": "k"},
+            "gemini": {"enabled": False},
+            "opencode": {"enabled": True},
+        })
+        cfg.update(over)
+        return cfg
+
+    def test_runner_and_quality_check_agree_on_order(self, minimal_config):
+        from scripts.llm_chain import build_llm_chain
+        from scripts.quality_check import build_llm_client
+
+        cfg = self._config(minimal_config)
+        expected = [type(c).__name__ for c in build_llm_chain(cfg)]
+        judge = build_llm_client(cfg)
+        actual = [type(c).__name__ for c in getattr(judge, "clients", [judge])]
+        assert actual == expected
+
+    def test_quality_judge_puts_free_before_paid(self, minimal_config):
+        from scripts.quality_check import build_llm_client
+
+        judge = build_llm_client(self._config(minimal_config))
+        names = [type(c).__name__ for c in getattr(judge, "clients", [judge])]
+        assert names.index("OpenRouterClient") < names.index("OpencodeClient")
+
+    def test_quality_judge_returns_none_when_nothing_enabled(self, minimal_config):
+        from scripts.quality_check import build_llm_client
+
+        cfg = self._config(minimal_config, openrouter={"enabled": False},
+                           opencode={"enabled": False}, gemini={"enabled": False})
+        assert build_llm_client(cfg) is None

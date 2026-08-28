@@ -31,6 +31,7 @@ briefings/
 .local-state.json
 state.json
 status.json
+status-*.json
 blogs.json
 news.json
 papers.json
@@ -47,6 +48,11 @@ logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl
 logs/gemini-audit-*.txt
+# Quality-check run artifacts (scripts/quality_check.py)
+logs/source-health.jsonl
+logs/quality-scores.jsonl
+logs/quality-alerts.json
+logs/quality-digest-*.md
 logs/local-gemini-calls.jsonl
 
 # IDE and Tools
