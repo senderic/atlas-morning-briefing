@@ -1323,6 +1323,7 @@ class TestConfigDrivenJudgeDimensions:
             **_no_op_layer2(),
             build_client=lambda config: shared_client,
             score_history_loader=lambda pipeline, path=None: [],
+            scores_path=str(tmp_path / "scores.jsonl"),
         )
 
         assert set(scores["atlas"]["scores"]) == set(self.FOUR)

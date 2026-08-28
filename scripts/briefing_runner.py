@@ -45,6 +45,7 @@ from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
+from scripts.event_dates import has_only_past_dates
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
@@ -435,7 +436,7 @@ class BriefingRunner:
                 "Fetching fresh happenings (fetch weekday=%s, today=%s)",
                 fetch_weekday, today.weekday(),
             )
-            fetched = self.run_happenings_aggregation()
+            fetched = self._drop_past_happenings(self.run_happenings_aggregation())
             if fetched:
                 self._happenings_cache = list(fetched)
                 self._happenings_cache_date = today.strftime("%Y-%m-%d")
@@ -445,7 +446,9 @@ class BriefingRunner:
                 )
                 return fetched
             logger.warning("Happenings fetch returned empty, falling back to cache")
-        cached = previous_state.get("cached_happenings", [])
+        cached = self._drop_past_happenings(
+            previous_state.get("cached_happenings", [])
+        )
         if cached:
             cache_date = previous_state.get("cached_happenings_date", "unknown")
             logger.info(
@@ -459,6 +462,45 @@ class BriefingRunner:
             return list(cached)
         logger.info("No happenings cache available and today is not fetch day")
         return []
+
+    def _drop_past_happenings(
+        self, happenings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Remove happenings whose every calendar date has already passed.
+
+        Happenings are cached between fetch days, so by the end of the window
+        the cache can still be advertising last weekend. On 2026-08-28 the
+        local briefing led with three "Aug. 21-23 this weekend" items — a week
+        past — because the cache was only refreshed on Saturdays.
+
+        A shorter cache window narrows this but cannot close it: a Thursday
+        fetch still serves Saturday, and Brave's ``pw`` freshness returns
+        results from the past week by design. So the dates are checked at use
+        time rather than trusted to be fresh.
+
+        Undated items are kept: a venue's standing events calendar or a rule
+        change ("volleyball can now begin at 6 a.m.") is not stale for lacking
+        a day. Ranges are judged by when they end.
+        """
+        if not happenings:
+            return happenings
+        today = datetime.now().date()
+        kept, dropped = [], []
+        for item in happenings:
+            text = " ".join(
+                str(item.get(field, ""))
+                for field in ("title", "description", "age")
+            )
+            if has_only_past_dates(text, today):
+                dropped.append(item.get("title", "")[:80])
+            else:
+                kept.append(item)
+        if dropped:
+            logger.info(
+                "Dropped %d happening(s) whose dates have passed: %s",
+                len(dropped), "; ".join(dropped),
+            )
+        return kept
 
     def score_papers(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Score and rank papers."""

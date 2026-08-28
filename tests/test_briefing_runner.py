@@ -341,3 +341,69 @@ class TestSharedChainBuilder:
         cfg = self._config(minimal_config, openrouter={"enabled": False},
                            opencode={"enabled": False}, gemini={"enabled": False})
         assert build_llm_client(cfg) is None
+
+
+class TestHappeningsStalenessFilter:
+    """Cached happenings must not advertise events that have already passed.
+
+    On 2026-08-28 the local briefing led with three "Aug. 21-23 this weekend"
+    items — a week past — because the cache refreshed only on Saturdays.
+    A shorter cache window narrows the gap but cannot close it, so dates are
+    checked at use time.
+    """
+
+    def _runner(self, minimal_config):
+        return BriefingRunner(config=minimal_config, dry_run=True)
+
+    def test_drops_items_whose_dates_have_passed(self, minimal_config, monkeypatch):
+        import scripts.briefing_runner as br
+        from datetime import datetime as real_dt
+
+        class _Now(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 8, 28)
+
+        monkeypatch.setattr(br, "datetime", _Now)
+        items = [
+            {"title": "Weekend roundup", "description": "Events Aug. 21-23 citywide."},
+            {"title": "Farmers market", "description": "Market on Aug. 26, 9:30 a.m."},
+        ]
+        assert self._runner(minimal_config)._drop_past_happenings(items) == []
+
+    def test_keeps_future_and_undated_items(self, minimal_config, monkeypatch):
+        import scripts.briefing_runner as br
+        from datetime import datetime as real_dt
+
+        class _Now(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 8, 28)
+
+        monkeypatch.setattr(br, "datetime", _Now)
+        items = [
+            {"title": "Labor Day fest", "description": "Runs Aug 30-Sep 2."},
+            {"title": "Volleyball rule", "description": "Play can now begin at 6 a.m."},
+            {"title": "City events calendar", "description": "Standing listing."},
+        ]
+        kept = self._runner(minimal_config)._drop_past_happenings(items)
+        assert [i["title"] for i in kept] == [
+            "Labor Day fest", "Volleyball rule", "City events calendar",
+        ]
+
+    def test_range_is_judged_by_its_end_date(self, minimal_config, monkeypatch):
+        import scripts.briefing_runner as br
+        from datetime import datetime as real_dt
+
+        class _Now(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 8, 28)
+
+        monkeypatch.setattr(br, "datetime", _Now)
+        # Starts in the past, still running today -> keep.
+        items = [{"title": "Fair", "description": "Runs Aug 25-30."}]
+        assert len(self._runner(minimal_config)._drop_past_happenings(items)) == 1
+
+    def test_empty_input_is_passed_through(self, minimal_config):
+        assert self._runner(minimal_config)._drop_past_happenings([]) == []
