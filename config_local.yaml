@@ -3,6 +3,11 @@
 # Run with: python3 scripts/briefing_runner.py --config config_local.yaml
 
 # --- Pipeline identity ---
+# Own status file: run_briefing.sh runs this pipeline ~15 min after the main
+# one, and a shared status.json means the second run erases the first's counters.
+status_file_path: "status-local.json"
+pipeline_name: "local"
+
 state_file_path: ".local-state.json"
 briefing_title: "San Diego Local News Briefing"
 file_naming: "Local-Briefing-{yyyy}.{mm}.{dd}"
@@ -182,6 +187,23 @@ max_blogs: 8
 max_news: 15
 arxiv_days_back: 3
 
+# ArXiv fetch behaviour (legacy export.arxiv.org path).
+#
+# Topics are scanned SEQUENTIALLY, matching upstream. This used to run 8
+# topics concurrently, which exceeds what export.arxiv.org tolerates: a run on
+# 2026-08-27 lost 20/20 topic searches to 429s and read timeouts and shipped a
+# briefing with no papers at all. ArXiv's terms ask for ~1 request per 3s.
+arxiv_request_delay: 3.0
+#
+# Wrap multi-word topics in quotes for an exact phrase match. Upstream does
+# this by default; measured against the live API on 2026-08-28 it returned 0
+# papers for 7 of the 9 multi-word topics above (at 3 and at 14 days back),
+# because these topics are conceptual descriptions rather than literal
+# phrases. Recall is preferable here since TF-IDF scoring and the interest
+# profile already cull irrelevant hits. Turn on only if your topics are
+# literal phrases that appear verbatim in paper text.
+arxiv_exact_phrase: false
+
 # --- Concurrency ---
 max_workers: 6
 
@@ -215,43 +237,102 @@ gemini:
     light: "flash-lite"
 
 opencode:
-  enabled: false
+  # LAST-RESORT PAID BACKSTOP. Reached only after every free OpenRouter model
+  # for the tier has failed (see llm.backend_priority below), so in a normal
+  # run this costs nothing.
+  #
+  # The models here are the PAID `opencode-go` ones, not the `opencode/*-free`
+  # ones. The free opencode models answer a trivial preflight ping but stall on
+  # real briefing prompts, which is what made them useless as a safety net.
+  # Verified 2026-08-27: deepseek-v4-pro 14s, deepseek-v4-flash 8s,
+  # glm-5.3-flash 21s on a real ranking prompt.
+  enabled: true
   models:
-    heavy: "opencode/nemotron-3-ultra-free"
-    medium: "opencode/deepseek-v4-flash-free"
-    light: "opencode/deepseek-v4-flash-free"
+    heavy: "opencode-go/deepseek-v4-pro"
+    medium: "opencode-go/minimax-m3"
+    light: "opencode-go/qwen3.6-plus"
+  # One fallback per tier, degrading down a weight class, never up.
   fallback_models:
-    heavy: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
-    medium: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
-    light: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
-  max_calls_per_run: 50
-  timeout: 120
+    heavy: ["opencode-go/glm-5.3-flash"]
+    medium: ["opencode-go/mimo-v2.5"]
+    light: ["opencode-go/mimo-v2.5"]
+  # Small budget on purpose: this tier is an emergency backstop, and capping it
+  # bounds what a bad day can cost.
+  max_calls_per_run: 20
+  # Do not probe this backend at 5:45 AM: it is paid, and the probe would be
+  # the only call that ever bills it on a healthy day.
+  preflight_check: false
+  # TIMEOUT BUDGET — must fit inside composite.timeout_seconds below.
+  # The composite gives each backend one window for its ENTIRE internal chain,
+  # so worst case = timeout x (1 + max_retries) x models-in-chain. At the old
+  # 300s/2-retries/3-models it needed 2730s against a 400s window and was
+  # killed after a single attempt, meaning the backstop could never actually
+  # serve a request. Now: 150 x 1 x 2 = 300s, inside the 350s window.
+  # Retries are 0 deliberately — a last resort should fail fast to the next
+  # model rather than burn the window retrying a stalled one.
+  timeout: 150
+  max_retries_per_model: 0
+  # Estimated DeepSeek V4 Flash paid rates, used for the usage-summary footer.
   pricing:
     input_per_million: 0.14
     output_per_million: 0.28
 
+# LLM backend order: tried front to back, so free backends come first and the
+# paid opencode-go backstop is last. A backend that is disabled is skipped.
+llm:
+  backend_priority: ["openrouter", "gemini", "opencode"]
+
+# OpenRouter configuration (OpenAI-compatible API) — the PRIMARY backend.
+# Requires an API key: OPENROUTER_API_KEY or OPENAI_API_KEY (pointing at
+# OpenRouter) in the environment.
 openrouter:
   enabled: true
   api_base: "https://openrouter.ai/api/v1/chat/completions"
+  # Tier ladder. Verified free + reachable on 2026-08-27 against this account.
+  # Keep it monotonic: heavy > medium > light in both size and context window.
+  # Fallbacks may only degrade DOWN a tier, never up, so a heavy prompt never
+  # silently lands on a light model.
   models:
-    heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
-    medium: "openrouter/minimax/minimax-m3:free"
-    light: "openrouter/minimax/minimax-m3:free"
+    heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"      # 550B, 1M ctx
+    medium: "openrouter/minimax/minimax-m3:free"                    # 1M ctx, no reasoning tax
+    light: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # 120B-A12B, 262k ctx
   fallback_models:
-    heavy: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
-    medium: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
-    light: ["openrouter/z-ai/glm-5.2:free", "openrouter/openrouter/free"]
+    heavy: ["openrouter/dots-studio/dots-3-note-preview:free", "openrouter/minimax/minimax-m3:free"]
+    medium: ["openrouter/nvidia/nemotron-3-super-120b-a12b:free", "openrouter/dots-studio/dots-3-note-preview:free"]
+    light: ["openrouter/cohere/north-mini-code:free", "openrouter/minimax/minimax-m3:free"]
+  # NOT in the roster, and why (re-verify before re-adding):
+  #   z-ai/glm-5.2:free                  persistently 429 "rate-limited upstream"
+  #   google/gemma-4-*:free              404, blocked by this account's data policy
+  #   nvidia/nemotron-3.5-lightning:free 400 "DEGRADED function cannot be invoked"
+  #   thinkingmachines/inkling*:free     403, agentic harnesses only
+  #   openrouter/auto                    NOT free — it is the paid auto-router
+  #   openrouter/free                    free, but an auto-router: it picks its
+  #                                      own model, which defeats tier pinning
   max_calls_per_run: 100
-  timeout: 120
+  # Simultaneous in-flight requests. The runner enriches sections in parallel
+  # (max_workers), so this is the real throttle on the free tier: 6 concurrent
+  # requests all succeeded, 12 produced silent empty bodies.
+  max_concurrent_requests: 4
+  # TIMEOUT BUDGET — must fit inside composite.timeout_seconds.
+  # Worst case = timeout x (1 + max_retries_per_model) x models-in-chain
+  #            = 75 x 2 x 3 = 450s, inside the 500s window.
+  # Real responses land in 3-25s; the retry exists for the transient upstream
+  # 502s these free endpoints return inside an HTTP 200 body.
+  timeout: 75
+  max_retries_per_model: 1
   max_tokens: 4096
   temperature: 0.3
+  # All models above are `:free`, so the run should bill $0.00. The usage
+  # summary reports the API's own cost field and flags any non-zero value.
   pricing:
-    input_per_million: 0.25
-    output_per_million: 0.75
+    input_per_million: 0.0
+    output_per_million: 0.0
 
 # LLM fallback chain tuning
 composite:
-  timeout_seconds: 240
+  timeout_seconds: 500
 
+# Amazon Bedrock configuration
+# Set enabled: false to run in deterministic mode (no LLM, zero cost)
 bedrock:
   enabled: false

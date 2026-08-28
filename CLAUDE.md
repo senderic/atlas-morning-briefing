@@ -32,7 +32,16 @@ There is no separate lint step; the project follows PEP 8 + type hints by conven
 
 These are the things that mislead a fresh reader of this repo:
 
-1. **The LLM backend is the Gemini CLI, not Amazon Bedrock.** The README and CHANGELOG are written around Amazon Bedrock, but the *active* pipeline (`briefing_runner.py` → `intelligence.py`) drives an external **Gemini CLI binary** through `scripts/gemini_client.py` (`GeminiCLIClient`). `config.yaml` has `bedrock.enabled: false` and `gemini.enabled: true`. Treat the README's Bedrock framing as aspirational/legacy. `scripts/bedrock_client.py` is only wired into the *experimental* v2 runner (below).
+1. **The LLM backend is OpenRouter free models, not Amazon Bedrock and no longer the Gemini CLI.** The README and CHANGELOG are written around Amazon Bedrock; treat that framing as aspirational/legacy (`scripts/bedrock_client.py` is only wired into the *experimental* v2 runner, below). The *active* chain is built in `briefing_runner.py` from `llm.backend_priority`, default `["openrouter", "gemini", "opencode"]`, and wrapped in a `CompositeClient` that tries each backend in order:
+   - **`openrouter` (primary, free).** `scripts/openrouter_client.py` calls OpenRouter's HTTP API with a per-tier roster of `:free` models. A healthy run bills **$0.00**, and the usage summary flags it loudly if it doesn't.
+   - **`gemini` (disabled).** `config.yaml` has `gemini.enabled: false`.
+   - **`opencode` (last-resort, PAID).** `scripts/opencode_client.py` shells out to the `opencode` CLI using `opencode-go/*` models. Reached only when every free model for the tier has failed.
+
+   **Order is cost — free first, paid last.** If you add a backend, put it in `llm.backend_priority` deliberately.
+
+   Two rules the model roster must keep: tiers are **distinct and monotonic** (heavy > medium > light in size and context window), and a tier's fallbacks may only **degrade down** a tier, never up. `config/model_capabilities.yaml` records per-model reasoning control; on OpenRouter the only parameter that actually suppresses reasoning tokens is `reasoning: {enabled: false}` — `reasoning_effort` is accepted but is a no-op.
+
+   **Every backend's internal retry+fallback chain must fit inside `composite.timeout_seconds`.** The composite gives each backend ONE window for its whole chain, so a backend whose worst case (`timeout x (1 + max_retries_per_model) x models-in-chain`) exceeds that window is killed mid-chain on every call and can silently never serve a request. `CompositeClient` logs a warning at startup when this is violated — do not ignore it.
 
 2. **Two orchestrators exist.** `scripts/briefing_runner.py` is the **v0.1 single-pass runner — this is the one in use** (referenced by `run_briefing.sh`, the `morning-briefing` entry point, and all the `tests/test_briefing_runner*.py`). `scripts/briefing_runner_v2.py` is an **experimental** coordinator + parallel-workers redesign (`scripts/workers/`) still wired to `BedrockClient`. Don't assume changes to one apply to the other.
 
@@ -58,13 +67,17 @@ load .atlas-state.json (cross-day memory)
   → write status.json + .atlas-state.json (incl. accumulated weekly_items)
 ```
 
-Every `[LLM]` step has a **deterministic fallback** — when the Gemini CLI is unavailable (`intelligence.available is False`), the pipeline still fetches, scores papers via TF-IDF (`paper_scorer.py`), and delivers. Preserving this graceful degradation is a hard requirement (see `GEMINI.md`).
+Every `[LLM]` step has a **deterministic fallback** — when no LLM backend is available (`intelligence.available is False`), the pipeline still fetches, scores papers via TF-IDF (`paper_scorer.py`), and delivers. Preserving this graceful degradation is a hard requirement (see `GEMINI.md`).
+
+**ArXiv is scanned sequentially and paced** (`arxiv_request_delay`, default 3s), matching upstream. It briefly ran 8 topics concurrently, which exceeds what `export.arxiv.org` tolerates — 20/20 topic searches failed with 429s and the briefing shipped with no papers. Don't reintroduce a thread pool there.
 
 **Module map (`scripts/`):**
 - `briefing_runner.py` — orchestrator, dedup logic, markdown generation, state I/O, CLI (`--config` required, `--dry-run`, `--log-level`).
 - `intelligence.py` — `BriefingIntelligence`: all prompts and LLM-powered features; `_sanitize_prompt_input()` strips injection markers before embedding external text in prompts.
 - `gemini_client.py` — `GeminiCLIClient`: tiered model dispatch (`heavy=pro`, `medium=flash`, `light=flash-lite`), retry/key-rotation, per-call cost logging to `logs/gemini-calls.jsonl`, and **dual-binary support** via `BINARY_PROFILES` (`gemini` and `agy`/Antigravity). Auto-detect prefers `gemini`; `agy` is opt-in via `gemini.cli_binary: "agy"`. See `MIGRATION_PLAN_ANTIGRAVITY.md` for why `agy` is not cron-viable (OAuth-only in 1.0.1).
 - `arxiv_scanner.py` — `create_scanner()` factory returns DeepXiv SDK scanner (semantic search) with automatic fallback to the legacy `ArxivScanner` (ArXiv API) when `deepxiv-sdk` is absent.
+- `llm_client.py` — `BaseLLMClient` interface + `ReasoningControlMixin` (capability lookup, CoT-leakage detection). `composite_client.py` — ordered multi-backend fallback with a per-backend timeout and the startup budget guard. `openrouter_client.py` / `opencode_client.py` — the two live backends. `llm_errors.py` — shared `classify_error()` (`"fallback"` vs `"retry"`).
+- `preflight_model_check.py` — probes the tiered roster before the run and writes `.model-availability.json`, which the runner uses to pin a per-tier model (ignored if older than 6h). It reads the roster **from config**, never a local table, and a tier's result may only name a model from that tier's own chain. Backends with `preflight_check: false` (the paid one) are skipped.
 - `blog_scanner.py`, `stock_fetcher.py` (Finnhub), `news_aggregator.py` (Brave) — data collectors.
 - `paper_scorer.py` — deterministic TF-IDF scoring: `has_code×7 + topic_match×3 + recency×2 + citation×1`, minus infra/theory penalties.
 - `pdf_generator.py` (ReportLab, Kindle 6×8"), `epub_generator.py`, `email_distributor.py` (SMTP, nh3-sanitized HTML, masks addresses in logs).

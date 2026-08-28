@@ -2,6 +2,15 @@
 # Defines reasoning control capabilities for each model.
 # Used by OpencodeClient and OpenRouterClient to apply reasoning control
 # without hardcoding model-specific logic.
+#
+# OpenRouter note: the only parameter that ACTUALLY suppresses reasoning tokens
+# is `reasoning: {enabled: false}`. `reasoning_effort: minimal` is accepted but
+# is a no-op on every free model tested (2026-08-27) — reasoning tokens are
+# still emitted and still consume max_tokens. Do not use it.
+#
+# Models whose endpoint rejects reasoning suppression ("Reasoning is mandatory
+# for this endpoint and cannot be disabled", HTTP 400) are marked
+# supports_reasoning_control: false so the client never sends the parameter.
 
 model_capabilities:
   # ===== opencode models =====
@@ -59,74 +68,135 @@ model_capabilities:
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  # --- opencode-go: the PAID last-resort backstop tier ---
+  # `--variant minimal` is verified against the opencode CLI (opencode run
+  # --help lists it as provider-specific reasoning effort).
+  opencode-go/deepseek-v4-pro:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode-go/deepseek-v4-flash:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode-go/glm-5.3:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode-go/glm-5.3-flash:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode-go/minimax-m3:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  opencode-go/mimo-v2.5:
+    supports_reasoning_control: true
+    reasoning_control_method: "cli_flag"
+    cli_flag_name: "variant"
+    cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
   # ===== openrouter models =====
+  # --- heavy tier ---
   openrouter/nvidia/nemotron-3-ultra-550b-a55b:free:
     supports_reasoning_control: true
     reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 
-  openrouter/nvidia/nemotron-3.5-lightning:free:
+  openrouter/dots-studio/dots-3-note-preview:free:
     supports_reasoning_control: true
     reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  # --- medium tier ---
   openrouter/minimax/minimax-m3:free:
     supports_reasoning_control: true
     reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  # --- light tier ---
+  openrouter/nvidia/nemotron-3-super-120b-a12b:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/cohere/north-mini-code:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # --- reasoning cannot be disabled on these endpoints (HTTP 400) ---
+  # Kept for reference so nobody re-adds the parameter.
   openrouter/minimax/minimax-m2.7:free:
-    supports_reasoning_control: true
-    reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
-    known_cot_leakage: false
-    non_reasoning_variant: null
-
-  openrouter/z-ai/glm-5.2:free:
-    supports_reasoning_control: true
-    reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
-    known_cot_leakage: false
-    non_reasoning_variant: null
-
-  openrouter/google/gemma-4-31b-it:free:
     supports_reasoning_control: false
     reasoning_control_method: "none"
     known_cot_leakage: false
     non_reasoning_variant: null
 
   openrouter/openrouter/free:
-    supports_reasoning_control: true
-    reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  openrouter/inclusionai/ling-3.0-flash-fin:free:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # --- paid fallbacks (only reached if every free model fails) ---
   openrouter/deepseek/deepseek-v4-pro:
     supports_reasoning_control: true
     reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 
   openrouter/deepseek/deepseek-chat:
     supports_reasoning_control: true
     reasoning_control_method: "api_param"
-    api_param_name: "reasoning_effort"
-    api_param_value: "minimal"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 

@@ -36,6 +36,44 @@ class CompositeClient(BaseLLMClient):
         # that a quota-exhausted / hanging client can't stall the run).
         self._timeout = timeout if timeout is not None else 240.0
         self._served_by: List[str] = []  # which client last handled each call
+        self._warn_if_budgets_exceed_timeout()
+
+    def _warn_if_budgets_exceed_timeout(self) -> None:
+        """Warn when a backend cannot finish its own chain inside its window.
+
+        Each backend gets ONE window for its entire internal retry+fallback
+        chain. A backend whose worst case exceeds that window is killed
+        mid-chain on every call, so a configured fallback backend can silently
+        never serve a single request — which is exactly how the paid backstop
+        was found to be dead on arrival.
+        """
+        for client in self.clients:
+            worst = self._worst_case_seconds(client)
+            if worst is None or worst <= self._timeout:
+                continue
+            logger.warning(
+                "Composite: %s needs up to %.0fs for its full model chain but the "
+                "per-backend timeout is %.0fs — it will be cut off mid-chain and "
+                "may never serve a request. Lower its timeout/max_retries or raise "
+                "composite.timeout_seconds.",
+                type(client).__name__, worst, self._timeout,
+            )
+
+    @staticmethod
+    def _worst_case_seconds(client: BaseLLMClient) -> Optional[float]:
+        """Estimate a backend's worst-case wall time for one invoke()."""
+        per_call = getattr(client, "_timeout", None)
+        if not per_call:
+            return None
+        retries = getattr(client, "max_retries", 0) or 0
+        models = getattr(client, "models", None)
+        fallbacks = getattr(client, "fallback_models", None) or {}
+        if not isinstance(models, dict):
+            return None
+        longest_chain = 1 + max(
+            (len(fallbacks.get(tier, [])) for tier in models), default=0
+        )
+        return per_call * (1 + retries) * longest_chain
 
     @property
     def available(self) -> bool:

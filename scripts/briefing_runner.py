@@ -103,46 +103,57 @@ class BriefingRunner:
         # Chain: opencode/DeepSeek first (its own per-tier fallbacks run
         # internally), then the Gemini CLI, then OpenRouter as fallbacks when
         # the respective backends are enabled.
-        
-        # Load preflight model availability results
-        preflight_path = Path(".model-availability.json")
-        preflight_data = {}
-        if preflight_path.exists():
-            try:
-                with open(preflight_path) as f:
-                    preflight_data = json.load(f)
-                logger.info(f"Loaded preflight model availability: {preflight_path}")
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Failed to load preflight data: {e}")
-        else:
-            logger.info("No preflight model availability data found, using config defaults")
-        
-        # Extract preflight models for each provider
+
+        preflight_data = self._load_preflight_models()
         opencode_preflight = preflight_data.get("opencode", {})
         openrouter_preflight = preflight_data.get("openrouter", {})
-        
+
         gemini_config = config.get("gemini", config.get("bedrock", {}))
         openrouter_config = config.get("openrouter", {})
 
-        # Build the backend chain from every enabled provider, in priority
-        # order: opencode, then Gemini CLI, then OpenRouter. Any disabled
-        # backend is skipped, so disabling opencode makes OpenRouter (or
-        # Gemini) the primary rather than dropping back to a lone Gemini.
+        # Build the backend chain from every enabled provider. Order matters:
+        # the chain is tried front to back, so the cheapest backend goes first
+        # and any paid one goes LAST, reached only when every free model in
+        # front of it has failed. Disabled backends are skipped, so the next
+        # one in the list simply becomes primary.
         from scripts.composite_client import CompositeClient
         from scripts.opencode_client import OpencodeClient
         from scripts.openrouter_client import OpenRouterClient
 
-        chain: List[BaseLLMClient] = []
-        if config.get("opencode", {}).get("enabled"):
-            chain.append(OpencodeClient(
-                config.get("opencode", {}), preflight_models=opencode_preflight
-            ))
-        if gemini_config.get("enabled"):
-            chain.append(GeminiCLIClient(gemini_config))
-        if openrouter_config.get("enabled"):
-            chain.append(OpenRouterClient(
+        builders = {
+            "openrouter": lambda: OpenRouterClient(
                 openrouter_config, preflight_models=openrouter_preflight
-            ))
+            ),
+            "gemini": lambda: GeminiCLIClient(gemini_config),
+            "opencode": lambda: OpencodeClient(
+                config.get("opencode", {}), preflight_models=opencode_preflight
+            ),
+        }
+        enabled = {
+            "openrouter": bool(openrouter_config.get("enabled")),
+            "gemini": bool(gemini_config.get("enabled")),
+            "opencode": bool(config.get("opencode", {}).get("enabled")),
+        }
+        priority = config.get("llm", {}).get(
+            "backend_priority", ["openrouter", "gemini", "opencode"]
+        )
+        unknown = [name for name in priority if name not in builders]
+        if unknown:
+            logger.warning("Ignoring unknown llm.backend_priority entries: %s", unknown)
+        # Any backend omitted from the priority list still runs, appended last,
+        # so a typo in config cannot silently drop a configured backend.
+        ordered = [n for n in priority if n in builders]
+        ordered += [n for n in builders if n not in ordered]
+
+        chain: List[BaseLLMClient] = []
+        for name in ordered:
+            if enabled[name]:
+                chain.append(builders[name]())
+        if chain:
+            logger.info(
+                "LLM backend chain (first tried to last): %s",
+                " -> ".join(type(c).__name__ for c in chain),
+            )
 
         if not chain:
             # No LLM backend enabled at all — deterministic mode.
@@ -196,11 +207,13 @@ class BriefingRunner:
 
             # create_scanner picks DeepXivScanner when the SDK is installed
             # (auto-registers a free token on first use) and falls back to
-            # our parallel defusedxml ArxivScanner otherwise.
+            # our sequential defusedxml ArxivScanner otherwise.
             scanner = create_scanner(
                 topics=topics,
                 days_back=days_back,
                 max_results=max_papers,
+                request_delay=self.config.get("arxiv_request_delay"),
+                exact_phrase=self.config.get("arxiv_exact_phrase", False),
             )
             papers = scanner.scan_all_topics()
             self.status["papers_found"] = len(papers)
@@ -713,6 +726,59 @@ class BriefingRunner:
 
         return "".join(md)
 
+    # Preflight results older than this are ignored: a stale file would pin a
+    # model chosen for yesterday's conditions, and the whole point of the check
+    # is that free-model availability changes hour to hour.
+    PREFLIGHT_MAX_AGE_SECONDS = 6 * 3600
+
+    def _load_preflight_models(self) -> Dict[str, Any]:
+        """Load .model-availability.json written by scripts/preflight_model_check.py.
+
+        Returns an empty dict (meaning "use the configured models") when the
+        file is missing, unreadable, or stale.
+        """
+        preflight_path = Path(
+            self.config.get("preflight_file_path", ".model-availability.json")
+        )
+        if not preflight_path.exists():
+            logger.info(
+                "No preflight model availability at %s; using configured models",
+                preflight_path,
+            )
+            return {}
+        try:
+            with open(preflight_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load preflight data from %s: %s", preflight_path, e)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("Preflight data in %s is not an object; ignoring", preflight_path)
+            return {}
+
+        age = time.time() - preflight_path.stat().st_mtime
+        if age > self.PREFLIGHT_MAX_AGE_SECONDS:
+            logger.warning(
+                "Preflight data in %s is %.1f hours old (max %.1f); using configured models",
+                preflight_path, age / 3600, self.PREFLIGHT_MAX_AGE_SECONDS / 3600,
+            )
+            return {}
+
+        available = {
+            provider: [
+                tier for tier, entry in tiers.items()
+                if isinstance(entry, dict) and entry.get("available")
+            ]
+            for provider, tiers in data.items()
+            if isinstance(tiers, dict)
+        }
+        logger.info(
+            "Loaded preflight model availability from %s (%.0f min old): %s",
+            preflight_path, age / 60,
+            {k: v for k, v in available.items() if v} or "nothing available",
+        )
+        return data
+
     def _format_filename(self, now: datetime) -> str:
         """Format the output filename from config pattern, ignoring unknown keys."""
         file_naming = self.config.get("file_naming", "Atlas-Briefing-{yyyy}.{mm}.{dd}")
@@ -1159,11 +1225,22 @@ class BriefingRunner:
         """
         Save run status to JSON file for monitoring.
 
+        The filename is config-driven because a machine can run more than one
+        pipeline: run_briefing.sh runs the main briefing and then the local one
+        ~15 minutes later, and with a shared filename the second run silently
+        overwrites the first run's counters. Monitoring that reads the file
+        would then report one pipeline's numbers as if they were both — which
+        is exactly what happened on 2026-08-28, when status.json showed
+        papers_found: 0 from the local pipeline (which scans no papers) while
+        the main run had in fact collected 172.
+
         Args:
             output_dir: Directory to save status file.
         """
         self.status["errors"] = self.errors
-        status_path = Path(output_dir) / "status.json"
+        self.status["pipeline"] = self.config.get("pipeline_name", "")
+        status_filename = self.config.get("status_file_path", "status.json")
+        status_path = Path(output_dir) / status_filename
         try:
             with open(status_path, "w") as f:
                 json.dump(self.status, f, indent=2)

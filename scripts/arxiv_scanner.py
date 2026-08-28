@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -143,7 +144,17 @@ class ArxivScanner:
 
     ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
-    def __init__(self, topics: List[str], days_back: int = 7, max_results: int = 20):
+    # ArXiv's API terms ask for no more than one request every ~3 seconds.
+    REQUEST_DELAY_SECONDS = 3.0
+
+    def __init__(
+        self,
+        topics: List[str],
+        days_back: int = 7,
+        max_results: int = 20,
+        request_delay: Optional[float] = None,
+        exact_phrase: bool = False,
+    ):
         """
         Initialize ArxivScanner.
 
@@ -151,7 +162,15 @@ class ArxivScanner:
             topics: List of topics to search for
             days_back: Number of days to look back
             max_results: Maximum number of results per topic
+            request_delay: Seconds to wait between topic searches. Defaults to
+                REQUEST_DELAY_SECONDS; pass 0 in tests to skip the wait.
+            exact_phrase: Wrap multi-word topics in quotes for an exact phrase
+                match. Off by default — see the note in search_topic().
         """
+        self.exact_phrase = exact_phrase
+        self.request_delay = (
+            self.REQUEST_DELAY_SECONDS if request_delay is None else request_delay
+        )
         self.topics = topics
         self.days_back = days_back
         self.max_results = max_results
@@ -171,8 +190,21 @@ class ArxivScanner:
             end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=self.days_back)
 
-            # Build query
-            query = f"all:{topic}"
+            # Build query. Upstream (ae14677) wraps multi-word topics in quotes
+            # for an exact phrase match, which suits literal topic names. This
+            # fork's topics are conceptual descriptions ("Edge AI for
+            # Battlefield Systems"), and measured against the live API on
+            # 2026-08-28 exact-phrase matching returned 0 papers for 7 of 9
+            # such topics — at 3 AND at 14 days back — versus a full result set
+            # unquoted. Recall matters more here because TF-IDF scoring and the
+            # interest-profile filter already cull irrelevant hits downstream,
+            # so the default stays unquoted. Set `arxiv_exact_phrase: true` if
+            # your topics are literal phrases.
+            query = (
+                f'all:"{topic}"'
+                if self.exact_phrase and " " in topic.strip()
+                else f"all:{topic}"
+            )
             params = {
                 "search_query": query,
                 "start": 0,
@@ -246,16 +278,17 @@ class ArxivScanner:
                     if paper_url:
                         pdf_link = paper_url.replace("/abs/", "/pdf/") + ".pdf"
 
-                # Parse published date
-                if published is not None and published.text:
-                    pub_date = datetime.fromisoformat(
-                        published.text.replace("Z", "+00:00")
+                # Freshness filter: prefer `updated`, fall back to `published`,
+                # and keep the entry when both are missing rather than dropping
+                # it (upstream ae14677 — the old code silently discarded any
+                # entry without a published date).
+                date_el = updated if (updated is not None and updated.text) else published
+                if date_el is not None and date_el.text:
+                    ref_date = datetime.fromisoformat(
+                        date_el.text.replace("Z", "+00:00")
                     )
-                    # Filter by date range
-                    if pub_date < start_date:
+                    if ref_date < start_date:
                         continue
-                else:
-                    continue
 
                 paper = {
                     "id": paper_id.text.strip() if paper_id is not None else "",
@@ -278,32 +311,34 @@ class ArxivScanner:
 
     def scan_all_topics(self) -> List[Dict[str, Any]]:
         """
-        Scan all configured topics in parallel.
+        Scan all configured topics sequentially, deduplicating by ArXiv ID.
+
+        Deliberately sequential, matching upstream. This previously ran 8
+        topics concurrently, which exceeds what export.arxiv.org tolerates —
+        observed 20/20 topic searches failing with 429s and read timeouts,
+        producing a briefing with an empty papers section. ArXiv's terms ask
+        for roughly one request every 3 seconds, so requests are additionally
+        paced by REQUEST_DELAY_SECONDS.
 
         Returns:
             List of all papers found across topics
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         all_papers = []
         seen_ids = set()
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {
-                pool.submit(self.search_topic, topic): topic
-                for topic in self.topics
-            }
-            for future in as_completed(futures):
-                try:
-                    papers = future.result()
-                    for paper in papers:
-                        paper_id = paper.get("id", "")
-                        if paper_id and paper_id not in seen_ids:
-                            all_papers.append(paper)
-                            seen_ids.add(paper_id)
-                except Exception as e:
-                    topic = futures[future]
-                    logger.warning(f"ArXiv scan failed for topic '{topic}': {e}")
+        for idx, topic in enumerate(self.topics):
+            if idx > 0 and self.request_delay > 0:
+                time.sleep(self.request_delay)
+            try:
+                papers = self.search_topic(topic)
+            except Exception as e:
+                logger.warning(f"ArXiv scan failed for topic '{topic}': {e}")
+                continue
+            for paper in papers:
+                paper_id = paper.get("id", "")
+                if paper_id and paper_id not in seen_ids:
+                    all_papers.append(paper)
+                    seen_ids.add(paper_id)
 
         logger.info(f"Total unique papers found: {len(all_papers)}")
         return all_papers
@@ -496,15 +531,23 @@ class DeepXivScanner:
 
 
 def create_scanner(
-    topics: List[str], days_back: int = 7, max_results: int = 20
+    topics: List[str],
+    days_back: int = 7,
+    max_results: int = 20,
+    request_delay: Optional[float] = None,
+    exact_phrase: bool = False,
 ):
     """
     Return the best available scanner.
 
     Picks DeepXivScanner whenever the SDK is installed — the SDK
     auto-registers a free anonymous token on first use, so no explicit
-    DEEPXIV_TOKEN is required. Falls back to the parallel defusedxml
+    DEEPXIV_TOKEN is required. Falls back to the sequential defusedxml
     ArxivScanner when the SDK is not installed.
+
+    ``request_delay`` and ``exact_phrase`` apply to the legacy ArXiv path;
+    DeepXiv has its own API and does not need them, but its zero-result
+    fallback path constructs an ArxivScanner that does.
     """
     if HAS_DEEPXIV:
         logger.info("Using DeepXiv SDK for paper search")
@@ -513,7 +556,11 @@ def create_scanner(
         )
     logger.info("Using legacy ArXiv API scanner")
     return ArxivScanner(
-        topics=topics, days_back=days_back, max_results=max_results
+        topics=topics,
+        days_back=days_back,
+        max_results=max_results,
+        request_delay=request_delay,
+        exact_phrase=exact_phrase,
     )
 
 

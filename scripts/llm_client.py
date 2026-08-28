@@ -68,6 +68,13 @@ def get_model_capabilities(model: str) -> Dict[str, Any]:
 class ReasoningControlMixin:
     """Mixin providing model-agnostic reasoning control via capability registry."""
 
+    # Phrases that only appear when a model spills its own reasoning
+    # scaffolding into the answer.
+    #
+    # These must stay narrow. The briefing is ABOUT AI research, so bare topic
+    # words ("chain of thought", "reasoning trace", "thinking process") occur
+    # legitimately in paper summaries and would cause good output to be thrown
+    # away. Match the scaffolding's own phrasing instead of its subject matter.
     COT_LEAKAGE_MARKERS = (
         "strict grounding",
         "check verbatim",
@@ -75,10 +82,15 @@ class ReasoningControlMixin:
         "entities/facts",
         "grounding verification",
         "verification scaffolding",
-        "chain of thought",
-        "reasoning trace",
-        "thinking process",
-        "internal monologue",
+        "let me think through",
+        "let me reason through",
+        "first, i need to",
+        "the user wants me to",
+        "the user is asking",
+        "okay, so the user",
+        "my chain of thought",
+        "my reasoning trace",
+        "my internal monologue",
     )
 
     def get_model_capabilities(self, model: str) -> Dict[str, Any]:
@@ -120,9 +132,13 @@ class ReasoningControlMixin:
             return cmd_or_payload
 
         elif method == "api_param":
-            # OpenRouter API parameter approach
-            param_name = caps.get("api_param_name", "reasoning_effort")
-            param_value = caps.get("api_param_value", "minimal")
+            # OpenRouter API parameter approach. The default must be the
+            # parameter that actually suppresses reasoning: `reasoning_effort:
+            # minimal` is accepted by the API but is a no-op on every free
+            # model tested, so a registry entry that omits these keys would
+            # otherwise silently get no reasoning control at all.
+            param_name = caps.get("api_param_name", "reasoning")
+            param_value = caps.get("api_param_value", {"enabled": False})
             if isinstance(cmd_or_payload, dict):
                 cmd_or_payload[param_name] = param_value
             return cmd_or_payload

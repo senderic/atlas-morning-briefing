@@ -161,3 +161,140 @@ class TestStatus:
         status = json.loads(status_path.read_text())
         assert "timestamp" in status
         assert "elapsed_seconds" in status
+
+
+class TestPreflightModelLoading:
+    """The runner lets preflight pin a per-tier model, so a bad file is costly.
+
+    A stale .model-availability.json would pin models chosen under yesterday's
+    conditions — exactly what the check exists to avoid, since free-model
+    availability changes within hours.
+    """
+
+    def _config(self, minimal_config, path):
+        cfg = dict(minimal_config)
+        cfg["preflight_file_path"] = str(path)
+        return cfg
+
+    def test_missing_file_returns_empty(self, minimal_config, tmp_path):
+        cfg = self._config(minimal_config, tmp_path / "nope.json")
+        assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == {}
+
+    def test_fresh_file_is_used(self, minimal_config, tmp_path):
+        import json
+
+        p = tmp_path / ".model-availability.json"
+        payload = {"openrouter": {"heavy": {"available": True, "tier": "heavy",
+                                            "model": "openrouter/x:free"}}}
+        p.write_text(json.dumps(payload))
+        cfg = self._config(minimal_config, p)
+        assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == payload
+
+    def test_stale_file_is_ignored(self, minimal_config, tmp_path):
+        import json
+        import os
+        import time
+
+        p = tmp_path / ".model-availability.json"
+        p.write_text(json.dumps({"openrouter": {"heavy": {"available": True}}}))
+        runner_cls = BriefingRunner
+        stale = time.time() - (runner_cls.PREFLIGHT_MAX_AGE_SECONDS + 60)
+        os.utime(p, (stale, stale))
+        cfg = self._config(minimal_config, p)
+        assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == {}
+
+    def test_corrupt_file_returns_empty(self, minimal_config, tmp_path):
+        p = tmp_path / ".model-availability.json"
+        p.write_text("{not json")
+        cfg = self._config(minimal_config, p)
+        assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == {}
+
+    def test_non_object_json_returns_empty(self, minimal_config, tmp_path):
+        p = tmp_path / ".model-availability.json"
+        p.write_text("[1, 2, 3]")
+        cfg = self._config(minimal_config, p)
+        assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == {}
+
+
+class TestBackendChainOrder:
+    """Order is cost: the chain is tried front to back, so paid goes last."""
+
+    def _config(self, minimal_config, **overrides):
+        cfg = dict(minimal_config)
+        cfg.update({
+            "openrouter": {"enabled": True, "api_key": "k"},
+            "gemini": {"enabled": False},
+            "opencode": {"enabled": True},
+        })
+        cfg.update(overrides)
+        return cfg
+
+    def _names(self, cfg):
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        client = runner.llm_client
+        clients = getattr(client, "clients", [client])
+        return [type(c).__name__ for c in clients]
+
+    def test_free_openrouter_precedes_paid_opencode_by_default(self, minimal_config):
+        names = self._names(self._config(minimal_config))
+        assert names.index("OpenRouterClient") < names.index("OpencodeClient")
+
+    def test_priority_list_is_honoured(self, minimal_config):
+        cfg = self._config(minimal_config, llm={"backend_priority": ["opencode", "openrouter"]})
+        names = self._names(cfg)
+        assert names.index("OpencodeClient") < names.index("OpenRouterClient")
+
+    def test_backend_missing_from_priority_is_still_included_last(self, minimal_config):
+        """A typo in the priority list must not silently drop a backend."""
+        cfg = self._config(minimal_config, llm={"backend_priority": ["openrouter"]})
+        names = self._names(cfg)
+        assert "OpencodeClient" in names
+        assert names[-1] == "OpencodeClient"
+
+    def test_unknown_priority_entry_is_ignored(self, minimal_config):
+        cfg = self._config(minimal_config, llm={"backend_priority": ["nope", "openrouter"]})
+        assert "OpenRouterClient" in self._names(cfg)
+
+    def test_disabled_backend_is_skipped(self, minimal_config):
+        cfg = self._config(minimal_config, opencode={"enabled": False})
+        assert "OpencodeClient" not in self._names(cfg)
+
+
+class TestStatusFileIsPerPipeline:
+    """Two pipelines sharing status.json means the second erases the first.
+
+    On 2026-08-28 status.json reported papers_found: 0 from the local pipeline
+    (which scans no papers) three minutes after the main run had collected 172.
+    """
+
+    def test_default_status_filename(self, minimal_config, tmp_path):
+        import json
+
+        BriefingRunner(config=minimal_config, dry_run=True).save_status(str(tmp_path))
+        assert (tmp_path / "status.json").exists()
+
+    def test_configured_status_filename_is_used(self, minimal_config, tmp_path):
+        cfg = dict(minimal_config, status_file_path="status-local.json")
+        BriefingRunner(config=cfg, dry_run=True).save_status(str(tmp_path))
+        assert (tmp_path / "status-local.json").exists()
+        assert not (tmp_path / "status.json").exists()
+
+    def test_two_pipelines_do_not_overwrite_each_other(self, minimal_config, tmp_path):
+        import json
+
+        main = BriefingRunner(
+            config=dict(minimal_config, status_file_path="status.json",
+                        pipeline_name="main"), dry_run=True)
+        main.status["papers_found"] = 172
+        main.save_status(str(tmp_path))
+
+        local = BriefingRunner(
+            config=dict(minimal_config, status_file_path="status-local.json",
+                        pipeline_name="local"), dry_run=True)
+        local.status["papers_found"] = 0
+        local.save_status(str(tmp_path))
+
+        saved = json.loads((tmp_path / "status.json").read_text())
+        assert saved["papers_found"] == 172, "local run clobbered the main run"
+        assert saved["pipeline"] == "main"
+        assert json.loads((tmp_path / "status-local.json").read_text())["pipeline"] == "local"

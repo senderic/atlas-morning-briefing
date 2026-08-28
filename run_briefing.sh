@@ -12,21 +12,25 @@ export PATH="$HOME/.nvm/versions/node/v20.19.5/bin:$HOME/.linuxbrew/bin:/home/li
 # Navigate to project directory
 cd "$DIR" || exit 1
 
-# Pre-flight model availability check (5:45 AM recommended, runs inline here)
-# Tests all free models concurrently and writes .model-availability.json
-"$DIR/.venv/bin/python3" "$DIR/scripts/preflight_model_check.py" 2>&1 | logger -t preflight-check
-RC_PREFLIGHT=$?
-if [ $RC_PREFLIGHT -ne 0 ]; then
-    logger -t preflight-check "Pre-flight check failed, continuing with config defaults"
+# Pre-flight model availability check. Probes the tiered model roster from
+# config.yaml and writes .model-availability.json, which both briefings read to
+# pin a working model per tier. A non-zero exit means some tier had no reachable
+# model; the run continues on the configured defaults either way.
+# Note: ${PIPESTATUS[0]} — not $? — is the python exit status when piped to logger.
+"$DIR/.venv/bin/python3" "$DIR/scripts/preflight_model_check.py" \
+    --config "$DIR/config.yaml" 2>&1 | logger -t preflight-check
+RC_PREFLIGHT=${PIPESTATUS[0]}
+if [ "$RC_PREFLIGHT" -ne 0 ]; then
+    logger -t preflight-check "Pre-flight check failed (rc=$RC_PREFLIGHT), continuing with config defaults"
 fi
 
 # Main briefing (defense/tech) runs first
 "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config.yaml" --log-level DEBUG "$@" 2>&1 | logger -t atlas-briefing
-RC_MAIN=$?
+RC_MAIN=${PIPESTATUS[0]}
 
 # Local briefing (San Diego / CA) runs after main completes
 "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config_local.yaml" --log-level DEBUG "$@" 2>&1 | logger -t local-briefing
-RC_LOCAL=$?
+RC_LOCAL=${PIPESTATUS[0]}
 
 if [ $RC_MAIN -ne 0 ] || [ $RC_LOCAL -ne 0 ]; then
     exit 1
