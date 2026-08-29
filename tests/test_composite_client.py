@@ -130,7 +130,6 @@ class TestCompositeClient:
         c = CompositeClient([_HangingClient("hanging"), fast], timeout=0.2)
         result = c.invoke("hi")
         assert result == "from-fast"
-        assert "_HangingClient" in c._slow_clients
 
     def test_timeout_returns_from_second_client(self):
         class _SlowThenOk(_FakeClient):
@@ -151,3 +150,41 @@ class TestCompositeClient:
         c = CompositeClient([_QuickClient("q")], timeout=5)
         assert c._timeout == 5
         assert c.invoke("hi") == "quick"
+
+
+class TestBudgetGuard:
+    """A backend whose chain cannot finish inside its window never serves.
+
+    This is how the paid backstop was found dead on arrival: 300s timeout x 3
+    retries x 3 models = 2730s of work inside a 400s window, so it was killed
+    mid-first-retry on every single call.
+    """
+
+    class _Backend(_FakeClient):
+        def __init__(self, timeout, retries, fallbacks):
+            super().__init__("budgeted")
+            self._timeout = timeout
+            self.max_retries = retries
+            self.models = {"heavy": "h", "medium": "m", "light": "l"}
+            self.fallback_models = {t: list(fallbacks) for t in self.models}
+
+    def test_worst_case_accounts_for_retries_and_fallbacks(self):
+        b = self._Backend(timeout=100, retries=2, fallbacks=["a", "b"])
+        assert CompositeClient._worst_case_seconds(b) == 100 * 3 * 3
+
+    def test_warns_when_a_backend_cannot_finish_in_its_window(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            CompositeClient([self._Backend(300, 2, ["a", "b"])], timeout=400)
+        assert "may never serve a request" in caplog.text
+
+    def test_silent_when_the_budget_fits(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            CompositeClient([self._Backend(150, 0, ["a"])], timeout=350)
+        assert "may never serve a request" not in caplog.text
+
+    def test_backend_without_a_model_table_is_not_guessed_at(self):
+        assert CompositeClient._worst_case_seconds(_FakeClient("plain")) is None

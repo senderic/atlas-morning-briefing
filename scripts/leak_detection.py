@@ -11,8 +11,30 @@ intelligence layer and the briefing renderer to recognize such leaks and fall
 back to the non-reasoning model or an unavailable placeholder.
 """
 
-STRONG_MARKERS = ("strict grounding", "check verbatim")
+# Grounding-verification scaffolding.
+STRONG_MARKERS = (
+    "strict grounding",
+    "check verbatim",
+    "grounding verification",
+    "verification scaffolding",
+    # First-person planning the model should never show the reader. These are
+    # conclusive on their own and, unlike bare topic words, cannot appear in
+    # legitimate briefing prose about reasoning models.
+    "let me think through",
+    "let me reason through",
+    "the user wants me to",
+    "the user is asking",
+    "okay, so the user",
+    "my chain of thought",
+    "my reasoning trace",
+    "my internal monologue",
+)
 WEAK_MARKERS = ("is verbatim", "entities/facts")
+
+# Deliberately NOT markers: "chain of thought", "reasoning trace", "thinking
+# process", "internal monologue" on their own. The briefing is ABOUT AI
+# research, so those phrases occur in real paper summaries and matching them
+# threw away good output.
 
 _ALL_MARKERS = STRONG_MARKERS + WEAK_MARKERS
 

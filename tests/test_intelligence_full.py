@@ -1374,3 +1374,58 @@ class TestSourceDiversityConfig:
         )
         result = intel.rank_and_summarize_news(self._articles(), topics=["x"])
         assert len(result) == 3
+
+
+class TestExecutiveSummaryLeadInstruction:
+    """The lead must open on the reader, not on a development.
+
+    Judged live on 2026-08-28: with the previous wording ("state the day's
+    single most important thesis") the lead scored 0/2 on lead_alignment on
+    every run since the checker was built — it reliably produced "Company X
+    did Y, which signals trend Z". Naming the required grammatical subject and
+    showing the failing shapes moved it to 2/2.
+    """
+
+    def _prompt(self, intel, mock_client):
+        mock_client.invoke.return_value = "**Lead.**"
+        intel.synthesize_briefing(
+            papers=[], blogs=[], stocks=[], news=[{"title": "N1"}], top_papers=[]
+        )
+        return mock_client.invoke.call_args[0][0]
+
+    def test_requires_the_reader_as_grammatical_subject(self, intel, mock_client):
+        prompt = self._prompt(intel, mock_client)
+        assert "GRAMMATICAL SUBJECT" in prompt
+        assert "must NOT be the subject" in prompt
+
+    def test_shows_the_failing_shapes(self, intel, mock_client):
+        prompt = self._prompt(intel, mock_client)
+        assert "Shape that FAILS" in prompt
+        assert "Shape that PASSES" in prompt
+
+    def test_lead_instruction_interpolates_the_configured_audience(
+        self, mock_client, default_config
+    ):
+        """Domain framing must come from config, never be baked into the prompt."""
+        from scripts.intelligence import BriefingIntelligence
+
+        cfg = dict(default_config)
+        cfg["briefing_profile"] = {
+            "domain": "municipal composting",
+            "audience": "a household recycling coordinator",
+            "landscape": "the waste-diversion landscape",
+        }
+        intel = BriefingIntelligence(mock_client, cfg)
+        prompt = self._prompt(intel, mock_client)
+        assert "a household recycling coordinator" in prompt
+
+    def test_lead_instruction_names_no_domain(self, intel, mock_client):
+        """The worked examples are shapes, not defense/AI content.
+
+        Domain-specific examples leaked defense vocabulary into the San Diego
+        local briefing, which shares this prompt.
+        """
+        prompt = self._prompt(intel, mock_client)
+        lead_block = prompt[prompt.index("GRAMMATICAL SUBJECT"):prompt.index("glanceable")]
+        for term in ("kill chain", "Nvidia", "ISR", "counter-UAS", "defense", "arXiv"):
+            assert term.lower() not in lead_block.lower(), f"{term} hardcoded in lead instruction"

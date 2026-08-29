@@ -18,6 +18,8 @@ from typing import Any, Dict, List
 import requests
 import yaml
 
+from scripts.url_utils import normalize_url
+
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -124,10 +126,12 @@ class NewsAggregator:
                 try:
                     articles = future.result()
                     for article in articles:
-                        url = article.get("url", "")
-                        if url and url not in seen_urls:
+                        # Key on the normalized URL: sources return the same
+                        # article under trailing-slash / www / utm variants.
+                        key = normalize_url(article.get("url", ""))
+                        if key and key not in seen_urls:
                             all_articles.append(article)
-                            seen_urls.add(url)
+                            seen_urls.add(key)
                 except Exception as e:
                     query = futures[future]
                     logger.warning(f"News search failed for '{query}': {e}")

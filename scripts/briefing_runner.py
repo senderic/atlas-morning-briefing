@@ -45,6 +45,8 @@ from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
+from scripts.event_dates import has_only_past_dates
+from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
@@ -133,34 +135,24 @@ class BriefingRunner:
         }
 
         # Initialize LLM client and intelligence layer.
-        # Chain: opencode/DeepSeek first (its own per-tier fallbacks run
-        # internally), then the Gemini CLI, then OpenRouter as fallbacks when
-        # the respective backends are enabled.
+        preflight_data = self._load_preflight_models()
         gemini_config = config.get("gemini", config.get("bedrock", {}))
-        openrouter_config = config.get("openrouter", {})
-        if config.get("opencode", {}).get("enabled"):
-            from scripts.opencode_client import OpencodeClient
-            opencode_client: BaseLLMClient = OpencodeClient(config.get("opencode", {}))
-            fallback_clients = []
-            if gemini_config.get("enabled"):
-                fallback_clients.append(GeminiCLIClient(gemini_config))
-            if openrouter_config.get("enabled"):
-                from scripts.openrouter_client import OpenRouterClient
-                fallback_clients.append(OpenRouterClient(openrouter_config))
-            if fallback_clients:
-                from scripts.composite_client import CompositeClient
-                composite_timeout = config.get("llm", {}).get(
-                    "fallback_timeout_seconds",
-                    config.get("composite", {}).get("timeout_seconds", 240),
-                )
-                self.llm_client = CompositeClient(
-                    [opencode_client] + fallback_clients,
-                    timeout=composite_timeout,
-                )
-            else:
-                self.llm_client = opencode_client
-        else:
+
+        # Chain construction lives in scripts.llm_chain so the briefing runner
+        # and the quality checker cannot drift on backend ordering. Order is
+        # cost: free backends first, any paid one last.
+        from scripts.composite_client import CompositeClient
+        from scripts.llm_chain import build_llm_chain, chain_timeout
+
+        chain = build_llm_chain(config, preflight_models=preflight_data)
+
+        if not chain:
+            # No LLM backend enabled at all — deterministic mode.
             self.llm_client = GeminiCLIClient(gemini_config)
+        elif len(chain) == 1:
+            self.llm_client = chain[0]
+        else:
+            self.llm_client = CompositeClient(chain, timeout=chain_timeout(config))
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
@@ -202,11 +194,13 @@ class BriefingRunner:
 
             # create_scanner picks DeepXivScanner when the SDK is installed
             # (auto-registers a free token on first use) and falls back to
-            # our parallel defusedxml ArxivScanner otherwise.
+            # our sequential defusedxml ArxivScanner otherwise.
             scanner = create_scanner(
                 topics=topics,
                 days_back=days_back,
                 max_results=max_papers,
+                request_delay=self.config.get("arxiv_request_delay"),
+                exact_phrase=self.config.get("arxiv_exact_phrase", False),
             )
             papers = scanner.scan_all_topics()
             self.status["papers_found"] = len(papers)
@@ -223,7 +217,16 @@ class BriefingRunner:
         try:
             logger.info("=== Scanning Blog Feeds ===")
             feeds = self.config.get("blog_feeds", [])
-            days_back = self.config.get("arxiv_days_back", 7)
+            # Blogs get their own window. Reusing arxiv_days_back tied the blog
+            # cutoff to a paper-freshness setting: at arxiv_days_back=3 a feed
+            # posting weekly is invisible on most days, which showed up as
+            # "yield collapse" warnings against feeds that were perfectly
+            # healthy. Measured 2026-08-29 across 28 feeds: 17 had posted
+            # within 3 days, 19 within 7. Cross-day dedup already prevents a
+            # widened window from repeating an item the reader has seen.
+            days_back = self.config.get(
+                "blog_days_back", self.config.get("arxiv_days_back", 7)
+            )
             max_blogs = self.config.get("max_blogs", 10)
 
             if not feeds:
@@ -322,11 +325,13 @@ class BriefingRunner:
                     freshness=freshness,
                 )
                 for article in aggregator.aggregate_all_queries():
-                    url = article.get("url", "")
-                    if url and url in seen_urls:
+                    # Normalized so the same article fetched under two
+                    # freshness windows is not printed twice.
+                    key = normalize_url(article.get("url", ""))
+                    if key and key in seen_urls:
                         continue
-                    if url:
-                        seen_urls.add(url)
+                    if key:
+                        seen_urls.add(key)
                     articles.append(article)
 
             self.status["news_found"] = len(articles)
@@ -443,7 +448,9 @@ class BriefingRunner:
                 "Fetching fresh happenings (fetch weekday=%s, today=%s)",
                 fetch_weekday, today.weekday(),
             )
-            fetched = self.run_happenings_aggregation()
+            fetched = self._drop_past_happenings(
+                self._dedupe_happenings_by_url(self.run_happenings_aggregation())
+            )
             if fetched:
                 self._happenings_cache = list(fetched)
                 self._happenings_cache_date = today.strftime("%Y-%m-%d")
@@ -453,7 +460,11 @@ class BriefingRunner:
                 )
                 return fetched
             logger.warning("Happenings fetch returned empty, falling back to cache")
-        cached = previous_state.get("cached_happenings", [])
+        cached = self._drop_past_happenings(
+            self._dedupe_happenings_by_url(
+                previous_state.get("cached_happenings", [])
+            )
+        )
         if cached:
             cache_date = previous_state.get("cached_happenings_date", "unknown")
             logger.info(
@@ -467,6 +478,71 @@ class BriefingRunner:
             return list(cached)
         logger.info("No happenings cache available and today is not fetch day")
         return []
+
+    @staticmethod
+    def _dedupe_happenings_by_url(
+        happenings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Collapse happenings that point at the same document.
+
+        Applied to the cached path as well as the fresh one: a cache written
+        before URL normalization existed still holds raw-string duplicates,
+        and on 2026-08-29 two of them reached the reader — the same San Diego
+        Magazine roundup under a trailing-slash variant, and the same KPBS
+        piece under a ``www.`` variant.
+        """
+        seen = set()
+        deduped = []
+        for item in happenings or []:
+            key = normalize_url(item.get("url", ""))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(item)
+        removed = len(happenings or []) - len(deduped)
+        if removed:
+            logger.info("Dedup: removed %d happening(s) with duplicate URLs", removed)
+        return deduped
+
+    def _drop_past_happenings(
+        self, happenings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Remove happenings whose every calendar date has already passed.
+
+        Happenings are cached between fetch days, so by the end of the window
+        the cache can still be advertising last weekend. On 2026-08-28 the
+        local briefing led with three "Aug. 21-23 this weekend" items — a week
+        past — because the cache was only refreshed on Saturdays.
+
+        A shorter cache window narrows this but cannot close it: a Thursday
+        fetch still serves Saturday, and Brave's ``pw`` freshness returns
+        results from the past week by design. So the dates are checked at use
+        time rather than trusted to be fresh.
+
+        Undated items are kept: a venue's standing events calendar or a rule
+        change ("volleyball can now begin at 6 a.m.") is not stale for lacking
+        a day. Ranges are judged by when they end.
+        """
+        if not happenings:
+            return happenings
+        today = datetime.now().date()
+        kept, dropped = [], []
+        for item in happenings:
+            text = " ".join(
+                str(item.get(field, ""))
+                for field in ("title", "description", "age")
+            )
+            if has_only_past_dates(text, today):
+                dropped.append(item.get("title", "")[:80])
+            else:
+                kept.append(item)
+        if dropped:
+            logger.info(
+                "Dropped %d happening(s) whose dates have passed: %s",
+                len(dropped), "; ".join(dropped),
+            )
+        return kept
 
     def score_papers(self, papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Score and rank papers."""
@@ -886,6 +962,59 @@ class BriefingRunner:
             md.append(self.llm_client.get_usage_summary(start_time=start_time, end_time=end_time))
 
         return "".join(md)
+
+    # Preflight results older than this are ignored: a stale file would pin a
+    # model chosen for yesterday's conditions, and the whole point of the check
+    # is that free-model availability changes hour to hour.
+    PREFLIGHT_MAX_AGE_SECONDS = 6 * 3600
+
+    def _load_preflight_models(self) -> Dict[str, Any]:
+        """Load .model-availability.json written by scripts/preflight_model_check.py.
+
+        Returns an empty dict (meaning "use the configured models") when the
+        file is missing, unreadable, or stale.
+        """
+        preflight_path = Path(
+            self.config.get("preflight_file_path", ".model-availability.json")
+        )
+        if not preflight_path.exists():
+            logger.info(
+                "No preflight model availability at %s; using configured models",
+                preflight_path,
+            )
+            return {}
+        try:
+            with open(preflight_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load preflight data from %s: %s", preflight_path, e)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("Preflight data in %s is not an object; ignoring", preflight_path)
+            return {}
+
+        age = time.time() - preflight_path.stat().st_mtime
+        if age > self.PREFLIGHT_MAX_AGE_SECONDS:
+            logger.warning(
+                "Preflight data in %s is %.1f hours old (max %.1f); using configured models",
+                preflight_path, age / 3600, self.PREFLIGHT_MAX_AGE_SECONDS / 3600,
+            )
+            return {}
+
+        available = {
+            provider: [
+                tier for tier, entry in tiers.items()
+                if isinstance(entry, dict) and entry.get("available")
+            ]
+            for provider, tiers in data.items()
+            if isinstance(tiers, dict)
+        }
+        logger.info(
+            "Loaded preflight model availability from %s (%.0f min old): %s",
+            preflight_path, age / 60,
+            {k: v for k, v in available.items() if v} or "nothing available",
+        )
+        return data
 
     def _format_filename(self, now: datetime) -> str:
         """Format the output filename from config pattern, ignoring unknown keys."""
@@ -1393,7 +1522,10 @@ class BriefingRunner:
         pipeline: run_briefing.sh runs the main briefing and then the local one
         ~15 minutes later, and with a shared filename the second run silently
         overwrites the first run's counters. Monitoring that reads the file
-        would then report one pipeline's numbers as if they were both.
+        would then report one pipeline's numbers as if they were both — which
+        is exactly what happened on 2026-08-28, when status.json showed
+        papers_found: 0 from the local pipeline (which scans no papers) while
+        the main run had in fact collected 172.
 
         Args:
             output_dir: Directory to save status file.

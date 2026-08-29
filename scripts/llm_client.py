@@ -5,13 +5,153 @@ Abstract base class for LLM clients.
 
 Defines the common interface that all LLM client implementations must satisfy:
 GeminiCLIClient, OpencodeClient, and any future backends.
+
+Also provides a ReasoningControlMixin for model-agnostic reasoning control
+using the capability registry in config/model_capabilities.yaml.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import yaml
+
+from scripts.leak_detection import STRONG_MARKERS, WEAK_MARKERS, is_cot_leak
+
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# Global capability cache
+_capability_cache: Optional[Dict[str, Any]] = None
 
 
-class BaseLLMClient(ABC):
+def _load_capabilities() -> Dict[str, Any]:
+    """Load model capabilities from config/model_capabilities.yaml."""
+    global _capability_cache
+    if _capability_cache is not None:
+        return _capability_cache
+
+    config_path = Path(__file__).resolve().parent.parent / "config" / "model_capabilities.yaml"
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+            _capability_cache = data or {}
+            logger.debug(f"Loaded model capabilities from {config_path}")
+            return _capability_cache
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        logger.warning(f"Failed to load model capabilities: {e}")
+        _capability_cache = {"model_capabilities": {}, "default_capabilities": {}}
+        return _capability_cache
+
+
+def get_model_capabilities(model: str) -> Dict[str, Any]:
+    """
+    Get capabilities for a specific model.
+
+    Args:
+        model: Model identifier (e.g., "opencode/nemotron-3-ultra-free")
+
+    Returns:
+        Dict with keys: supports_reasoning_control, reasoning_control_method,
+        cli_flag_name, cli_flag_value, api_param_name, api_param_value,
+        known_cot_leakage, non_reasoning_variant
+    """
+    caps = _load_capabilities()
+    model_caps = caps.get("model_capabilities", {}).get(model, {})
+    default_caps = caps.get("default_capabilities", {})
+
+    # Merge with defaults
+    result = default_caps.copy()
+    result.update(model_caps)
+    return result
+
+
+class ReasoningControlMixin:
+    """Mixin providing model-agnostic reasoning control via capability registry."""
+
+    # CoT-leakage vocabulary and the predicate live in scripts.leak_detection
+    # so the renderer and the LLM clients cannot drift apart on what counts as
+    # a leak. Re-exported here for callers that hold only a client.
+    COT_LEAKAGE_MARKERS = STRONG_MARKERS + WEAK_MARKERS
+
+    def get_model_capabilities(self, model: str) -> Dict[str, Any]:
+        """Get capabilities for a model. Override in subclass if needed."""
+        return get_model_capabilities(model)
+
+    def apply_reasoning_control(self, model: str, cmd_or_payload: Dict[str, Any], reasoning_enabled: bool) -> Dict[str, Any]:
+        """
+        Apply reasoning control to a command or payload based on model capabilities.
+
+        Args:
+            model: Model identifier
+            cmd_or_payload: Command list (opencode) or payload dict (OpenRouter)
+            reasoning_enabled: Whether reasoning should be enabled
+
+        Returns:
+            Modified command/payload, or string model ID if model swap required
+        """
+        if reasoning_enabled:
+            return cmd_or_payload
+
+        caps = self.get_model_capabilities(model)
+
+        if not caps.get("supports_reasoning_control", False):
+            # No control available - proceed anyway, will detect CoT leakage at runtime
+            logger.debug(f"Model {model} has no reasoning control support")
+            return cmd_or_payload
+
+        method = caps.get("reasoning_control_method", "none")
+
+        if method == "cli_flag":
+            # opencode CLI flag approach
+            flag_name = caps.get("cli_flag_name", "variant")
+            flag_value = caps.get("cli_flag_value", "minimal")
+            if isinstance(cmd_or_payload, list):
+                # Add flag if not present
+                if flag_name not in cmd_or_payload:
+                    cmd_or_payload.extend([f"--{flag_name}", flag_value])
+            return cmd_or_payload
+
+        elif method == "api_param":
+            # OpenRouter API parameter approach. The default must be the
+            # parameter that actually suppresses reasoning: `reasoning_effort:
+            # minimal` is accepted by the API but is a no-op on every free
+            # model tested, so a registry entry that omits these keys would
+            # otherwise silently get no reasoning control at all.
+            param_name = caps.get("api_param_name", "reasoning")
+            param_value = caps.get("api_param_value", {"enabled": False})
+            if isinstance(cmd_or_payload, dict):
+                cmd_or_payload[param_name] = param_value
+            return cmd_or_payload
+
+        elif method == "model_swap":
+            # Must swap to non-reasoning variant
+            swap_model = caps.get("non_reasoning_variant")
+            if swap_model:
+                logger.info(f"Reasoning disabled: swapping {model} -> {swap_model}")
+                return swap_model
+            return cmd_or_payload
+
+        return cmd_or_payload
+
+    def detect_cot_leakage(self, text: str) -> bool:
+        """
+        Detect if response contains leaked chain-of-thought reasoning.
+
+        Delegates to :func:`scripts.leak_detection.is_cot_leak` — a single
+        strong marker is conclusive, otherwise two markers must co-occur.
+
+        Args:
+            text: Response text to check
+
+        Returns:
+            True if CoT leakage detected
+        """
+        return is_cot_leak(text)
+
+
+class BaseLLMClient(ABC, ReasoningControlMixin):
     """Abstract interface for LLM client implementations."""
 
     @property

@@ -212,6 +212,31 @@ num_paper_picks: 3
 # Date range for arxiv search (days)
 arxiv_days_back: 3
 
+# Blog freshness window, separate from arxiv_days_back. Blogs and papers have
+# different cadences: at 3 days a weekly blogger is invisible on most runs,
+# which the quality checker reported as a yield collapse against feeds that
+# were healthy. Measured 2026-08-29 across 28 feeds: 17 had posted within 3
+# days, 19 within 7, 21 within 14. Cross-day dedup stops a wider window from
+# re-showing an item the reader already saw.
+blog_days_back: 7
+
+# ArXiv fetch behaviour (legacy export.arxiv.org path).
+#
+# Topics are scanned SEQUENTIALLY, matching upstream. This used to run 8
+# topics concurrently, which exceeds what export.arxiv.org tolerates: a run on
+# 2026-08-27 lost 20/20 topic searches to 429s and read timeouts and shipped a
+# briefing with no papers at all. ArXiv's terms ask for ~1 request per 3s.
+arxiv_request_delay: 3.0
+#
+# Wrap multi-word topics in quotes for an exact phrase match. Upstream does
+# this by default; measured against the live API on 2026-08-28 it returned 0
+# papers for 7 of the 9 multi-word topics above (at 3 and at 14 days back),
+# because these topics are conceptual descriptions rather than literal
+# phrases. Recall is preferable here since TF-IDF scoring and the interest
+# profile already cull irrelevant hits. Turn on only if your topics are
+# literal phrases that appear verbatim in paper text.
+arxiv_exact_phrase: false
+
 # Maximum items per section
 max_papers: 30
 max_blogs: 12
@@ -230,17 +255,16 @@ pdf:
 opencode:
   enabled: false
   models:
-    heavy: "opencode/deepseek-v4-flash-free"
+    heavy: "opencode/nemotron-3-ultra-free"
     medium: "opencode/deepseek-v4-flash-free"
     light: "opencode/deepseek-v4-flash-free"
   # Fallback chain tried (in order) when the primary model for a tier fails
   # (non-zero exit, empty NDJSON response, or timeout) — e.g. when the free
-  # opencode quota is exhausted. opencode-go/glm-5.2 has the largest free
-  # quota on OpenCode Zen, so it goes first. Set to `[]` to disable.
+  # opencode quota is exhausted.
   fallback_models:
-    heavy: ["opencode-go/glm-5.2"]
-    medium: ["opencode-go/glm-5.2"]
-    light: ["opencode-go/glm-5.2"]
+    heavy: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    medium: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
+    light: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
   max_calls_per_run: 50
   # Per-call timeout. Fast failures (model not found, insufficient balance,
   # rate limit) are detected immediately via NDJSON error events and skip
@@ -251,6 +275,46 @@ opencode:
   # Number of retries for retryable errors before falling back. Set to 0
   # to disable retries entirely.
   max_retries_per_model: 2
+
+# OpenRouter configuration (OpenAI-compatible HTTP API)
+# Requires OPENROUTER_API_KEY. Slugs carry a single `openrouter/` routing
+# prefix that the client strips before calling the API.
+#
+# Keep the ladder monotonic — heavy > medium > light in both model size and
+# context window — and let fallbacks degrade DOWN a tier only, never up, so a
+# heavy prompt can never silently land on a light model.
+#
+# Free models on OpenRouter come and go. Re-verify a slug before adding it:
+#   curl -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+#        https://openrouter.ai/api/v1/models | jq -r '.data[] | select(.id|endswith(":free")) | .id'
+# and confirm it returns non-empty `choices[0].message.content` for a real
+# prompt — several free models answer 200 with an empty body because reasoning
+# tokens consume the whole max_tokens budget.
+#
+# Avoid `openrouter/auto`: despite the name it is the PAID auto-router.
+openrouter:
+  enabled: false
+  api_base: "https://openrouter.ai/api/v1/chat/completions"
+  models:
+    heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+    medium: "openrouter/minimax/minimax-m3:free"
+    light: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+  fallback_models:
+    heavy: ["openrouter/dots-studio/dots-3-note-preview:free", "openrouter/minimax/minimax-m3:free"]
+    medium: ["openrouter/nvidia/nemotron-3-super-120b-a12b:free", "openrouter/dots-studio/dots-3-note-preview:free"]
+    light: ["openrouter/cohere/north-mini-code:free", "openrouter/minimax/minimax-m3:free"]
+  max_calls_per_run: 100
+  # Simultaneous in-flight requests. The runner enriches sections in parallel
+  # (see max_workers), so this is the real throttle against the free tier.
+  max_concurrent_requests: 4
+  timeout: 120
+  max_tokens: 4096
+  temperature: 0.3
+  # Used only for the "equivalent paid cost" line in the usage summary; the
+  # summary reports the API's own cost field for what was actually billed.
+  pricing:
+    input_per_million: 0.0
+    output_per_million: 0.0
   # Estimated pricing if using paid DeepSeek V4 Flash API (e.g. Deep Infra)
   # instead of the free opencode model. Used in the usage summary footer.
   pricing:

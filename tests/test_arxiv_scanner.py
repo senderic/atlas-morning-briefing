@@ -2,7 +2,7 @@
 """Tests for arxiv_scanner module."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import requests
@@ -163,11 +163,33 @@ class TestParseArxivResponse:
         assert "Evaluating Multi-Agent Systems" in titles
         assert "Old Paper on Something" not in titles
 
-    def test_skips_entries_without_date(self, scanner, recent_xml):
+    def test_keeps_entries_without_a_date(self, scanner, recent_xml):
+        """Undated entries are kept, not silently dropped (upstream ae14677).
+
+        ArXiv occasionally omits both <published> and <updated>; discarding
+        those entries lost real papers for no benefit.
+        """
         start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
         papers = scanner._parse_arxiv_response(recent_xml, start_date)
         titles = [p["title"] for p in papers]
-        assert "No Date Paper" not in titles
+        assert "No Date Paper" in titles
+
+    def test_uses_updated_date_in_preference_to_published(self, scanner):
+        """Freshness is judged on <updated> so revised papers resurface."""
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.00099v2</id>
+    <title>Revised Paper</title>
+    <summary>Old publication, recent revision.</summary>
+    <published>2020-01-01T00:00:00Z</published>
+    <updated>2026-08-20T00:00:00Z</updated>
+    <author><name>Erin</name></author>
+  </entry>
+</feed>"""
+        start_date = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        papers = scanner._parse_arxiv_response(xml, start_date)
+        assert [p["title"] for p in papers] == ["Revised Paper"]
 
     def test_handles_malformed_xml(self, scanner):
         start_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -214,6 +236,7 @@ class TestSearchTopic:
         assert len(papers) >= 1
         # Verify query was built correctly
         kwargs = mock_get.call_args.kwargs
+        # Unquoted by default — see TestExactPhraseOptIn for why.
         assert kwargs["params"]["search_query"] == "all:Agent Evaluation"
         assert kwargs["params"]["sortBy"] == "submittedDate"
 
@@ -398,3 +421,100 @@ class TestMain:
         mock_cls.return_value = instance
         monkeypatch.setattr("sys.argv", ["arxiv_scanner.py", "--config", str(cfg_path)])
         assert main() == 1
+
+
+class TestExactPhraseOptIn:
+    """Upstream ae14677 quotes multi-word topics for an exact phrase match.
+
+    That suits literal topic names but not this fork's conceptual ones:
+    measured live on 2026-08-28, exact-phrase matching returned 0 papers for
+    7 of 9 multi-word topics in config.yaml (at both 3 and 14 days back), so
+    it is opt-in rather than the default.
+    """
+
+    def _query(self, topic, **kw):
+        s = ArxivScanner(topics=["x"], days_back=7, max_results=10, **kw)
+        with patch("scripts.arxiv_scanner.requests.get") as get:
+            get.return_value = Mock(text="<feed/>", raise_for_status=Mock())
+            s.search_topic(topic)
+        return get.call_args.kwargs["params"]["search_query"]
+
+    def test_multi_word_topic_is_unquoted_by_default(self):
+        assert self._query("Multi Agent Systems") == "all:Multi Agent Systems"
+
+    def test_multi_word_topic_is_quoted_when_opted_in(self):
+        assert self._query("Multi Agent Systems", exact_phrase=True) == 'all:"Multi Agent Systems"'
+
+    def test_single_word_topic_is_never_quoted(self):
+        assert self._query("Robotics") == "all:Robotics"
+        assert self._query("Robotics", exact_phrase=True) == "all:Robotics"
+
+
+class TestSequentialPacedScanning:
+    """ArXiv rate limiting: 8-way concurrency lost 20/20 topic searches.
+
+    Upstream scans sequentially; this fork's ThreadPoolExecutor(max_workers=8)
+    exceeded what export.arxiv.org tolerates and returned an empty papers
+    section on most runs.
+    """
+
+    def test_topics_are_scanned_one_at_a_time(self):
+        import threading
+
+        s = ArxivScanner(topics=["a", "b", "c"], days_back=7, request_delay=0)
+        in_flight = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_search(topic):
+            nonlocal in_flight, peak
+            with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            try:
+                return [{"id": f"http://arxiv.org/abs/{topic}"}]
+            finally:
+                with lock:
+                    in_flight -= 1
+
+        with patch.object(s, "search_topic", side_effect=fake_search):
+            papers = s.scan_all_topics()
+        assert peak == 1, f"peak concurrency {peak}; must stay sequential"
+        assert len(papers) == 3
+
+    def test_default_delay_respects_arxiv_terms(self):
+        assert ArxivScanner(topics=["a"]).request_delay >= 3.0
+
+    def test_delay_is_applied_between_topics_only(self):
+        s = ArxivScanner(topics=["a", "b", "c"], days_back=7)
+        with patch.object(s, "search_topic", return_value=[]), \
+             patch("scripts.arxiv_scanner.time.sleep") as sleep:
+            s.scan_all_topics()
+        # 3 topics -> 2 gaps, never a leading sleep
+        assert sleep.call_count == 2
+        assert all(c.args[0] == s.request_delay for c in sleep.call_args_list)
+
+    def test_no_delay_for_a_single_topic(self):
+        s = ArxivScanner(topics=["only"], days_back=7)
+        with patch.object(s, "search_topic", return_value=[]), \
+             patch("scripts.arxiv_scanner.time.sleep") as sleep:
+            s.scan_all_topics()
+        sleep.assert_not_called()
+
+    def test_one_failing_topic_does_not_abort_the_scan(self):
+        s = ArxivScanner(topics=["good", "bad", "good2"], days_back=7, request_delay=0)
+
+        def flaky(topic):
+            if topic == "bad":
+                raise requests.RequestException("429")
+            return [{"id": f"http://arxiv.org/abs/{topic}"}]
+
+        with patch.object(s, "search_topic", side_effect=flaky):
+            papers = s.scan_all_topics()
+        assert len(papers) == 2
+
+    def test_duplicate_ids_are_deduplicated(self):
+        s = ArxivScanner(topics=["a", "b"], days_back=7, request_delay=0)
+        with patch.object(s, "search_topic",
+                          return_value=[{"id": "http://arxiv.org/abs/same"}]):
+            assert len(s.scan_all_topics()) == 1

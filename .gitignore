@@ -37,6 +37,7 @@ news.json
 papers.json
 scored_papers.json
 stocks.json
+.model-availability.json
 logs/*.log
 *.log
 logs/*.dot

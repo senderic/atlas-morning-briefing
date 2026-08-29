@@ -232,45 +232,63 @@ def _lazy_import(module_name: str, attr: str) -> Callable[..., Any]:
 # ---------------------------------------------------------------------------
 
 
+def source_health_rules(configs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Collect ``quality_check.source_health`` rules across the pipelines.
+
+    A feed can be configured in more than one pipeline, so the blocks are
+    merged rather than one being picked arbitrarily: scalar thresholds take
+    the strictest (smallest) value seen, and ``feed_overrides`` are unioned so
+    an exemption written in either config is honoured.
+
+    Returns {} when nothing is configured, which leaves detect_rot on its
+    own DEFAULT_RULES.
+    """
+    # config.yaml, config.yaml.example and references/config_guide.md all
+    # document this as `dead_url_runs`, but source_health reads
+    # `dead_url_streak`. Translate rather than rename either side: the
+    # documented name is the public contract, and renaming the internal one
+    # would churn source_health's own tests for no reader benefit.
+    key_aliases = {"dead_url_runs": "dead_url_streak"}
+
+    merged: Dict[str, Any] = {}
+    overrides: Dict[str, Any] = {}
+    for config in (configs or {}).values():
+        block = ((config or {}).get("quality_check") or {}).get("source_health") or {}
+        for key, value in block.items():
+            key = key_aliases.get(key, key)
+            if key == "feed_overrides":
+                for feed, rule in (value or {}).items():
+                    overrides.setdefault(feed, {}).update(rule or {})
+            elif isinstance(value, (int, float)) and key in merged:
+                merged[key] = min(merged[key], value)
+            else:
+                merged[key] = value
+    if overrides:
+        merged["feed_overrides"] = overrides
+    return merged
+
+
 def build_llm_client(config: Dict[str, Any]) -> Optional[Any]:
-    """Build the same opencode -> gemini -> openrouter fallback chain the
-    runner builds, for the judge's own use. Never raises; returns None if no
-    backend can be constructed or something goes wrong importing one.
+    """Build the same backend chain the runner builds, for the judge's own use.
+
+    Delegates to scripts.llm_chain so the checker and the runner cannot drift.
+    They previously each built their own chain and did drift: this function
+    hardcoded opencode-first long after the runner had moved to cost-ordered
+    openrouter-first, so every daily quality run billed the paid backstop.
+
+    Never raises; returns None if no backend can be constructed.
     """
     try:
-        gemini_config = config.get("gemini", config.get("bedrock", {})) or {}
-        openrouter_config = config.get("openrouter", {}) or {}
-        opencode_config = config.get("opencode", {}) or {}
+        from scripts.llm_chain import build_llm_chain, chain_timeout
 
-        if opencode_config.get("enabled"):
-            from scripts.opencode_client import OpencodeClient
+        chain = build_llm_chain(config)
+        if not chain:
+            return None
+        if len(chain) == 1:
+            return chain[0]
+        from scripts.composite_client import CompositeClient
 
-            opencode_client = OpencodeClient(opencode_config)
-            fallback_clients = []
-            if gemini_config.get("enabled"):
-                from scripts.gemini_client import GeminiCLIClient
-
-                fallback_clients.append(GeminiCLIClient(gemini_config))
-            if openrouter_config.get("enabled"):
-                from scripts.openrouter_client import OpenRouterClient
-
-                fallback_clients.append(OpenRouterClient(openrouter_config))
-            if fallback_clients:
-                from scripts.composite_client import CompositeClient
-
-                timeout = config.get("llm", {}).get(
-                    "fallback_timeout_seconds",
-                    (config.get("composite", {}) or {}).get("timeout_seconds", 240),
-                )
-                return CompositeClient([opencode_client] + fallback_clients, timeout=timeout)
-            return opencode_client
-
-        if gemini_config.get("enabled"):
-            from scripts.gemini_client import GeminiCLIClient
-
-            return GeminiCLIClient(gemini_config)
-
-        return None
+        return CompositeClient(chain, timeout=chain_timeout(config))
     except Exception as e:  # pragma: no cover - defensive, exercised via judge-skipped tests
         logger.warning("Could not build LLM client for quality judge: %s", e)
         return None
@@ -578,7 +596,17 @@ def run_checks(
         # graceful degradation, consistent with detect_rot's own None
         # contract and source_health.py's CLI.
         live_sources = live_source_names(configs) or None
-        findings.extend(_detect_rot(history, probes=probes, live_sources=live_sources))
+        # Pass the configured rules through. Without this, detect_rot silently
+        # fell back to its own defaults and the whole
+        # quality_check.source_health config block — thresholds AND every
+        # feed_overrides entry — had no effect: on 2026-08-29 Karpathy was
+        # flagged at "threshold 90d" while config.yaml set 400 for it.
+        findings.extend(_detect_rot(
+            history,
+            probes=probes,
+            rules=source_health_rules(configs),
+            live_sources=live_sources,
+        ))
     except Exception as e:
         findings.append(Finding(WARN, "source-health-unavailable", f"Layer 1 (source health) failed: {e}", source="layer1"))
 

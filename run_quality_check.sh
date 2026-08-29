@@ -5,9 +5,11 @@
 # journald, deterministic invariants over the rendered briefings, and an LLM
 # judge scoring the editorial goals. See references/quality_monitoring_design.md.
 #
-# Cron (both briefings finish by ~06:25):
-#   40 6 * * 1-6 /home/eric/atlas-morning-briefing/run_quality_check.sh
-#   15 7 * * 0   /home/eric/atlas-morning-briefing/run_quality_check.sh --deep
+# NOT scheduled in cron. run_briefing.sh chains this after both briefings
+# finish, because run length varies with LLM backend health and a clock-based
+# schedule raced the pipeline. Saturday runs pick up --deep from that caller.
+# Invoke by hand for an ad-hoc audit:
+#   ./run_quality_check.sh --dry-run --date YYYY-MM-DD
 #
 # Exit codes: 0 = clean or warnings only, 1 = CRITICAL findings, 2 = the
 # checker itself failed. Cron mails on nonzero.
