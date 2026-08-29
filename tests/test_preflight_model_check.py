@@ -12,6 +12,20 @@ import pytest
 from scripts import preflight_model_check as pf
 
 
+@pytest.fixture(autouse=True)
+def _stub_api_key(monkeypatch):
+    """Give the OpenRouter probe a key so its network call is the mocked one.
+
+    Without this the probe short-circuits on "No API key" before reaching the
+    patched requests.post, so these tests passed locally only because a real
+    key was present in .env — and failed in CI, which has none. Pinning a dummy
+    value here makes them hermetic and independent of the developer's
+    environment.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-used-for-network")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 class TestRosterComesFromConfig:
     """A hardcoded model table in preflight drifts from config and crosses tiers."""
 
