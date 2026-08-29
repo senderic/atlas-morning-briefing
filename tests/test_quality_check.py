@@ -1364,3 +1364,81 @@ class TestConfigDrivenJudgeDimensions:
         # The four dimensions with full history are flat (2 -> 2 the whole
         # way), so nothing should fire at all.
         assert findings == []
+
+
+class TestSourceHealthRulesReachDetectRot:
+    """The configured rules must actually be applied.
+
+    detect_rot was called without `rules`, so the whole
+    quality_check.source_health config block — thresholds and every
+    feed_overrides entry — was silently ignored and it ran on its own
+    defaults. On 2026-08-29 Karpathy was flagged at "threshold 90d" while
+    config.yaml set 400 for it, i.e. an exemption written months earlier had
+    never taken effect.
+    """
+
+    def test_feed_overrides_are_collected(self):
+        rules = qc.source_health_rules({
+            "atlas": {"quality_check": {"source_health": {
+                "feed_overrides": {"Karpathy": {"stale_after_days": 400}}}}},
+        })
+        assert rules["feed_overrides"]["Karpathy"]["stale_after_days"] == 400
+
+    def test_overrides_from_both_pipelines_are_unioned(self):
+        rules = qc.source_health_rules({
+            "atlas": {"quality_check": {"source_health": {
+                "feed_overrides": {"A": {"stale_after_days": 400}}}}},
+            "local": {"quality_check": {"source_health": {
+                "feed_overrides": {"B": {"stale_after_days": 200}}}}},
+        })
+        assert set(rules["feed_overrides"]) == {"A", "B"}
+
+    def test_conflicting_thresholds_take_the_stricter_value(self):
+        rules = qc.source_health_rules({
+            "atlas": {"quality_check": {"source_health": {"stale_after_days": 90}}},
+            "local": {"quality_check": {"source_health": {"stale_after_days": 30}}},
+        })
+        assert rules["stale_after_days"] == 30
+
+    def test_documented_dead_url_runs_maps_to_the_internal_key(self):
+        """config/docs say dead_url_runs; source_health reads dead_url_streak."""
+        rules = qc.source_health_rules({
+            "atlas": {"quality_check": {"source_health": {"dead_url_runs": 5}}},
+        })
+        assert rules["dead_url_streak"] == 5
+
+    def test_no_config_yields_empty_so_defaults_apply(self):
+        assert qc.source_health_rules({"atlas": {}}) == {}
+        assert qc.source_health_rules({}) == {}
+
+    def test_every_produced_key_is_understood_by_detect_rot(self):
+        """A key detect_rot does not know is a silently dead setting."""
+        from scripts.source_health import DEFAULT_RULES
+
+        rules = qc.source_health_rules({
+            "atlas": {"quality_check": {"source_health": {
+                "dead_url_runs": 3, "stale_after_days": 90,
+                "zero_run_threshold": 7, "median_window": 30,
+                "query_window": 14,
+                "feed_overrides": {"X": {"stale_after_days": 400}}}}},
+        })
+        assert set(rules) <= set(DEFAULT_RULES)
+
+    def test_run_checks_passes_the_rules_through(self):
+        seen = {}
+
+        def _detect_rot(history, probes=None, rules=None, live_sources=None):
+            seen["rules"] = rules
+            return []
+
+        layer1 = _no_op_layer1()
+        layer1["detect_rot"] = _detect_rot
+        qc.run_checks(
+            {"atlas": {"quality_check": {"source_health": {
+                "feed_overrides": {"Karpathy": {"stale_after_days": 400}}}}}},
+            today=date(2026, 8, 29),
+            no_judge=True,
+            **layer1,
+            **_no_op_layer2(),
+        )
+        assert seen["rules"]["feed_overrides"]["Karpathy"]["stale_after_days"] == 400

@@ -186,7 +186,8 @@ def main() -> int:
 
     # Extract settings
     feeds = config.get("blog_feeds", [])
-    days_back = config.get("arxiv_days_back", 7)  # Reuse same setting
+    # Blogs have their own cadence; see the note in briefing_runner.run_blog_scan.
+    days_back = config.get("blog_days_back", config.get("arxiv_days_back", 7))
     max_blogs = config.get("max_blogs", 10)
 
     if not feeds:

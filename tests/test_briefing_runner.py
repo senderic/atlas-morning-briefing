@@ -450,3 +450,48 @@ class TestHappeningsUrlDedup:
 
     def test_empty_input(self, minimal_config):
         assert self._runner(minimal_config)._dedupe_happenings_by_url([]) == []
+
+
+class TestBlogWindowIsIndependentOfArxiv:
+    """Blogs and papers have different cadences.
+
+    The blog cutoff reused arxiv_days_back, so at arxiv_days_back=3 a weekly
+    blogger was invisible on most runs — which the quality checker reported as
+    a yield collapse against feeds that were healthy. Measured 2026-08-29 over
+    28 feeds: 17 had posted within 3 days, 19 within 7.
+    """
+
+    def _days_back_used(self, runner, monkeypatch):
+        seen = {}
+
+        class _Scanner:
+            def __init__(self, feeds, days_back, max_items):
+                seen["days_back"] = days_back
+
+            def scan_all_feeds(self):
+                return []
+
+        monkeypatch.setattr("scripts.briefing_runner.BlogScanner", _Scanner)
+        runner.run_blog_scan()
+        return seen["days_back"]
+
+    def test_blog_days_back_wins_when_set(self, minimal_config, monkeypatch):
+        cfg = dict(minimal_config, blog_feeds=[{"name": "x", "url": "u"}],
+                   arxiv_days_back=3, blog_days_back=7)
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        assert self._days_back_used(runner, monkeypatch) == 7
+
+    def test_falls_back_to_arxiv_days_back_when_unset(self, minimal_config, monkeypatch):
+        """Existing configs without the new key keep their current behaviour."""
+        cfg = dict(minimal_config, blog_feeds=[{"name": "x", "url": "u"}],
+                   arxiv_days_back=3)
+        cfg.pop("blog_days_back", None)
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        assert self._days_back_used(runner, monkeypatch) == 3
+
+    def test_defaults_to_seven_when_neither_is_set(self, minimal_config, monkeypatch):
+        cfg = dict(minimal_config, blog_feeds=[{"name": "x", "url": "u"}])
+        cfg.pop("arxiv_days_back", None)
+        cfg.pop("blog_days_back", None)
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        assert self._days_back_used(runner, monkeypatch) == 7

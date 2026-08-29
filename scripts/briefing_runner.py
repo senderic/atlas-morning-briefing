@@ -217,7 +217,16 @@ class BriefingRunner:
         try:
             logger.info("=== Scanning Blog Feeds ===")
             feeds = self.config.get("blog_feeds", [])
-            days_back = self.config.get("arxiv_days_back", 7)
+            # Blogs get their own window. Reusing arxiv_days_back tied the blog
+            # cutoff to a paper-freshness setting: at arxiv_days_back=3 a feed
+            # posting weekly is invisible on most days, which showed up as
+            # "yield collapse" warnings against feeds that were perfectly
+            # healthy. Measured 2026-08-29 across 28 feeds: 17 had posted
+            # within 3 days, 19 within 7. Cross-day dedup already prevents a
+            # widened window from repeating an item the reader has seen.
+            days_back = self.config.get(
+                "blog_days_back", self.config.get("arxiv_days_back", 7)
+            )
             max_blogs = self.config.get("max_blogs", 10)
 
             if not feeds:

@@ -35,6 +35,13 @@ arxiv_topics:
   - "In-situ resource utilization (ISRU) for lunar bases"
 
 # RSS feeds to monitor
+# Removed 2026-08-29 (surfaced by the quality checker's source-rot layer):
+#   BAIR       — unreachable: DNS resolves but TCP 443 times out at 45s on
+#                every scheme/host/path variant. 0 items in 24 runs.
+#   Chip Huyen — dormant: huyenchip.com still advertises /feed.xml as its
+#                canonical feed, so this is not a wrong URL; the newest
+#                entry is 2024-02-28. 0 items in 24 runs.
+# Re-probe before re-adding; both may come back.
 blog_feeds:
   - name: "AWS ML Blog"
     url: "https://aws.amazon.com/blogs/machine-learning/feed/"
@@ -43,14 +50,15 @@ blog_feeds:
   # noticed. Anthropic news arrives through the Brave news queries instead.
   # Do not substitute a community-mirrored feed: unvetted third-party content
   # goes straight into LLM prompts.
+  # Moved 2026-08-29: karpathy.github.io/feed.xml still serves, but its newest
+  # entry is from 2016 — the blog moved to bearblog. Probed: 10 entries,
+  # newest 120d ("Sequoia Ascent 2026 summary").
   - name: "Karpathy"
-    url: "https://karpathy.github.io/feed.xml"
+    url: "https://karpathy.bearblog.dev/feed/"
   - name: "OpenAI"
     url: "https://openai.com/blog/rss.xml"
   - name: "Eugene Yan"
     url: "https://eugeneyan.com/rss/"
-  - name: "Chip Huyen"
-    url: "https://huyenchip.com/feed.xml"
   - name: "Interconnects"
     url: "https://www.interconnects.ai/feed"
   - name: "Lilian Weng"
@@ -59,8 +67,6 @@ blog_feeds:
     url: "https://magazine.sebastianraschka.com/feed"
   - name: "The Gradient"
     url: "https://thegradient.pub/rss/"
-  - name: "BAIR"
-    url: "https://bair.berkeley.edu/blog/feed.xml"
   - name: "DeepMind"
     url: "https://deepmind.google/blog/rss.xml"
   - name: "Hugging Face"
@@ -272,6 +278,14 @@ num_paper_picks: 3
 
 # Date range for arxiv search (days)
 arxiv_days_back: 3
+
+# Blog freshness window, separate from arxiv_days_back. Blogs and papers have
+# different cadences: at 3 days a weekly blogger is invisible on most runs,
+# which the quality checker reported as a yield collapse against feeds that
+# were healthy. Measured 2026-08-29 across 28 feeds: 17 had posted within 3
+# days, 19 within 7, 21 within 14. Cross-day dedup stops a wider window from
+# re-showing an item the reader already saw.
+blog_days_back: 7
 
 # ArXiv fetch behaviour (legacy export.arxiv.org path).
 #

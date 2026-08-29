@@ -212,6 +212,14 @@ num_paper_picks: 3
 # Date range for arxiv search (days)
 arxiv_days_back: 3
 
+# Blog freshness window, separate from arxiv_days_back. Blogs and papers have
+# different cadences: at 3 days a weekly blogger is invisible on most runs,
+# which the quality checker reported as a yield collapse against feeds that
+# were healthy. Measured 2026-08-29 across 28 feeds: 17 had posted within 3
+# days, 19 within 7, 21 within 14. Cross-day dedup stops a wider window from
+# re-showing an item the reader already saw.
+blog_days_back: 7
+
 # ArXiv fetch behaviour (legacy export.arxiv.org path).
 #
 # Topics are scanned SEQUENTIALLY, matching upstream. This used to run 8
