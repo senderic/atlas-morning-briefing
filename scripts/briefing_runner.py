@@ -46,6 +46,7 @@ from scripts.pdf_generator import PDFGenerator
 from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
 from scripts.event_dates import has_only_past_dates
+from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
 from scripts.intelligence import BriefingIntelligence
@@ -315,11 +316,13 @@ class BriefingRunner:
                     freshness=freshness,
                 )
                 for article in aggregator.aggregate_all_queries():
-                    url = article.get("url", "")
-                    if url and url in seen_urls:
+                    # Normalized so the same article fetched under two
+                    # freshness windows is not printed twice.
+                    key = normalize_url(article.get("url", ""))
+                    if key and key in seen_urls:
                         continue
-                    if url:
-                        seen_urls.add(url)
+                    if key:
+                        seen_urls.add(key)
                     articles.append(article)
 
             self.status["news_found"] = len(articles)
@@ -436,7 +439,9 @@ class BriefingRunner:
                 "Fetching fresh happenings (fetch weekday=%s, today=%s)",
                 fetch_weekday, today.weekday(),
             )
-            fetched = self._drop_past_happenings(self.run_happenings_aggregation())
+            fetched = self._drop_past_happenings(
+                self._dedupe_happenings_by_url(self.run_happenings_aggregation())
+            )
             if fetched:
                 self._happenings_cache = list(fetched)
                 self._happenings_cache_date = today.strftime("%Y-%m-%d")
@@ -447,7 +452,9 @@ class BriefingRunner:
                 return fetched
             logger.warning("Happenings fetch returned empty, falling back to cache")
         cached = self._drop_past_happenings(
-            previous_state.get("cached_happenings", [])
+            self._dedupe_happenings_by_url(
+                previous_state.get("cached_happenings", [])
+            )
         )
         if cached:
             cache_date = previous_state.get("cached_happenings_date", "unknown")
@@ -462,6 +469,32 @@ class BriefingRunner:
             return list(cached)
         logger.info("No happenings cache available and today is not fetch day")
         return []
+
+    @staticmethod
+    def _dedupe_happenings_by_url(
+        happenings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Collapse happenings that point at the same document.
+
+        Applied to the cached path as well as the fresh one: a cache written
+        before URL normalization existed still holds raw-string duplicates,
+        and on 2026-08-29 two of them reached the reader — the same San Diego
+        Magazine roundup under a trailing-slash variant, and the same KPBS
+        piece under a ``www.`` variant.
+        """
+        seen = set()
+        deduped = []
+        for item in happenings or []:
+            key = normalize_url(item.get("url", ""))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(item)
+        removed = len(happenings or []) - len(deduped)
+        if removed:
+            logger.info("Dedup: removed %d happening(s) with duplicate URLs", removed)
+        return deduped
 
     def _drop_past_happenings(
         self, happenings: List[Dict[str, Any]]

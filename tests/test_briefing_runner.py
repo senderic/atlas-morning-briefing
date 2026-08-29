@@ -407,3 +407,46 @@ class TestHappeningsStalenessFilter:
 
     def test_empty_input_is_passed_through(self, minimal_config):
         assert self._runner(minimal_config)._drop_past_happenings([]) == []
+
+
+class TestHappeningsUrlDedup:
+    """The same document under a cosmetic URL variant reached the reader twice."""
+
+    def _runner(self, minimal_config):
+        return BriefingRunner(config=minimal_config, dry_run=True)
+
+    def test_trailing_slash_variant_is_collapsed(self, minimal_config):
+        items = [
+            {"title": "Roundup", "url": "https://sdmag.com/things-to-do/x/"},
+            {"title": "Roundup", "url": "https://sdmag.com/things-to-do/x"},
+        ]
+        assert len(self._runner(minimal_config)._dedupe_happenings_by_url(items)) == 1
+
+    def test_www_variant_is_collapsed(self, minimal_config):
+        items = [
+            {"title": "Picks", "url": "https://www.kpbs.org/news/y"},
+            {"title": "Picks", "url": "https://kpbs.org/news/y"},
+        ]
+        assert len(self._runner(minimal_config)._dedupe_happenings_by_url(items)) == 1
+
+    def test_first_occurrence_is_the_one_kept(self, minimal_config):
+        items = [
+            {"title": "first", "url": "https://a.com/p"},
+            {"title": "second", "url": "https://a.com/p/"},
+        ]
+        kept = self._runner(minimal_config)._dedupe_happenings_by_url(items)
+        assert [i["title"] for i in kept] == ["first"]
+
+    def test_distinct_urls_are_all_kept(self, minimal_config):
+        items = [
+            {"title": "a", "url": "https://a.com/1"},
+            {"title": "b", "url": "https://a.com/2"},
+        ]
+        assert len(self._runner(minimal_config)._dedupe_happenings_by_url(items)) == 2
+
+    def test_items_without_a_url_are_not_collapsed_together(self, minimal_config):
+        items = [{"title": "a"}, {"title": "b"}]
+        assert len(self._runner(minimal_config)._dedupe_happenings_by_url(items)) == 2
+
+    def test_empty_input(self, minimal_config):
+        assert self._runner(minimal_config)._dedupe_happenings_by_url([]) == []
