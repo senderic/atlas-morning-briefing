@@ -97,3 +97,44 @@ def test_extract_missing_authors_blogs(intelligence, mock_client):
     calls = mock_client.invoke.call_args_list
     assert calls[0].kwargs["tier"] == "light"
     assert calls[1].kwargs["tier"] == "light"
+
+
+def test_skipped_blurb_does_not_misattribute_later_sources(intelligence, mock_client):
+    """A model that omits one item must not shift blurbs onto wrong sources.
+
+    Free endpoints routinely drop or merge an entry. Matching blurbs to items
+    by position meant every source after the gap got the next source's bio --
+    the failure that put a City News Service blurb under a Times of San Diego
+    story.
+    """
+    items = [
+        {"title": "A", "source": "Times of India"},
+        {"title": "B", "source": "Crypto Briefing"},
+        {"title": "C", "source": "SOFREP"},
+        {"title": "D", "source": "CNBC"},
+    ]
+    # The model answers for 1, 3 and 4 but silently skips 2.
+    mock_client.invoke.return_value = (
+        "[1] About Times of India.\n[3] About SOFREP.\n[4] About CNBC."
+    )
+
+    result = intelligence.generate_author_blurbs(items, "news")
+
+    assert result[0]["author_blurb"] == "About Times of India."
+    assert "author_blurb" not in result[1]  # unanswered, not back-filled wrongly
+    assert result[2]["author_blurb"] == "About SOFREP."
+    assert result[3]["author_blurb"] == "About CNBC."
+
+
+def test_blurb_cache_reuses_one_answer_per_source(intelligence, mock_client):
+    """Two items from the same outlet share one blurb and one lookup."""
+    items = [
+        {"title": "A", "source": "NBC 7 San Diego"},
+        {"title": "B", "source": "NBC 7 San Diego"},
+    ]
+    mock_client.invoke.return_value = "[1] About NBC 7."
+
+    result = intelligence.generate_author_blurbs(items, "news")
+
+    assert result[0]["author_blurb"] == "About NBC 7."
+    assert result[1]["author_blurb"] == "About NBC 7."

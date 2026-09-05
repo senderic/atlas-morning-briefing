@@ -643,12 +643,13 @@ class BriefingIntelligence:
         if not result:
             return items
 
-        # Parse numbered blurbs and update cache
-        blurbs = _parse_numbered_list(result, len(fetch_list))
-        for i, blurb in enumerate(blurbs):
-            if i < len(fetch_list):
-                norm_source = fetch_list[i][0]
-                self.source_blurb_cache[norm_source] = blurb.strip()
+        # Parse numbered blurbs and update cache. Keyed by the model's own
+        # item number so a skipped item cannot shift every later blurb onto
+        # the wrong source.
+        blurbs = _parse_numbered_map(result, len(fetch_list))
+        for i, blurb in blurbs.items():
+            norm_source = fetch_list[i][0]
+            self.source_blurb_cache[norm_source] = blurb.strip()
 
         # 4. Apply newly fetched blurbs to all items
         for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
@@ -715,8 +716,8 @@ class BriefingIntelligence:
         if not result:
             return items
 
-        extracted = _parse_numbered_list(result, len(to_extract))
-        for i, name in enumerate(extracted):
+        extracted = _parse_numbered_map(result, len(to_extract))
+        for i, name in extracted.items():
             idx = indices[i]
             if item_type == "papers":
                 items[idx]["authors"] = [name]
@@ -772,11 +773,11 @@ class BriefingIntelligence:
         if not result:
             return papers
 
-        # Parse numbered summaries back to papers
-        summaries = _parse_numbered_list(result, len(batch))
-        for i, summary in enumerate(summaries):
-            if i < len(papers):
-                papers[i]["brief_summary"] = summary
+        # Parse numbered summaries back to papers, keyed by the model's own
+        # item number -- position would misattribute a skipped summary.
+        summaries = _parse_numbered_map(result, len(batch))
+        for i, summary in summaries.items():
+            papers[i]["brief_summary"] = summary
 
         logger.info(f"Generated summaries for {len(summaries)} papers")
         return papers
@@ -2203,21 +2204,40 @@ class BriefingIntelligence:
         return cross_source[:5]
 
 
-def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
+def _parse_numbered_map(text: str, expected_count: int) -> Dict[int, str]:
     """
-    Parse a numbered list response from the model.
-    Ignores conversational preambles before the first numbered item.
+    Parse a numbered-list response into ``{0-based index: item text}``.
+
+    The model's own ``[n]`` / ``n.`` label is the key -- never the item's
+    position in the response. A model that skips, merges, or reorders an
+    entry (routine on free endpoints) would otherwise shift every later item
+    onto the wrong input, silently attaching one source's blurb or summary to
+    a different source. Labels outside ``1..expected_count`` are dropped, and
+    a repeated label keeps its first occurrence.
+
+    Ignores any conversational preamble before the first numbered item.
 
     Args:
         text: Model response text.
-        expected_count: Expected number of items.
+        expected_count: Number of items that were sent, which bounds the
+            labels that will be accepted.
 
     Returns:
-        List of parsed items.
+        Mapping of 0-based input index to the text the model returned for it.
+        Indices the model did not answer for are simply absent.
     """
-    items = []
-    current_lines = []
+    items: Dict[int, str] = {}
+    current_lines: List[str] = []
     current_num = -1
+
+    def flush() -> None:
+        if current_num == -1 or not current_lines:
+            return
+        idx = current_num - 1
+        if 0 <= idx < expected_count and idx not in items:
+            body = " ".join(l for l in current_lines if l).strip()
+            if body:
+                items[idx] = body
 
     for line in text.strip().split("\n"):
         stripped = line.strip()
@@ -2244,21 +2264,19 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                     break
 
         if new_num is not None and new_num != current_num:
-            # Only append if we've already started a numbered section
-            if current_lines and current_num != -1:
-                items.append(" ".join(current_lines))
+            flush()
             current_num = new_num
             current_lines = [stripped] if stripped else []
         else:
             current_lines.append(stripped)
 
-    # Append the last item if it exists and had a number
-    if current_lines and current_num != -1:
-        items.append(" ".join(current_lines))
+    flush()
 
     # If we found no numbered items, we might have received one giant block.
     # We'll allow it only if we were expecting exactly one item.
     if not items and expected_count == 1 and current_lines:
-        items.append(" ".join(current_lines))
+        body = " ".join(l for l in current_lines if l).strip()
+        if body:
+            items[0] = body
 
-    return items[:expected_count]
+    return items

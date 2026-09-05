@@ -2,7 +2,7 @@
 """Tests for intelligence module."""
 
 import pytest
-from scripts.intelligence import BriefingIntelligence, _parse_numbered_list
+from scripts.intelligence import BriefingIntelligence, _parse_numbered_map
 
 
 class TestExtractScore:
@@ -67,44 +67,63 @@ class TestParseRankedResponse:
         assert "Sub-point one" in result[0][1]
 
 
-class TestParseNumberedList:
+class TestParseNumberedMap:
     def test_bracket_format(self):
         text = "[1] First item.\n[2] Second item.\n[3] Third item."
-        result = _parse_numbered_list(text, 3)
+        result = _parse_numbered_map(text, 3)
         assert len(result) == 3
         assert result[0] == "First item."
 
     def test_dot_format(self):
         text = "1. First.\n2. Second."
-        result = _parse_numbered_list(text, 2)
+        result = _parse_numbered_map(text, 2)
         assert len(result) == 2
         assert result[0] == "First."
 
     def test_limits_to_expected(self):
         text = "[1] A\n[2] B\n[3] C\n[4] D"
-        result = _parse_numbered_list(text, 2)
+        result = _parse_numbered_map(text, 2)
         assert len(result) == 2
+        assert set(result) == {0, 1}
 
     def test_multiline_item(self):
         text = "[1] Start of item.\nMore of the item.\n[2] Next."
-        result = _parse_numbered_list(text, 2)
+        result = _parse_numbered_map(text, 2)
         assert len(result) == 2
         assert "Start of item. More of the item." == result[0]
 
     def test_ignores_preamble(self):
         text = "Sure, here are the blurbs:\n1. First blurb.\n2. Second blurb."
-        result = _parse_numbered_list(text, 2)
+        result = _parse_numbered_map(text, 2)
         assert len(result) == 2
         assert result[0] == "First blurb."
         assert result[1] == "Second blurb."
 
     def test_handles_no_numbers_single_expected(self):
         text = "This is a single block of text."
-        result = _parse_numbered_list(text, 1)
-        assert len(result) == 1
-        assert result[0] == "This is a single block of text."
+        result = _parse_numbered_map(text, 1)
+        assert result == {0: "This is a single block of text."}
 
     def test_handles_no_numbers_multiple_expected(self):
         text = "This is a single block of text, but we expected more."
-        result = _parse_numbered_list(text, 2)
-        assert len(result) == 0  # Should skip as we can't reliably split it
+        result = _parse_numbered_map(text, 2)
+        assert result == {}  # Should skip as we can't reliably split it
+
+    def test_skipped_item_does_not_shift_later_items(self):
+        """A model that omits [2] must not slide [3] and [4] up a slot."""
+        text = "[1] About source one.\n[3] About source three.\n[4] About source four."
+        result = _parse_numbered_map(text, 4)
+        assert result == {
+            0: "About source one.",
+            2: "About source three.",
+            3: "About source four.",
+        }
+
+    def test_out_of_range_label_dropped(self):
+        text = "[1] Real item.\n[9] Invented item."
+        assert _parse_numbered_map(text, 2) == {0: "Real item."}
+
+    def test_repeated_label_keeps_first(self):
+        text = "[1] First answer.\n[2] Second.\n[1] Do-over."
+        result = _parse_numbered_map(text, 2)
+        assert result[0] == "First answer."
