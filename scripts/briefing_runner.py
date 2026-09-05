@@ -49,6 +49,8 @@ from scripts.event_dates import has_only_past_dates
 from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
+from scripts.briefing_extensions import generate_section, load_extension_sections
+from scripts.intelligence import SYSTEM_PROMPT as INTELLIGENCE_SYSTEM_PROMPT
 from scripts.intelligence import BriefingIntelligence
 from scripts.leak_detection import is_cot_leak
 from scripts.llm_client import BaseLLMClient
@@ -124,9 +126,10 @@ class BriefingRunner:
         self.state_file_path = config.get("state_file_path", ".atlas-state.json")
         self.section_order = config.get("section_order", ["stocks", "news", "top_papers", "blogs"])
         features = config.get("features", {})
-        self.feature_solo_founder_angle = features.get("solo_founder_angle", True)
-        self.feature_agent_cost_optimization = features.get("agent_cost_optimization", True)
         self.feature_weekly_deep_dive = features.get("weekly_deep_dive", True)
+        # Fork-only sections, declared in config rather than coded here.
+        # See scripts/briefing_extensions.py for why.
+        self.extension_sections = load_extension_sections(config)
         self._headings = config.get("section_headings", {})
         self._happenings_cache: List[Dict[str, Any]] = []
         self._happenings_cache_date: Optional[str] = None
@@ -178,9 +181,9 @@ class BriefingRunner:
         )
         logger.debug(
             "Initialized BriefingRunner: state_file=%s section_order=%s "
-            "features(solo=%s agent=%s weekly=%s) dry_run=%s use_snapshots=%s",
+            "extensions=%s weekly=%s dry_run=%s use_snapshots=%s",
             self.state_file_path, self.section_order,
-            self.feature_solo_founder_angle, self.feature_agent_cost_optimization,
+            [x.key for x in self.extension_sections],
             self.feature_weekly_deep_dive, self.dry_run, self.use_snapshots,
         )
 
@@ -899,22 +902,16 @@ class BriefingRunner:
             md.append(SYNTHESIS_UNAVAILABLE_TEXT)
             self._record_degraded_synthesis()
 
-        if self.feature_solo_founder_angle:
-            solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
-            if solo_angle:
-                md.append(f"## {self._headings.get('solo_founder_angle', 'Solo Founder Angle')}\n\n")
-                md.append(f"{solo_angle}\n\n")
+        for section in self.extension_sections:
+            body = synthesis.get(section.key, "") if synthesis else ""
+            if body:
+                md.append(f"## {self._headings.get(section.key, section.heading)}\n\n")
+                md.append(f"{body}\n\n")
 
-        if self.feature_agent_cost_optimization:
-            cost_play = synthesis.get("agent_cost_play", "") if synthesis else ""
-            if cost_play:
-                md.append(f"## {self._headings.get('agent_cost_optimization', 'Agent Cost-Optimization Play')}\n\n")
-                md.append(f"{cost_play}\n\n")
-
-            # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
-            # Only show if an entity has a spike (e.g., 5+ mentions).
-            # entity_mentions = synthesis.get("entity_mentions", [])
-            # if entity_mentions: ...
+        # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
+        # Only show if an entity has a spike (e.g., 5+ mentions).
+        # entity_mentions = synthesis.get("entity_mentions", [])
+        # if entity_mentions: ...
 
         section_order = self.section_order
 
@@ -1842,27 +1839,24 @@ class BriefingRunner:
                 previous_state=previous_state,
             )
 
-            if self.feature_solo_founder_angle:
+            for section in self.extension_sections:
                 try:
-                    solo_angle = self.intelligence.generate_solo_startup_angle(
-                        papers, blogs[:6], news[:6], top_papers[:3],
+                    body = generate_section(
+                        section,
+                        self.intelligence.client,
+                        INTELLIGENCE_SYSTEM_PROMPT,
+                        papers=papers,
+                        blogs=blogs,
+                        news=news,
+                        top_papers=top_papers,
                         emerging_themes=emerging_themes,
                     )
-                    if solo_angle:
-                        synthesis["solo_startup"] = solo_angle
+                    if body:
+                        synthesis[section.key] = body
                 except Exception as e:
-                    logger.warning(f"Solo-startup angle generation failed: {e}")
-
-            if self.feature_agent_cost_optimization:
-                try:
-                    cost_play = self.intelligence.generate_agent_cost_optimization(
-                        papers, blogs[:6], news[:6], top_papers[:3],
-                        emerging_themes=emerging_themes,
+                    logger.warning(
+                        "Extension section %s failed: %s", section.key, e
                     )
-                    if cost_play:
-                        synthesis["agent_cost_play"] = cost_play
-                except Exception as e:
-                    logger.warning(f"Agent cost-optimization generation failed: {e}")
 
             # Feature 3: Competitive Intelligence (entity tracking)
             tracked_entities = self.config.get("tracked_entities", [])

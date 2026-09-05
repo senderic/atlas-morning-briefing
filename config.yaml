@@ -142,6 +142,88 @@ briefing_profile:
   audience: "an AI researcher, engineer, or defense analyst"
   landscape: "the AI, defense-tech, and space exploration landscape"
 
+# --- Fork-local briefing sections (scripts/briefing_extensions.py) ---
+# Upstream deleted these sections outright, so they exist only in this fork.
+# Their wording lives here as data instead of inside scripts/intelligence.py:
+# retargeting a section at a different audience, stack, or output shape is a
+# config edit, and the shared code stays mergeable with upstream. Sections
+# render in the order below, right after the Executive Summary.
+# `features.<key>: false` still switches one off.
+extension_sections:
+  - key: solo_founder_angle
+    heading: "Solo Founder Angle"
+    tier: heavy
+    persona: >-
+      You are a startup scout for a solo founder -- a one-person company, in
+      the spirit of Pieter Levels, Daniel Vassallo, and the IndieHackers
+      crowd. The founder is a senior backend and AI-infrastructure engineer
+      working alone, with a few free hours a week, who ships small, focused,
+      AI-native products in two to six weeks and wants paying customers early
+      ($500-$10K MRR is a win; no investors).
+    task: >-
+      Using ONLY today's signals below, propose ONE concrete product a solo
+      founder could start this month.
+    fields:
+      - "**Product:** <one sentence -- what it does>"
+      - "**Who pays:** <the buyer, and why they pay>"
+      - "**Signal today:** <which paper/blog/news item triggered this, and why>"
+      - "**Wedge / unfair advantage:** <why one person can win this niche>"
+      - "**MVP in 2-4 weeks:** <3-5 bullets, concrete technical choices>"
+      - "**Distribution:** <where the first 10 paying customers come from>"
+      - "**Pricing:** <starting price, e.g. $19/mo, $99 one-time>"
+      - "**Risk / why it might fail:** <one honest sentence>"
+    rules:
+      - >-
+        Must be buildable alone: no platform, no marketplace that needs
+        two-sided liquidity, no enterprise sales cycle.
+      - "Must follow from TODAY's signals -- not a generic SaaS idea."
+      - >-
+        Prefer painful, niche problems whose buyers already pay for something
+        adjacent.
+      - "Boring beats clever. Distribution beats novelty."
+
+  # Retargeted 2026-09-05. This was "Agent Cost-Optimization Play", written
+  # for an AWS principal engineer on Bedrock/Trainium -- a stack this pipeline
+  # left when it moved to OpenRouter, which is why the section kept shipping
+  # advice about Bedrock prompt caching and re:Invent 2025. It now addresses
+  # the machine the briefing actually runs on.
+  - key: pipeline_efficiency_play
+    heading: "Pipeline Efficiency Play"
+    tier: heavy
+    persona: >-
+      You advise an engineer who runs a self-hosted, cron-driven LLM pipeline
+      on a single Linux box: free and low-cost hosted models behind an
+      OpenAI-compatible API, a tiered model roster (heavy / medium / light)
+      with retry and fallback chains, and a hard requirement that a nightly
+      run costs near nothing and finishes unattended. They measure tokens per
+      run, wall-clock time, failed calls, and output quality -- not cloud
+      bills.
+    task: >-
+      Using ONLY today's signals below, propose ONE concrete change they could
+      make to that pipeline this week.
+    fields:
+      - "**Play:** <one sentence -- the specific change>"
+      - "**Signal today:** <which paper/blog/news item triggered this, and why>"
+      - >-
+        **Mechanism:** <how it helps -- reasoning control, context trimming,
+        structured output, batching, caching, model routing, retry policy,
+        quantization, local inference, ...>
+      - >-
+        **Estimated impact:** <concrete tokens, seconds, percentage, or
+        failure-rate change, and be honest about the uncertainty>
+      - "**What to change:** <the specific parameter, prompt, or code path>"
+      - "**Try this week:** <3-5 bullets, concrete steps with time estimates>"
+      - "**Watch-out:** <one honest sentence on where this might not pay off>"
+    rules:
+      - "Reference TODAY's signals; no generic best-practice filler."
+      - >-
+        Prefer plays with a measurable token, latency, or failure-rate effect
+        over architectural opinions.
+      - "Name the specific model, parameter, or setting where it matters."
+      - >-
+        If today's signals suggest no strong play, say so plainly and propose
+        the smallest useful experiment instead.
+
 # Stock watchlist (Finnhub API)
 stocks:
   - AMZN
