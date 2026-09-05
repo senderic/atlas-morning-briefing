@@ -5,6 +5,7 @@ Verifies config-driven headings, section ordering, feature gates, and
 backward compatibility of defaults in the refactored BriefingRunner.
 """
 
+import copy
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -105,9 +106,29 @@ MAIN_CONFIG = {
     },
     "features": {
         "solo_founder_angle": True,
-        "agent_cost_optimization": True,
+        "pipeline_efficiency_play": True,
         "weekly_deep_dive": True,
     },
+    "extension_sections": [
+        {
+            "key": "solo_founder_angle",
+            "heading": "Solo Founder Angle",
+            "tier": "heavy",
+            "persona": "You are a startup scout for a solo founder.",
+            "task": "Propose ONE product.",
+            "fields": ["**Product:** <one sentence>"],
+            "rules": ["Must be buildable alone."],
+        },
+        {
+            "key": "pipeline_efficiency_play",
+            "heading": "Pipeline Efficiency Play",
+            "tier": "heavy",
+            "persona": "You advise an engineer running a cron-driven LLM pipeline.",
+            "task": "Propose ONE change.",
+            "fields": ["**Play:** <one sentence>"],
+            "rules": ["Reference TODAY's signals."],
+        },
+    ],
     "epub": {
         "title_format": "Morning Briefing - {date}",
         "author": "Atlas",
@@ -215,14 +236,27 @@ class TestConfigDrivenDefaults:
         monkeypatch.chdir(tmp_path)
         minimal = {"bedrock": {"enabled": False}, "gemini": {"enabled": False}}
         runner = BriefingRunner(config=minimal, dry_run=True)
-        assert runner.feature_solo_founder_angle is True
-        assert runner.feature_agent_cost_optimization is True
         assert runner.feature_weekly_deep_dive is True
+        # No extension_sections declared -> none load.
+        assert runner.extension_sections == []
+
+    def test_extension_sections_loaded_for_main(self, main_runner):
+        assert [s.key for s in main_runner.extension_sections] == [
+            "solo_founder_angle",
+            "pipeline_efficiency_play",
+        ]
 
     def test_feature_gates_local_disabled(self, local_runner):
-        assert local_runner.feature_solo_founder_angle is False
-        assert local_runner.feature_agent_cost_optimization is False
         assert local_runner.feature_weekly_deep_dive is False
+        assert local_runner.extension_sections == []
+
+    def test_feature_flag_disables_a_declared_section(self, tmp_path, monkeypatch):
+        """features.<key>: false still switches a declared section off."""
+        monkeypatch.chdir(tmp_path)
+        cfg = copy.deepcopy(MAIN_CONFIG)
+        cfg["features"]["pipeline_efficiency_play"] = False
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        assert [s.key for s in runner.extension_sections] == ["solo_founder_angle"]
 
     def test_headings_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -287,28 +321,36 @@ class TestLocalMarkdownRendering:
         assert "San Diego / California News" in md
         assert "Local Sources & Analysis" not in md
 
-    def test_local_solo_founder_not_rendered(self, local_runner):
+    def test_local_extension_sections_not_rendered(self, local_runner):
         news = _sample_news(5)
         blogs = _sample_blogs(4)
-        synthesis = {"solo_startup": "A solo startup idea", "agent_cost_play": "A cost play"}
+        synthesis = {
+            "solo_founder_angle": "A solo startup idea",
+            "pipeline_efficiency_play": "A pipeline play",
+        }
         md = local_runner.generate_markdown_briefing(
             papers=[], blogs=blogs, stocks=[], news=news,
             top_papers=[], synthesis=synthesis,
         )
         assert "Solo Founder Angle" not in md
-        assert "Agent Cost-Optimization" not in md
+        assert "Pipeline Efficiency Play" not in md
 
-    def test_main_config_renders_solo_and_agent(self, main_runner):
+    def test_main_config_renders_extension_sections(self, main_runner):
         news = _sample_news(5)
         blogs = _sample_blogs(4)
         papers = _sample_papers(3)
-        synthesis = {"solo_startup": "A solo startup angle", "agent_cost_play": "A cost play"}
+        synthesis = {
+            "solo_founder_angle": "A solo startup angle",
+            "pipeline_efficiency_play": "A pipeline play",
+        }
         md = main_runner.generate_markdown_briefing(
             papers=papers, blogs=blogs, stocks=[], news=news,
             top_papers=papers, synthesis=synthesis,
         )
-        assert "Solo Founder Angle" in md
-        assert "Agent Cost-Optimization Play" in md
+        assert "## Solo Founder Angle" in md
+        assert "## Pipeline Efficiency Play" in md
+        # Declaration order is render order.
+        assert md.index("Solo Founder Angle") < md.index("Pipeline Efficiency Play")
 
     def test_local_news_renders_articles(self, local_runner):
         news = _sample_news(3)
@@ -446,9 +488,9 @@ class TestLocalRunOrchestration:
         runner.intelligence.synthesize_briefing.return_value = {
             "editorial_intro": "Local editorial summary"
         }
-        # These two must NOT be called for local config — side effects check below
-        runner.intelligence.generate_solo_startup_angle.return_value = "SHOULD NOT APPEAR"
-        runner.intelligence.generate_agent_cost_optimization.return_value = "SHOULD NOT APPEAR"
+        # The local config declares no extension_sections, so the extension
+        # generator must never reach the client.
+        runner.intelligence.client.invoke.return_value = "SHOULD NOT APPEAR"
         runner.intelligence.detect_entity_mentions.return_value = []
         runner._enrich_papers = MagicMock(side_effect=lambda p, t: p)
 
@@ -460,8 +502,7 @@ class TestLocalRunOrchestration:
             rc = runner.run()
 
         assert rc in (0, 1)
-        runner.intelligence.generate_solo_startup_angle.assert_not_called()
-        runner.intelligence.generate_agent_cost_optimization.assert_not_called()
+        runner.intelligence.client.invoke.assert_not_called()
         runner.intelligence.generate_weekly_deep_dive.assert_not_called()
 
         # Verify the markdown does not contain disabled features
@@ -470,7 +511,7 @@ class TestLocalRunOrchestration:
         content = md_files[0].read_text()
         assert "SHOULD NOT APPEAR" not in content
         assert "Solo Founder Angle" not in content
-        assert "Agent Cost-Optimization" not in content
+        assert "Pipeline Efficiency Play" not in content
         assert "Local editorial summary" in content
         assert "San Diego / California News" in content
         assert "Local Sources & Analysis" in content
@@ -519,8 +560,7 @@ class TestLocalRunOrchestration:
         main_runner.intelligence.assess_reproduction_feasibility.side_effect = lambda p: p
         main_runner.intelligence.generate_author_blurbs.side_effect = lambda items, t: items
         main_runner.intelligence.synthesize_briefing.return_value = {"editorial_intro": "Main summary"}
-        main_runner.intelligence.generate_solo_startup_angle.return_value = "Solo angle text"
-        main_runner.intelligence.generate_agent_cost_optimization.return_value = "Cost play text"
+        main_runner.intelligence.client.invoke.return_value = "Extension section body"
         main_runner.intelligence.detect_entity_mentions.return_value = []
         main_runner._enrich_papers = MagicMock(side_effect=lambda p, t: p)
 
@@ -532,15 +572,20 @@ class TestLocalRunOrchestration:
             rc = main_runner.run()
 
         assert rc in (0, 1)
-        main_runner.intelligence.generate_solo_startup_angle.assert_called_once()
-        main_runner.intelligence.generate_agent_cost_optimization.assert_called_once()
+        # One client call per declared extension section.
+        tiers = [
+            kwargs.get("tier")
+            for _, kwargs in main_runner.intelligence.client.invoke.call_args_list
+        ]
+        assert tiers == ["heavy", "heavy"]
 
         md_files = list(tmp_path.glob("briefings/Atlas-Briefing-*.md"))
         assert len(md_files) == 1
         content = md_files[0].read_text()
         assert "Atlas Morning Briefing" in content
-        assert "Solo Founder Angle" in content
-        assert "Agent Cost-Optimization Play" in content
+        assert "## Solo Founder Angle" in content
+        assert "## Pipeline Efficiency Play" in content
+        assert "Extension section body" in content
         assert "AI & Tech News" in content
 
 

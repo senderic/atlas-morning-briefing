@@ -16,7 +16,7 @@ from scripts.llm_client import BaseLLMClient
 from scripts.intelligence import (
     BriefingIntelligence,
     SYSTEM_PROMPT,
-    _parse_numbered_list,
+    _parse_numbered_map,
     _sanitize_prompt_input,
     _strip_trailing_rationale,
 )
@@ -207,20 +207,20 @@ class TestStripTrailingRationale:
         assert _strip_trailing_rationale(text) == text
 
 
-class TestParseNumberedList:
+class TestParseNumberedMap:
     def test_handles_paren_format(self):
-        items = _parse_numbered_list("1) first\n2) second", 2)
-        assert items == ["first", "second"]
+        items = _parse_numbered_map("1) first\n2) second", 2)
+        assert items == {0: "first", 1: "second"}
 
     def test_handles_colon_format(self):
-        items = _parse_numbered_list("1: alpha\n2: beta", 2)
-        assert items == ["alpha", "beta"]
+        items = _parse_numbered_map("1: alpha\n2: beta", 2)
+        assert items == {0: "alpha", 1: "beta"}
 
     def test_empty_input(self):
-        assert _parse_numbered_list("", 5) == []
+        assert _parse_numbered_map("", 5) == {}
 
     def test_skips_only_whitespace(self):
-        assert _parse_numbered_list("   \n  \n", 5) == []
+        assert _parse_numbered_map("   \n  \n", 5) == {}
 
 
 # ---------- filter_papers_by_relevance ----------

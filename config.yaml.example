@@ -106,6 +106,34 @@ briefing_profile:
   #   - "Policy and rule changes with concrete effects."
   #   - "Market and investment angles. Secondary -- never lead with them."
 
+# Optional extra sections rendered after the Executive Summary, defined as
+# data rather than code (scripts/briefing_extensions.py). Each entry becomes
+# one "## Heading" section written by one LLM call against the day's signals.
+# Editing a persona, field, or rule retargets a section without touching any
+# Python. Omit the key entirely for a briefing that needs no extra sections;
+# `features.<key>: false` switches one off without deleting it.
+#
+# extension_sections:
+#   - key: solo_founder_angle          # synthesis key + features flag
+#     heading: "Solo Founder Angle"
+#     tier: heavy                      # light | medium | heavy
+#     persona: >-
+#       Who is writing, and for whom. Be concrete about the reader's stack,
+#       constraints, and what they measure -- a stale persona is how a section
+#       ends up giving advice about a platform the reader left.
+#     task: >-
+#       Using ONLY today's signals below, propose ONE concrete ...
+#     fields:                          # the exact markdown skeleton to fill
+#       - "**Product:** <one sentence -- what it does>"
+#       - "**Risk / why it might fail:** <one honest sentence>"
+#     rules:                           # section-specific constraints
+#       - "Must follow from TODAY's signals -- not a generic idea."
+#     limits:                          # optional signal caps per source kind
+#       news: 6                        # top_papers/papers/blogs/news/themes
+#
+# Grounding rules (cite only what is in <signals>, today's date, no leaked
+# reasoning) are appended to every section automatically -- do not repeat them.
+
 # Default Brave freshness window for news queries with no branch binding
 # ("pd" past day, "pw" past week, "pm" past month). Interest-graph branches can
 # override it per node -- see references/config_guide.md.

@@ -643,12 +643,13 @@ class BriefingIntelligence:
         if not result:
             return items
 
-        # Parse numbered blurbs and update cache
-        blurbs = _parse_numbered_list(result, len(fetch_list))
-        for i, blurb in enumerate(blurbs):
-            if i < len(fetch_list):
-                norm_source = fetch_list[i][0]
-                self.source_blurb_cache[norm_source] = blurb.strip()
+        # Parse numbered blurbs and update cache. Keyed by the model's own
+        # item number so a skipped item cannot shift every later blurb onto
+        # the wrong source.
+        blurbs = _parse_numbered_map(result, len(fetch_list))
+        for i, blurb in blurbs.items():
+            norm_source = fetch_list[i][0]
+            self.source_blurb_cache[norm_source] = blurb.strip()
 
         # 4. Apply newly fetched blurbs to all items
         for i, (item, s_info) in enumerate(zip(items, item_source_infos)):
@@ -715,8 +716,8 @@ class BriefingIntelligence:
         if not result:
             return items
 
-        extracted = _parse_numbered_list(result, len(to_extract))
-        for i, name in enumerate(extracted):
+        extracted = _parse_numbered_map(result, len(to_extract))
+        for i, name in extracted.items():
             idx = indices[i]
             if item_type == "papers":
                 items[idx]["authors"] = [name]
@@ -772,11 +773,11 @@ class BriefingIntelligence:
         if not result:
             return papers
 
-        # Parse numbered summaries back to papers
-        summaries = _parse_numbered_list(result, len(batch))
-        for i, summary in enumerate(summaries):
-            if i < len(papers):
-                papers[i]["brief_summary"] = summary
+        # Parse numbered summaries back to papers, keyed by the model's own
+        # item number -- position would misattribute a skipped summary.
+        summaries = _parse_numbered_map(result, len(batch))
+        for i, summary in summaries.items():
+            papers[i]["brief_summary"] = summary
 
         logger.info(f"Generated summaries for {len(summaries)} papers")
         return papers
@@ -1623,185 +1624,10 @@ class BriefingIntelligence:
         logger.info("Briefing synthesis complete")
         return {"editorial_intro": result.strip()}
 
-    def generate_solo_startup_angle(
-        self,
-        papers: List[Dict[str, Any]],
-        blogs: List[Dict[str, Any]],
-        news: List[Dict[str, Any]],
-        top_papers: List[Dict[str, Any]],
-        emerging_themes: Optional[List[str]] = None,
-    ) -> str:
-        """Generate one concrete solo-founder (1-man company) startup angle
-        based on today's signals. Inspired by Pieter Levels / Daniel Vassallo style:
-        small, focused, AI-native, no-team, ship-fast, paid-from-day-one.
-
-        Returns markdown string (the angle), or empty string when unavailable.
-        """
-        if not self.available:
-            return ""
-
-        sections = []
-        if top_papers:
-            sections.append(
-                "TOP PAPERS:\n"
-                + "\n".join(
-                    f"- {p.get('title', '')}" for p in top_papers[:3]
-                )
-            )
-        if papers:
-            sections.append(
-                "OTHER PAPERS:\n"
-                + "\n".join(f"- {p.get('title', '')}" for p in papers[:6])
-            )
-        if blogs:
-            sections.append(
-                "BLOGS:\n"
-                + "\n".join(
-                    f"- [{b.get('source', '')}] {b.get('title', '')}"
-                    for b in blogs[:6]
-                )
-            )
-        if news:
-            sections.append(
-                "NEWS:\n"
-                + "\n".join(f"- {n.get('title', '')}" for n in news[:6])
-            )
-        if emerging_themes:
-            sections.append(
-                "EMERGING THEMES:\n"
-                + "\n".join(f"- {t}" for t in emerging_themes)
-            )
-
-        if not sections:
-            return ""
-
-        all_data = "\n\n".join(sections)
-
-        prompt = (
-            "You are a startup scout for a solo founder (1-man company) in the "
-            "style of Pieter Levels (Nomad List, Photo AI), Daniel Vassallo, "
-            "and the IndieHackers community. The founder is a senior AWS "
-            "principal engineer with strong backend / AI infra chops, no team, "
-            "and limited free hours per week. They want to build small, "
-            "focused, AI-native products that can be shipped in 2-6 weeks and "
-            "reach paying customers fast ($500-$10K MRR is great, no VC needed).\n\n"
-            "Based ONLY on today's signals below, propose ONE concrete solo "
-            "startup idea. Use this exact markdown structure (be terse, no fluff):\n\n"
-            "**Product:** <one sentence — what it does>\n"
-            "**Who pays:** <ICP — be specific about who and why they pay>\n"
-            "**Signal today:** <which paper/blog/news item triggered this and why>\n"
-            "**Wedge / unfair advantage:** <why a solo dev can win this niche>\n"
-            "**MVP in 2-4 weeks:** <3-5 bullets, concrete tech choices>\n"
-            "**Distribution:** <where/how to get the first 10 paying customers>\n"
-            "**Pricing:** <starting price, e.g. $19/mo, $99 one-time, etc.>\n"
-            "**Risk / why it might fail:** <one honest sentence>\n\n"
-            "Rules:\n"
-            "- Must be buildable solo. No 'platform', no 'marketplace requiring "
-            "liquidity', no enterprise sales cycle.\n"
-            "- Must reference TODAY's signals; don't propose generic ideas.\n"
-            "- Prefer wedges with painful, niche, willing-to-pay buyers.\n"
-            "- Boring beats clever. Distribution beats novelty.\n\n"
-            f"<signals>\n{all_data}\n</signals>"
-        )
-
-        result = self.client.invoke(
-            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
-        )
-        if not result:
-            return ""
-        logger.info("Solo-founder startup angle generated")
-        return result.strip()
-
-    def generate_agent_cost_optimization(
-        self,
-        papers: List[Dict[str, Any]],
-        blogs: List[Dict[str, Any]],
-        news: List[Dict[str, Any]],
-        top_papers: List[Dict[str, Any]],
-        emerging_themes: Optional[List[str]] = None,
-    ) -> str:
-        """Generate one concrete agent cost-optimization play grounded in today's signals.
-        Audience: AWS principal engineer running agents on Bedrock / Trainium / Inferentia,
-        thinking about $/session, latency, throughput, and how to actually move the number.
-        Returns markdown (the play), or empty string when unavailable.
-        """
-        if not self.available:
-            return ""
-
-        sections = []
-        if top_papers:
-            sections.append(
-                "TOP PAPERS:\n"
-                + "\n".join(
-                    f"- {p.get('title', '')}" for p in top_papers[:3]
-                )
-            )
-        if papers:
-            sections.append(
-                "OTHER PAPERS:\n"
-                + "\n".join(f"- {p.get('title', '')}" for p in papers[:6])
-            )
-        if blogs:
-            sections.append(
-                "BLOGS:\n"
-                + "\n".join(
-                    f"- [{b.get('source', '')}] {b.get('title', '')}"
-                    for b in blogs[:6]
-                )
-            )
-        if news:
-            sections.append(
-                "NEWS:\n"
-                + "\n".join(f"- {n.get('title', '')}" for n in news[:6])
-            )
-        if emerging_themes:
-            sections.append(
-                "EMERGING THEMES:\n"
-                + "\n".join(f"- {t}" for t in emerging_themes)
-            )
-
-        if not sections:
-            return ""
-
-        all_data = "\n\n".join(sections)
-
-        prompt = (
-            "You are an AWS principal engineer focused on agent cost "
-            "optimization. The reader runs LLM agents on AWS (Bedrock, "
-            "SageMaker, Trainium / Inferentia, Neuron SDK) and cares about "
-            "$/session, latency P50/P99, throughput, and total monthly spend. "
-            "They want ONE concrete cost-optimization play per day, grounded "
-            "in today's signals, that they could actually try this week.\n\n"
-            "Use this exact markdown structure (terse, no fluff):\n\n"
-            "**Play:** <one sentence — the specific tactic>\n"
-            "**Signal today:** <which paper/blog/news triggered this and why>\n"
-            "**Mechanism:** <how it reduces cost: caching, routing, distillation, "
-            "context compression, batching, KV reuse, speculative decoding, "
-            "smaller model, tool reduction, etc.>\n"
-            "**Estimated impact:** <concrete % or $ range — e.g. '30-50% fewer "
-            "input tokens', '$0.012 → $0.003 per session', '2x throughput on "
-            "trn1.2xlarge'. Be honest about uncertainty.>\n"
-            "**AWS-specific angle:** <Bedrock prompt caching, Trainium NKI, "
-            "Inferentia, SageMaker batch, etc. — what to actually use>\n"
-            "**Try this week:** <3-5 bullets, concrete steps, time estimate>\n"
-            "**Watch-out:** <one honest sentence on where the savings might "
-            "not materialize — e.g. cold-cache, quality regression, hidden cost>\n\n"
-            "Rules:\n"
-            "- Reference TODAY's signals; don't propose generic AWS Well-Architected fluff.\n"
-            "- Prefer plays with measurable $/% impact over architectural opinions.\n"
-            "- Be specific about model IDs, instance types, or AWS services when relevant.\n"
-            "- If today's signals don't suggest a strong play, say so honestly and "
-            "propose the smallest useful experiment.\n\n"
-            f"<signals>\n{all_data}\n</signals>"
-        )
-
-        result = self.client.invoke(
-            prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
-        )
-        if not result:
-            return ""
-        logger.info("Agent cost-optimization play generated")
-        return result.strip()
+    # generate_solo_startup_angle / generate_agent_cost_optimization used to
+    # live here. They are fork-only sections upstream deleted, and their
+    # wording is now config data -- see scripts/briefing_extensions.py and
+    # `extension_sections` in config.yaml.
 
     def track_trending(
         self,
@@ -2203,21 +2029,40 @@ class BriefingIntelligence:
         return cross_source[:5]
 
 
-def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
+def _parse_numbered_map(text: str, expected_count: int) -> Dict[int, str]:
     """
-    Parse a numbered list response from the model.
-    Ignores conversational preambles before the first numbered item.
+    Parse a numbered-list response into ``{0-based index: item text}``.
+
+    The model's own ``[n]`` / ``n.`` label is the key -- never the item's
+    position in the response. A model that skips, merges, or reorders an
+    entry (routine on free endpoints) would otherwise shift every later item
+    onto the wrong input, silently attaching one source's blurb or summary to
+    a different source. Labels outside ``1..expected_count`` are dropped, and
+    a repeated label keeps its first occurrence.
+
+    Ignores any conversational preamble before the first numbered item.
 
     Args:
         text: Model response text.
-        expected_count: Expected number of items.
+        expected_count: Number of items that were sent, which bounds the
+            labels that will be accepted.
 
     Returns:
-        List of parsed items.
+        Mapping of 0-based input index to the text the model returned for it.
+        Indices the model did not answer for are simply absent.
     """
-    items = []
-    current_lines = []
+    items: Dict[int, str] = {}
+    current_lines: List[str] = []
     current_num = -1
+
+    def flush() -> None:
+        if current_num == -1 or not current_lines:
+            return
+        idx = current_num - 1
+        if 0 <= idx < expected_count and idx not in items:
+            body = " ".join(l for l in current_lines if l).strip()
+            if body:
+                items[idx] = body
 
     for line in text.strip().split("\n"):
         stripped = line.strip()
@@ -2244,21 +2089,19 @@ def _parse_numbered_list(text: str, expected_count: int) -> List[str]:
                     break
 
         if new_num is not None and new_num != current_num:
-            # Only append if we've already started a numbered section
-            if current_lines and current_num != -1:
-                items.append(" ".join(current_lines))
+            flush()
             current_num = new_num
             current_lines = [stripped] if stripped else []
         else:
             current_lines.append(stripped)
 
-    # Append the last item if it exists and had a number
-    if current_lines and current_num != -1:
-        items.append(" ".join(current_lines))
+    flush()
 
     # If we found no numbered items, we might have received one giant block.
     # We'll allow it only if we were expecting exactly one item.
     if not items and expected_count == 1 and current_lines:
-        items.append(" ".join(current_lines))
+        body = " ".join(l for l in current_lines if l).strip()
+        if body:
+            items[0] = body
 
-    return items[:expected_count]
+    return items

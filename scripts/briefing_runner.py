@@ -49,6 +49,8 @@ from scripts.event_dates import has_only_past_dates
 from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
+from scripts.briefing_extensions import generate_section, load_extension_sections
+from scripts.intelligence import SYSTEM_PROMPT as INTELLIGENCE_SYSTEM_PROMPT
 from scripts.intelligence import BriefingIntelligence
 from scripts.leak_detection import is_cot_leak
 from scripts.llm_client import BaseLLMClient
@@ -85,6 +87,21 @@ def format_briefing_filename(file_naming: str, now: datetime) -> str:
 class BriefingRunner:
     """Main orchestrator for morning briefing generation."""
 
+    # A rendered item is preferred at or above this 1-5 quality score, but a
+    # low score never shortens a section on its own -- see _select_by_score.
+    MIN_DISPLAY_SCORE = 3
+
+    # Blog posts rendered per briefing. The ranker upstream already caps its
+    # own picks; this is the display bound.
+    BLOG_DISPLAY_COUNT = 5
+
+    # Spare papers carried past num_paper_picks. Three gates run between
+    # scoring and rendering -- the reproduction-feasibility gate, the 1-5
+    # quality score, and the display filter -- and a pool cut to exactly
+    # num_paper_picks has nothing left to promote when one of them drops a
+    # paper. That is how a 3-pick section shipped 2 papers out of 183 fetched.
+    PAPER_CANDIDATE_BUFFER = 3
+
     def __init__(
         self,
         config: Dict[str, Any],
@@ -109,9 +126,10 @@ class BriefingRunner:
         self.state_file_path = config.get("state_file_path", ".atlas-state.json")
         self.section_order = config.get("section_order", ["stocks", "news", "top_papers", "blogs"])
         features = config.get("features", {})
-        self.feature_solo_founder_angle = features.get("solo_founder_angle", True)
-        self.feature_agent_cost_optimization = features.get("agent_cost_optimization", True)
         self.feature_weekly_deep_dive = features.get("weekly_deep_dive", True)
+        # Fork-only sections, declared in config rather than coded here.
+        # See scripts/briefing_extensions.py for why.
+        self.extension_sections = load_extension_sections(config)
         self._headings = config.get("section_headings", {})
         self._happenings_cache: List[Dict[str, Any]] = []
         self._happenings_cache_date: Optional[str] = None
@@ -163,9 +181,9 @@ class BriefingRunner:
         )
         logger.debug(
             "Initialized BriefingRunner: state_file=%s section_order=%s "
-            "features(solo=%s agent=%s weekly=%s) dry_run=%s use_snapshots=%s",
+            "extensions=%s weekly=%s dry_run=%s use_snapshots=%s",
             self.state_file_path, self.section_order,
-            self.feature_solo_founder_angle, self.feature_agent_cost_optimization,
+            [x.key for x in self.extension_sections],
             self.feature_weekly_deep_dive, self.dry_run, self.use_snapshots,
         )
 
@@ -555,7 +573,11 @@ class BriefingRunner:
             weights = self.config.get("paper_scoring", {})
             num_picks = self.config.get("num_paper_picks", 3)
 
-            scorer = PaperScorer(topics=topics, weights=weights, num_picks=num_picks)
+            # Select a candidate pool, not just the display count: the gates
+            # downstream drop papers, and only a surplus lets the next-best
+            # paper take the freed slot. The renderer cuts to num_picks.
+            pool_size = num_picks + self.PAPER_CANDIDATE_BUFFER
+            scorer = PaperScorer(topics=topics, weights=weights, num_picks=pool_size)
             top_papers = scorer.get_top_picks(papers)
             logger.info(f"Selected top {len(top_papers)} papers")
             return top_papers
@@ -880,22 +902,16 @@ class BriefingRunner:
             md.append(SYNTHESIS_UNAVAILABLE_TEXT)
             self._record_degraded_synthesis()
 
-        if self.feature_solo_founder_angle:
-            solo_angle = synthesis.get("solo_startup", "") if synthesis else ""
-            if solo_angle:
-                md.append(f"## {self._headings.get('solo_founder_angle', 'Solo Founder Angle')}\n\n")
-                md.append(f"{solo_angle}\n\n")
+        for section in self.extension_sections:
+            body = synthesis.get(section.key, "") if synthesis else ""
+            if body:
+                md.append(f"## {self._headings.get(section.key, section.heading)}\n\n")
+                md.append(f"{body}\n\n")
 
-        if self.feature_agent_cost_optimization:
-            cost_play = synthesis.get("agent_cost_play", "") if synthesis else ""
-            if cost_play:
-                md.append(f"## {self._headings.get('agent_cost_optimization', 'Agent Cost-Optimization Play')}\n\n")
-                md.append(f"{cost_play}\n\n")
-
-            # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
-            # Only show if an entity has a spike (e.g., 5+ mentions).
-            # entity_mentions = synthesis.get("entity_mentions", [])
-            # if entity_mentions: ...
+        # Feature 3: Entity Watch — DISABLED per user request (2026-03-08)
+        # Only show if an entity has a spike (e.g., 5+ mentions).
+        # entity_mentions = synthesis.get("entity_mentions", [])
+        # if entity_mentions: ...
 
         section_order = self.section_order
 
@@ -1091,6 +1107,42 @@ class BriefingRunner:
         return "★" * score + "☆" * (5 - score)
 
     @staticmethod
+    def _select_by_score(
+        items: List[Dict[str, Any]],
+        count: int,
+        min_score: int,
+        score_key: str = "score_combined",
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank the whole candidate list, drop weak items, then take ``count``.
+
+        Order matters. Slicing to ``count`` first and filtering afterwards
+        shrinks the section every time one of the leading items scores low,
+        because the candidates that could have replaced it were already thrown
+        away -- that is how a 3-pick paper section shipped with 2 papers while
+        183 papers had been fetched. Filtering across the full list first lets
+        a lower-ranked but acceptable item take the freed slot.
+
+        A section still comes up short when genuinely nothing clears the bar;
+        that is an honest signal and is left to the caller to report.
+
+        Args:
+            items: Candidates, already ordered by upstream relevance.
+            count: How many to render.
+            min_score: Minimum score an item needs to be rendered.
+            score_key: Item key holding the score.
+
+        Returns:
+            Up to ``count`` items, best first.
+        """
+        if not any(x.get(score_key) for x in items):
+            # Scoring unavailable (no LLM, or every score failed to parse):
+            # keep the upstream relevance order untouched.
+            return items[:count]
+        ranked = sorted(items, key=lambda x: x.get(score_key) or 0, reverse=True)
+        return [x for x in ranked if (x.get(score_key) or 0) >= min_score][:count]
+
+    @staticmethod
     def _clean_summary(summary: str, title: str, source: str = "") -> str:
         """Remove title/source echo from LLM-generated summary."""
         if not summary:
@@ -1208,13 +1260,12 @@ class BriefingRunner:
         """Render blog updates section (top 5, with summaries, sorted by score)."""
         md = [f"## {self._headings.get('blogs', 'Blog Updates')}\n\n"]
         
-        # Sort by score if available, otherwise use original order
-        if any(b.get("score_combined") for b in blogs):
-            sorted_blogs = sorted(blogs[:8], key=lambda x: x.get("score_combined", 0), reverse=True)
-            # Only filter low scores if we actually have scores
-            sorted_blogs = [b for b in sorted_blogs if b.get("score_combined", 0) >= 3]
-        else:
-            sorted_blogs = blogs[:5]
+        # Rank over the whole ranked list, then take the display slice. The
+        # upstream ranker has already picked and capped its top posts, so
+        # dropping a low-scored one here would just shorten the section.
+        sorted_blogs = self._select_by_score(
+            blogs, self.BLOG_DISPLAY_COUNT, self.MIN_DISPLAY_SCORE
+        )
 
         if not sorted_blogs:
             return ""
@@ -1304,11 +1355,9 @@ class BriefingRunner:
         """Render top papers section (top N per config.num_paper_picks, with summaries, scores, and repro assessment)."""
         md = [f"## {self._headings.get('top_papers', 'Top Papers')}\n\n"]
         num_picks = self.config.get("num_paper_picks", 5)
-        sorted_papers = sorted(top_papers[:num_picks], key=lambda x: x.get("score_combined", 0), reverse=True)
-        if any(p.get("score_combined") for p in sorted_papers):
-            sorted_papers = [p for p in sorted_papers if p.get("score_combined", 0) >= 3]
-        else:
-            sorted_papers = top_papers[:3]
+        sorted_papers = self._select_by_score(
+            top_papers, num_picks, self.MIN_DISPLAY_SCORE
+        )
 
         if not sorted_papers:
             md.append("*No highly relevant papers found today based on scoring.*\n\n")
@@ -1761,8 +1810,13 @@ class BriefingRunner:
         if self.intelligence.available:
             top_papers = self.intelligence.assess_reproduction_feasibility(top_papers)
 
-            # Ensure all display papers have summaries (batched)
-            display_n = self.config.get("num_paper_picks", 5)
+            # Ensure all display papers have summaries (batched). A couple of
+            # spares are summarized too: _render_top_papers backfills from
+            # them when a pick scores below MIN_DISPLAY_SCORE, and a backfilled
+            # paper with no summary would render its raw abstract.
+            display_n = (
+                self.config.get("num_paper_picks", 5) + self.PAPER_CANDIDATE_BUFFER
+            )
             top_papers = self._ensure_paper_summaries(top_papers[:display_n]) + top_papers[display_n:]
 
             # --- Generate author blurbs for all sections ---
@@ -1785,27 +1839,24 @@ class BriefingRunner:
                 previous_state=previous_state,
             )
 
-            if self.feature_solo_founder_angle:
+            for section in self.extension_sections:
                 try:
-                    solo_angle = self.intelligence.generate_solo_startup_angle(
-                        papers, blogs[:6], news[:6], top_papers[:3],
+                    body = generate_section(
+                        section,
+                        self.intelligence.client,
+                        INTELLIGENCE_SYSTEM_PROMPT,
+                        papers=papers,
+                        blogs=blogs,
+                        news=news,
+                        top_papers=top_papers,
                         emerging_themes=emerging_themes,
                     )
-                    if solo_angle:
-                        synthesis["solo_startup"] = solo_angle
+                    if body:
+                        synthesis[section.key] = body
                 except Exception as e:
-                    logger.warning(f"Solo-startup angle generation failed: {e}")
-
-            if self.feature_agent_cost_optimization:
-                try:
-                    cost_play = self.intelligence.generate_agent_cost_optimization(
-                        papers, blogs[:6], news[:6], top_papers[:3],
-                        emerging_themes=emerging_themes,
+                    logger.warning(
+                        "Extension section %s failed: %s", section.key, e
                     )
-                    if cost_play:
-                        synthesis["agent_cost_play"] = cost_play
-                except Exception as e:
-                    logger.warning(f"Agent cost-optimization generation failed: {e}")
 
             # Feature 3: Competitive Intelligence (entity tracking)
             tracked_entities = self.config.get("tracked_entities", [])
@@ -1907,8 +1958,12 @@ class BriefingRunner:
         if not cached_happenings:
             cached_happenings = previous_state.get("cached_happenings", [])
             cached_happenings_date = previous_state.get("cached_happenings_date")
+        # Only the papers that could have been rendered are recorded as seen;
+        # the pool's spares were never shown, and marking them would suppress
+        # them from tomorrow's briefing without the reader ever seeing them.
         self._save_state(
-            top_papers, blogs, news, stocks, emerging_themes,
+            top_papers[:self.config.get("num_paper_picks", 3)],
+            blogs, news, stocks, emerging_themes,
             trending_topics=previous_state.get("trending_topics", {}),
             weekly_items=weekly_items,  # Use updated weekly_items from this run
             happenings=happenings,

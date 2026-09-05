@@ -266,6 +266,16 @@ class TestRenderBlogs:
     def test_empty_returns_empty(self, runner):
         assert runner._render_blogs([{"score_combined": 1}]) == ""
 
+    def test_low_score_lead_does_not_shrink_section(self, runner):
+        """A weak post at the head of the list must not cost the section a slot."""
+        blogs = [{"title": "Weak", "source": "S1", "score_combined": 1,
+                  "brief_summary": "w"}]
+        blogs += [{"title": f"Good{i}", "source": f"S{i}", "score_combined": 4,
+                   "brief_summary": "g"} for i in range(5)]
+        md = runner._render_blogs(blogs)
+        assert "Weak" not in md
+        assert md.count("Good") == 5
+
 
 class TestRenderTopPapers:
     def test_filters_by_score(self, runner):
@@ -303,13 +313,36 @@ class TestRenderTopPapers:
         md = runner._render_top_papers(papers)
         assert "No highly relevant papers" in md
 
-    def test_no_scores_uses_top3(self, runner):
+    def test_no_scores_honors_num_paper_picks(self, runner):
+        """Unscored papers fall back to config order, capped by config.
+
+        The fallback used to hardcode 3 regardless of num_paper_picks, so a
+        briefing configured for 2 picks rendered 3 whenever scoring failed.
+        """
         papers = [{"title": f"P{i}", "arxiv_url": "", "authors": []}
-                  for i in range(5)]
-        md = runner._render_top_papers(papers)
+                  for i in range(7)]
+        md = runner._render_top_papers(papers)  # cfg num_paper_picks == 5
         assert "P0" in md
-        assert "P2" in md
-        assert "P3" not in md
+        assert "P4" in md
+        assert "P5" not in md
+
+    def test_low_score_pick_is_replaced_not_dropped(self, runner):
+        """A low-scoring leading pick frees a slot for a later good paper.
+
+        Slicing to num_paper_picks before filtering discarded the candidates
+        that could have taken the slot, so the section shipped short.
+        """
+        papers = [
+            {"title": f"Good{i}", "score_combined": 5, "brief_summary": "s",
+             "arxiv_url": "u", "authors": []}
+            for i in range(4)
+        ]
+        papers.insert(1, {"title": "Weak", "score_combined": 1,
+                          "brief_summary": "s", "arxiv_url": "u",
+                          "authors": []})
+        md = runner._render_top_papers(papers)
+        assert "Weak" not in md
+        assert md.count("Good") == 4
 
 
 class TestRenderRecentPapers:
