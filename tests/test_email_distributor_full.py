@@ -16,8 +16,10 @@ def distributor():
 class TestMarkdownToHtml:
     def test_converts_basic_markdown(self, distributor):
         html = distributor._markdown_to_html("# Title\n\nSome **bold** text.")
-        assert "<h1>" in html
-        assert "<strong>bold</strong>" in html
+        # premailer inlines styles, so tags become <h1 style="...">, <strong style="...">
+        assert "<h1" in html
+        assert "<strong" in html
+        assert "bold" in html
 
     def test_sanitizes_unsafe_tags(self, distributor):
         # nh3 should strip script tags
@@ -28,7 +30,8 @@ class TestMarkdownToHtml:
     def test_renders_tables(self, distributor):
         md = "| A | B |\n|---|---|\n| 1 | 2 |\n"
         html = distributor._markdown_to_html(md)
-        assert "<table>" in html
+        # premailer inlines styles, so tag becomes <table ...>
+        assert "<table" in html
 
     def test_right_alignment_marker(self, distributor):
         md = "Left text [RIGHT]aligned right[/RIGHT]"
@@ -45,6 +48,46 @@ class TestMarkdownToHtml:
         html = distributor._markdown_to_html("Hi")
         assert "Atlas Morning Briefing" in html
         assert "footer" in html
+
+
+class TestMobileLegibility:
+    """Guards on the properties that decide whether the Gmail app shrinks the
+    message. The app scales the whole email down to fit its widest element, so
+    a single fixed width or an unwrappable table makes every font look tiny."""
+
+    def test_container_is_fluid_not_fixed_width(self, distributor):
+        html = distributor._markdown_to_html("# T\n")
+        assert "max-width: 600px" in html or "max-width:600px" in html
+        # A bare `width: 600px` on the container is the regression that made
+        # every font render ~45% smaller on a 360px phone.
+        assert "width: 600px;" not in html.replace("max-width: 600px;", "")
+
+    def test_base_font_is_at_least_16px(self, distributor):
+        html = distributor._markdown_to_html("Body text.\n")
+        assert "font-size: 16px" in html or "font-size:16px" in html
+
+    def test_tables_cannot_set_the_message_width(self, distributor):
+        md = "| Tier | Model | Calls |\n|---|---|---|\n| Heavy | `x/y:free` | 9 |\n"
+        html = distributor._markdown_to_html(md)
+        assert "word-break" in html          # long tokens must be breakable
+        assert "table-layout: fixed" not in html  # equal columns break mid-word
+
+    def test_media_query_survives_css_inlining(self, distributor):
+        html = distributor._markdown_to_html("# T\n")
+        assert "@media only screen and (max-width: 600px)" in html
+
+    def test_stays_under_gmail_clip_limit(self, distributor):
+        """Gmail clips at 102KB. Inlining CSS onto every table cell used to
+        push a long briefing to ~97KB, so the dense table rules are kept out
+        of the inliner; this fails if that comes undone."""
+        row = "| Heavy | `openrouter/nvidia/nemotron-3-super-120b:free` | 9 | 2 | 15,619 | 21,967 |\n"
+        md = (
+            "# Briefing\n\n" + ("Paragraph of briefing prose. " * 40 + "\n\n") * 20
+            + "| Tier | Model | Calls | Failures | Input | Output |\n"
+            + "|---|---|---|---|---|---|\n" + row * 60
+        )
+        html = distributor._markdown_to_html(md)
+        assert len(html.encode("utf-8")) / 1024 < 102
 
 
 class TestSendKindle:
