@@ -22,6 +22,9 @@ boto3>=1.34.0
 # HTML sanitization (for email distribution)
 nh3>=0.2.14
 
+# CSS inlining for email client compatibility
+premailer>=3.10.0
+
 # XML security (optional, falls back to stdlib)
 defusedxml>=0.7.1
 
