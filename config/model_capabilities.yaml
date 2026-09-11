@@ -36,6 +36,17 @@ model_capabilities:
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  # Zen FREE contributor tier. Registered conservatively: the reasoning-control
+  # behaviour of this model has NOT been probed live, and an unregistered model
+  # silently loses reasoning control entirely, which is worse than not sending
+  # the flag. Re-verify with scripts/preflight_model_check.py and promote to
+  # cli_flag/variant=minimal once a probe confirms it.
+  opencode/muse-spark-1.3-contributor-free:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
   opencode/deepseek-v4-flash-free:
     supports_reasoning_control: true
     reasoning_control_method: "cli_flag"
@@ -108,6 +119,13 @@ model_capabilities:
     reasoning_control_method: "cli_flag"
     cli_flag_name: "variant"
     cli_flag_value: "minimal"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # Light-tier paid backstop. Not probed live; see the note on muse-spark above.
+  opencode-go/qwen3.6-plus:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
     known_cot_leakage: false
     non_reasoning_variant: null
 

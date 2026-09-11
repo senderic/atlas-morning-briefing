@@ -157,20 +157,28 @@ class BriefingRunner:
         gemini_config = config.get("gemini", config.get("bedrock", {}))
 
         # Chain construction lives in scripts.llm_chain so the briefing runner
-        # and the quality checker cannot drift on backend ordering. Order is
-        # cost: free backends first, any paid one last.
+        # and the quality checker cannot drift on model ordering. Order is
+        # cost: free rungs first, any paid one last — a property of how
+        # llm.chains is written, not of which backend hosts a model.
         from scripts.composite_client import CompositeClient
-        from scripts.llm_chain import build_llm_chain, chain_timeout
+        from scripts.llm_chain import (
+            apply_pins,
+            build_clients,
+            build_model_chains,
+            chain_timeout,
+            preflight_pins,
+        )
 
-        chain = build_llm_chain(config, preflight_models=preflight_data)
+        clients = build_clients(config)
+        chains = apply_pins(build_model_chains(config), preflight_pins(preflight_data))
 
-        if not chain:
+        if not clients:
             # No LLM backend enabled at all — deterministic mode.
             self.llm_client = GeminiCLIClient(gemini_config)
-        elif len(chain) == 1:
-            self.llm_client = chain[0]
         else:
-            self.llm_client = CompositeClient(chain, timeout=chain_timeout(config))
+            self.llm_client = CompositeClient(
+                clients, chains, timeout=chain_timeout(config)
+            )
         self.intelligence = BriefingIntelligence(self.llm_client, config)
         self.status["intelligence_enabled"] = self.intelligence.available
 
@@ -1017,18 +1025,15 @@ class BriefingRunner:
             )
             return {}
 
-        available = {
-            provider: [
-                tier for tier, entry in tiers.items()
-                if isinstance(entry, dict) and entry.get("available")
-            ]
-            for provider, tiers in data.items()
-            if isinstance(tiers, dict)
+        pinned = {
+            tier: entry.get("model")
+            for tier, entry in (data.get("chains") or {}).items()
+            if isinstance(entry, dict) and entry.get("available")
         }
         logger.info(
             "Loaded preflight model availability from %s (%.0f min old): %s",
             preflight_path, age / 60,
-            {k: v for k, v in available.items() if v} or "nothing available",
+            pinned or "nothing available",
         )
         return data
 

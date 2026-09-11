@@ -216,8 +216,14 @@ class TestPreflightModelLoading:
         assert BriefingRunner(config=cfg, dry_run=True)._load_preflight_models() == {}
 
 
-class TestBackendChainOrder:
-    """Order is cost: the chain is tried front to back, so paid goes last."""
+class TestModelChainOrder:
+    """Order is cost, and it belongs to the chain, not to the backends.
+
+    The old shape ordered backends and let each pick its own model, so a
+    model's rung was decided by who hosted it: `opencode/muse-spark-*` sat
+    configured as a free heavy primary and served zero calls, because reaching
+    it meant getting past OpenRouter's entire roster first.
+    """
 
     def _config(self, minimal_config, **overrides):
         cfg = dict(minimal_config)
@@ -229,35 +235,57 @@ class TestBackendChainOrder:
         cfg.update(overrides)
         return cfg
 
-    def _names(self, cfg):
+    def _chain(self, cfg, tier="heavy"):
         runner = BriefingRunner(config=cfg, dry_run=True)
-        client = runner.llm_client
-        clients = getattr(client, "clients", [client])
-        return [type(c).__name__ for c in clients]
+        return [r.model for r in runner.llm_client.chains[tier]]
 
-    def test_free_openrouter_precedes_paid_opencode_by_default(self, minimal_config):
-        names = self._names(self._config(minimal_config))
-        assert names.index("OpenRouterClient") < names.index("OpencodeClient")
+    def test_chain_order_is_taken_from_config(self, minimal_config):
+        cfg = self._config(minimal_config, llm={"chains": {"heavy": [
+            "opencode/muse-spark-1.3-contributor-free",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        ]}})
+        assert self._chain(cfg) == [
+            "opencode/muse-spark-1.3-contributor-free",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        ]
 
-    def test_priority_list_is_honoured(self, minimal_config):
-        cfg = self._config(minimal_config, llm={"backend_priority": ["opencode", "openrouter"]})
-        names = self._names(cfg)
-        assert names.index("OpencodeClient") < names.index("OpenRouterClient")
+    def test_a_chain_may_interleave_backends(self, minimal_config):
+        """The regression this refactor exists for.
 
-    def test_backend_missing_from_priority_is_still_included_last(self, minimal_config):
-        """A typo in the priority list must not silently drop a backend."""
-        cfg = self._config(minimal_config, llm={"backend_priority": ["openrouter"]})
-        names = self._names(cfg)
-        assert "OpencodeClient" in names
-        assert names[-1] == "OpencodeClient"
+        Backend-ordered fallback cannot express opencode -> openrouter ->
+        opencode, so a free model on the paid-ish transport could never be
+        tried before every OpenRouter model had failed.
+        """
+        cfg = self._config(minimal_config, llm={"chains": {"heavy": [
+            "opencode/muse-spark-1.3-contributor-free",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+            "opencode-go/deepseek-v4-pro",
+        ]}})
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        backends = [r.backend for r in runner.llm_client.chains["heavy"]]
+        assert backends == ["opencode", "openrouter", "opencode"]
 
-    def test_unknown_priority_entry_is_ignored(self, minimal_config):
-        cfg = self._config(minimal_config, llm={"backend_priority": ["nope", "openrouter"]})
-        assert "OpenRouterClient" in self._names(cfg)
+    def test_paid_rung_goes_last(self, minimal_config):
+        import yaml
+
+        chains = yaml.safe_load(open("config.yaml"))["llm"]["chains"]
+        for tier, rungs in chains.items():
+            paid = [i for i, m in enumerate(rungs) if m.startswith("opencode-go/")]
+            assert not paid or min(paid) == len(rungs) - 1, (
+                f"{tier}: a paid rung is not last"
+            )
+
+    def test_rung_with_unknown_prefix_is_dropped(self, minimal_config):
+        cfg = self._config(minimal_config, llm={"chains": {"heavy": [
+            "mystery/some-model",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        ]}})
+        assert self._chain(cfg) == ["openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"]
 
     def test_disabled_backend_is_skipped(self, minimal_config):
         cfg = self._config(minimal_config, opencode={"enabled": False})
-        assert "OpencodeClient" not in self._names(cfg)
+        runner = BriefingRunner(config=cfg, dry_run=True)
+        assert "opencode" not in runner.llm_client.clients
 
 
 class TestStatusFileIsPerPipeline:
@@ -301,11 +329,11 @@ class TestStatusFileIsPerPipeline:
 
 
 class TestSharedChainBuilder:
-    """The runner and the quality checker must not drift on backend order.
+    """The runner and the quality checker must not drift on chain order.
 
     They each built their own chain, and did drift: quality_check kept
-    opencode (paid) first long after the runner moved to openrouter (free)
-    first, so every daily quality run billed the paid backstop.
+    opencode (paid) first long after the runner moved to free-first, so every
+    daily quality run billed the paid backstop.
     """
 
     def _config(self, minimal_config, **over):
@@ -318,22 +346,26 @@ class TestSharedChainBuilder:
         cfg.update(over)
         return cfg
 
-    def test_runner_and_quality_check_agree_on_order(self, minimal_config):
-        from scripts.llm_chain import build_llm_chain
+    def test_runner_and_quality_check_agree_on_chains(self, minimal_config):
+        from scripts.llm_chain import build_model_chains
         from scripts.quality_check import build_llm_client
 
         cfg = self._config(minimal_config)
-        expected = [type(c).__name__ for c in build_llm_chain(cfg)]
+        expected = {t: [r.model for r in rungs]
+                    for t, rungs in build_model_chains(cfg).items()}
         judge = build_llm_client(cfg)
-        actual = [type(c).__name__ for c in getattr(judge, "clients", [judge])]
+        actual = {t: [r.model for r in rungs] for t, rungs in judge.chains.items()}
         assert actual == expected
 
     def test_quality_judge_puts_free_before_paid(self, minimal_config):
         from scripts.quality_check import build_llm_client
 
-        judge = build_llm_client(self._config(minimal_config))
-        names = [type(c).__name__ for c in getattr(judge, "clients", [judge])]
-        assert names.index("OpenRouterClient") < names.index("OpencodeClient")
+        cfg = self._config(minimal_config, llm={"chains": {"heavy": [
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+            "opencode-go/deepseek-v4-pro",
+        ]}})
+        models = [r.model for r in build_llm_client(cfg).chains["heavy"]]
+        assert models[-1].startswith("opencode-go/")
 
     def test_quality_judge_returns_none_when_nothing_enabled(self, minimal_config):
         from scripts.quality_check import build_llm_client

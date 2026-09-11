@@ -277,40 +277,58 @@ pdf:
   include_toc: true
   include_emoji: false
 
-# OpenCode configuration (alternative to Gemini/Bedrock).
-# When enabled, uses `opencode run` with free-tier models.
+# OpenCode CLI backend — a TRANSPORT, not a tier.
+# Inference runs as `opencode run -m <model>`. Which of its models serve which
+# tier is decided by llm.chains below, not here. Both free (`opencode/*` Zen
+# contributor tier) and paid (`opencode-go/*`) models are reachable through it,
+# so cost is a property of the rung, never of the backend.
 # Requires `opencode` binary on PATH and a valid OpenCode Zen session.
 opencode:
   enabled: false
-  models:
-    heavy: "opencode/nemotron-3-ultra-free"
-    medium: "opencode/deepseek-v4-flash-free"
-    light: "opencode/deepseek-v4-flash-free"
-  # Fallback chain tried (in order) when the primary model for a tier fails
-  # (non-zero exit, empty NDJSON response, or timeout) — e.g. when the free
-  # opencode quota is exhausted.
-  fallback_models:
-    heavy: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
-    medium: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
-    light: ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"]
   max_calls_per_run: 50
-  # Per-call timeout. Fast failures (model not found, insufficient balance,
-  # rate limit) are detected immediately via NDJSON error events and skip
-  # straight to the fallback chain — they never wait for the full timeout.
-  # Retryable errors (rate limits, server overload) get 2 retries with
-  # exponential backoff (5-15s) before advancing to the next model.
+  # Per-call timeout for ONE model. Fast failures (model not found,
+  # insufficient balance, rate limit) are detected immediately via NDJSON error
+  # events and fail the rung without waiting for the full timeout.
   timeout: 120
-  # Number of retries for retryable errors before falling back. Set to 0
-  # to disable retries entirely.
+  # Retries for retryable errors, on the SAME model. Falling through to a
+  # different model is the chain's job. Set to 0 to disable retries.
   max_retries_per_model: 2
 
-# OpenRouter configuration (OpenAI-compatible HTTP API)
-# Requires OPENROUTER_API_KEY. Slugs carry a single `openrouter/` routing
-# prefix that the client strips before calling the API.
+# THE fallback chain. Each tier is an ordered list of MODELS, tried front to
+# back; the backend that serves a rung is inferred from its routing prefix
+# (`openrouter/`, `opencode/`, `opencode-go/`, `gemini/`).
 #
-# Keep the ladder monotonic — heavy > medium > light in both model size and
-# context window — and let fallbacks degrade DOWN a tier only, never up, so a
-# heavy prompt can never silently land on a light model.
+# Order is cost: free rungs first, paid ones last. Because the chain orders
+# models rather than backends, a free model on one transport can sit ahead of a
+# free model on another — which a backend-ordered list cannot express.
+#
+# Two rules to keep: tiers stay distinct and monotonic (heavy > medium > light
+# in size and context window), and within a tier a rung may only degrade DOWN a
+# weight class, never up, so a heavy prompt never lands on a light model.
+llm:
+  chains:
+    heavy:
+      - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+      - "openrouter/dots-studio/dots-3-note-preview:free"
+    medium:
+      - "openrouter/dots-studio/dots-3-note-preview:free"
+      - "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+    light:
+      - "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+      - "openrouter/cohere/north-mini-code:free"
+  # Per-RUNG window. Each rung is one model, so this only has to cover that
+  # model's own timeout x (1 + max_retries_per_model).
+  rung_timeout_seconds: 500
+  # Rungs the preflight check must not probe — the paid ones, where the probe
+  # would be the only call that ever bills them. Free rungs on the same
+  # transport are still probed.
+  preflight_skip:
+    - "opencode-go/"
+
+# OpenRouter configuration (OpenAI-compatible HTTP API) — also a TRANSPORT.
+# Requires OPENROUTER_API_KEY. Slugs carry a single `openrouter/` routing
+# prefix that the client strips before calling the API. Which models serve
+# which tier is in llm.chains below.
 #
 # Free models on OpenRouter come and go. Re-verify a slug before adding it:
 #   curl -H "Authorization: Bearer $OPENROUTER_API_KEY" \
@@ -323,14 +341,6 @@ opencode:
 openrouter:
   enabled: false
   api_base: "https://openrouter.ai/api/v1/chat/completions"
-  models:
-    heavy: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
-    medium: "openrouter/minimax/minimax-m3:free"
-    light: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
-  fallback_models:
-    heavy: ["openrouter/dots-studio/dots-3-note-preview:free", "openrouter/minimax/minimax-m3:free"]
-    medium: ["openrouter/nvidia/nemotron-3-super-120b-a12b:free", "openrouter/dots-studio/dots-3-note-preview:free"]
-    light: ["openrouter/cohere/north-mini-code:free", "openrouter/minimax/minimax-m3:free"]
   max_calls_per_run: 100
   # Simultaneous in-flight requests. The runner enriches sections in parallel
   # (see max_workers), so this is the real throttle against the free tier.

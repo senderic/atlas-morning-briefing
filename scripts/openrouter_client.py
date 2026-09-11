@@ -47,9 +47,9 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Default model IDs per tier. Verified free and responsive on 2026-08-27.
-# The ladder is deliberately monotonic: heavy > medium > light in both
-# parameter count and context window. Fallbacks may only degrade DOWN a tier,
-# never up, so a heavy prompt never silently lands on a light model.
+# Per-tier defaults for direct, chainless use of this client. The real
+# fallback order lives in llm.chains (see scripts/llm_chain.py), which spans
+# backends; this table is not a ladder and has no fallbacks of its own.
 DEFAULT_MODELS = {
     # 550B / 1M ctx
     "heavy": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -57,23 +57,6 @@ DEFAULT_MODELS = {
     "medium": "openrouter/minimax/minimax-m3:free",
     # 120B-A12B / 262k ctx
     "light": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
-}
-
-# Fallback model slugs tried per tier when the primary fails.
-# Every entry is free, verified reachable, and supports reasoning suppression.
-DEFAULT_FALLBACK_MODELS = {
-    "heavy": [
-        "openrouter/dots-studio/dots-3-note-preview:free",   # 512k ctx
-        "openrouter/minimax/minimax-m3:free",                # degrade to medium
-    ],
-    "medium": [
-        "openrouter/nvidia/nemotron-3-super-120b-a12b:free",  # degrade to light
-        "openrouter/dots-studio/dots-3-note-preview:free",
-    ],
-    "light": [
-        "openrouter/cohere/north-mini-code:free",            # 256k ctx
-        "openrouter/minimax/minimax-m3:free",
-    ],
 }
 
 DEFAULT_PRICING = {
@@ -98,9 +81,8 @@ _REASONING_MANDATORY = "reasoning is mandatory"
 class OpenRouterClient(BaseLLMClient):
     """LLM client that calls OpenRouter's OpenAI-compatible completions API."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, preflight_models: Optional[Dict[str, Dict]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         config = config or {}
-        preflight_models = preflight_models or {}
         self.enabled = config.get("enabled", True)
         self.provider = config.get("provider", "openrouter")
         self.render_key_rotation = True  # CompositeClient sets False to unify
@@ -112,43 +94,15 @@ class OpenRouterClient(BaseLLMClient):
         )
         self.api_base = config.get("api_base", API_BASE_URL)
 
+        # llm.chains decides which model serves a tier. These per-tier
+        # defaults only apply when this client is driven directly, without a
+        # chain — they are not a fallback ladder, and there is no longer an
+        # internal one: fallback across models is the chain's job.
         models_config = config.get("models", {})
-        fallback_config = config.get("fallback_models", {})
-        self.models = {}
-        self.fallback_models = {}
-
-        for tier in ("heavy", "medium", "light"):
-            configured = models_config.get(tier, DEFAULT_MODELS[tier])
-            # A preflight override may only replace the model WITHIN its own
-            # tier, and only when preflight actually reached it. Anything else
-            # keeps the configured model so tiers can never be crossed.
-            pf = preflight_models.get(tier, {})
-            pf_model = pf.get("model")
-            if pf.get("available") and pf_model:
-                if pf.get("tier", tier) != tier:
-                    logger.warning(
-                        "OpenRouter ignoring preflight entry for %s: it names tier %s",
-                        tier, pf.get("tier"),
-                    )
-                    self.models[tier] = configured
-                else:
-                    self.models[tier] = pf_model
-                    if pf_model != configured:
-                        logger.info(
-                            "OpenRouter preflight override %s: %s -> %s",
-                            tier, configured, pf_model,
-                        )
-            else:
-                self.models[tier] = configured
-
-            # Build fallback chain: config fallbacks minus the selected primary
-            primary = self.models[tier]
-            config_fallbacks = list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
-            # When preflight promoted a fallback to primary, keep the configured
-            # primary in the chain so a transient preflight blip is recoverable.
-            if primary != configured and configured not in config_fallbacks:
-                config_fallbacks.insert(0, configured)
-            self.fallback_models[tier] = [m for m in config_fallbacks if m != primary]
+        self.models = {
+            tier: models_config.get(tier, DEFAULT_MODELS[tier])
+            for tier in ("heavy", "medium", "light")
+        }
 
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 120)
@@ -222,8 +176,15 @@ class OpenRouterClient(BaseLLMClient):
         tier: str = "medium",
         system_prompt: Optional[str] = None,
         reasoning_enabled: bool = True,
+        model: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[str]:
+        """Serve one model. Fallback across models belongs to the chain.
+
+        `model` names the rung CompositeClient picked. Without it the tier's
+        default is used, which only happens when this client is driven
+        directly rather than through a chain.
+        """
         if kwargs:
             logger.debug(
                 "OpenRouter ignoring unexpected kwargs to invoke(): %s",
@@ -235,88 +196,80 @@ class OpenRouterClient(BaseLLMClient):
             logger.warning("OpenRouter unknown tier %r; using medium", tier)
             tier = "medium"
 
-        primary = self.models[tier]
-        chain = [primary] + [
-            m for m in self.fallback_models.get(tier, []) if m != primary
-        ]
+        model = model or self.models[tier]
 
-        for model in chain:
-            # Each model gets its own reasoning state so a forced downgrade on
-            # one model does not silently carry over to the next.
-            model_reasoning = reasoning_enabled
-            attempts = 0
-            while True:
-                if not self._reserve_call():
-                    logger.warning(
-                        "OpenRouter call budget exhausted (%d / %d calls)",
-                        self._call_count, self.max_calls,
-                    )
-                    return None
-                try:
-                    result, action = self._single_call(
-                        model=model,
-                        prompt=prompt,
-                        tier=tier,
-                        system_prompt=system_prompt,
-                        reasoning_enabled=model_reasoning,
-                    )
-                except Exception as e:
-                    logger.error("OpenRouter call exception (model=%s): %s", model, e)
-                    result, action = None, "retry"
-
-                if result:
-                    with self._lock:
-                        self._tier_served_by[tier] = model
-                    return result
-
-                if action == "reasoning_overflow":
-                    # HTTP 200 but the model spent the entire max_tokens budget
-                    # on reasoning tokens. Retrying the same model with
-                    # reasoning off recovers this; it is not a dead endpoint.
-                    if model_reasoning:
-                        logger.info(
-                            "OpenRouter %s (tier=%s) exhausted max_tokens on reasoning; "
-                            "retrying with reasoning disabled",
-                            model, tier,
-                        )
-                        model_reasoning = False
-                        continue
-                    logger.warning(
-                        "OpenRouter %s (tier=%s) returned empty content even with "
-                        "reasoning disabled; trying next model",
-                        model, tier,
-                    )
-                    break
-
-                if action == "fallback":
-                    logger.warning(
-                        "OpenRouter non-recoverable error for %s (tier=%s); skipping to next",
-                        model, tier,
-                    )
-                    break  # move to next model/provider
-
-                # Transient error: retry a bounded number of times with backoff.
-                attempts += 1
-                if attempts > self.max_retries:
-                    logger.warning(
-                        "OpenRouter exhausted retries for %s (tier=%s); trying next",
-                        model, tier,
-                    )
-                    break
-                backoff = min(
-                    RETRY_BACKOFF_BASE * (2 ** (attempts - 1)) + random.uniform(0, 2),
-                    RETRY_BACKOFF_MAX,
+        # Reasoning state is per-invocation: a forced downgrade here must
+        # not leak into the next rung, which the chain may serve elsewhere.
+        model_reasoning = reasoning_enabled
+        attempts = 0
+        while True:
+            if not self._reserve_call():
+                logger.warning(
+                    "OpenRouter call budget exhausted (%d / %d calls)",
+                    self._call_count, self.max_calls,
                 )
-                logger.info(
-                    "OpenRouter retrying %s (tier=%s, attempt=%d/%d, backoff %.1fs)",
-                    model, tier, attempts, self.max_retries, backoff,
+                return None
+            try:
+                result, action = self._single_call(
+                    model=model,
+                    prompt=prompt,
+                    tier=tier,
+                    system_prompt=system_prompt,
+                    reasoning_enabled=model_reasoning,
                 )
-                time.sleep(backoff)
+            except Exception as e:
+                logger.error("OpenRouter call exception (model=%s): %s", model, e)
+                result, action = None, "retry"
 
-        logger.warning(
-            "All OpenRouter models failed for tier=%s (primary=%s, tried %d)",
-            tier, primary, len(chain),
-        )
+            if result:
+                with self._lock:
+                    self._tier_served_by[tier] = model
+                return result
+
+            if action == "reasoning_overflow":
+                # HTTP 200 but the model spent the entire max_tokens budget
+                # on reasoning tokens. Retrying the same model with
+                # reasoning off recovers this; it is not a dead endpoint.
+                if model_reasoning:
+                    logger.info(
+                        "OpenRouter %s (tier=%s) exhausted max_tokens on reasoning; "
+                        "retrying with reasoning disabled",
+                        model, tier,
+                    )
+                    model_reasoning = False
+                    continue
+                logger.warning(
+                    "OpenRouter %s (tier=%s) returned empty content even with "
+                    "reasoning disabled; failing this rung",
+                    model, tier,
+                )
+                return None
+
+            if action == "fallback":
+                logger.warning(
+                    "OpenRouter non-recoverable error for %s (tier=%s); failing this rung",
+                    model, tier,
+                )
+                return None  # the chain advances to the next rung
+
+            # Transient error: retry a bounded number of times with backoff.
+            attempts += 1
+            if attempts > self.max_retries:
+                logger.warning(
+                    "OpenRouter exhausted retries for %s (tier=%s); failing this rung",
+                    model, tier,
+                )
+                return None
+            backoff = min(
+                RETRY_BACKOFF_BASE * (2 ** (attempts - 1)) + random.uniform(0, 2),
+                RETRY_BACKOFF_MAX,
+            )
+            logger.info(
+                "OpenRouter retrying %s (tier=%s, attempt=%d/%d, backoff %.1fs)",
+                model, tier, attempts, self.max_retries, backoff,
+            )
+            time.sleep(backoff)
+
         return None
 
     @staticmethod

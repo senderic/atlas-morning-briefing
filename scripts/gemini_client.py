@@ -581,6 +581,8 @@ class GeminiCLIClient(BaseLLMClient):
         system_prompt: Optional[str] = None,
         allow_fallback: bool = True,
         reasoning_enabled: bool = True,
+        model: Optional[str] = None,
+        **kwargs: Any,
     ) -> Optional[str]:
         """
         Invoke a Gemini model via CLI with recursive tier fallback.
@@ -614,7 +616,13 @@ class GeminiCLIClient(BaseLLMClient):
         self._attempts_on_current_key = 0
         max_attempts_per_key = 3 
 
-        model_id = self.models.get(tier, self.models["medium"])
+        # A chain rung names this backend's model as `gemini/<id>`; strip the
+        # routing prefix and use it verbatim. Without an explicit rung this
+        # falls back to the tier's configured model.
+        if model:
+            model_id = model[len("gemini/"):] if model.startswith("gemini/") else model
+        else:
+            model_id = self.models.get(tier, self.models["medium"])
         full_prompt = f"{system_prompt}\n\nUser Request: {prompt}" if system_prompt else prompt
 
         # Consistent, bounded retry policy across ALL tiers (no heavy 12-attempt

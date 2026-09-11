@@ -279,16 +279,16 @@ def build_llm_client(config: Dict[str, Any]) -> Optional[Any]:
     Never raises; returns None if no backend can be constructed.
     """
     try:
-        from scripts.llm_chain import build_llm_chain, chain_timeout
+        from scripts.llm_chain import build_clients, build_model_chains, chain_timeout
 
-        chain = build_llm_chain(config)
-        if not chain:
+        clients = build_clients(config)
+        if not clients:
             return None
-        if len(chain) == 1:
-            return chain[0]
         from scripts.composite_client import CompositeClient
 
-        return CompositeClient(chain, timeout=chain_timeout(config))
+        return CompositeClient(
+            clients, build_model_chains(config), timeout=chain_timeout(config)
+        )
     except Exception as e:  # pragma: no cover - defensive, exercised via judge-skipped tests
         logger.warning("Could not build LLM client for quality judge: %s", e)
         return None

@@ -209,17 +209,61 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     "'opencode.enabled' is true but 'opencode' binary not found "
                     "on PATH — install opencode or set 'opencode.enabled: false'"
                 )
-            models = opencode.get("models")
-            if models is not None:
-                if not isinstance(models, dict):
-                    errors.append("opencode.models must be a dictionary")
-                else:
-                    for tier in models:
-                        if tier not in ("heavy", "medium", "light"):
-                            warnings.append(
-                                f"opencode.models.{tier} is not a recognized tier "
-                                "(expected: heavy, medium, light)"
+    # --- LLM model chains ---
+    # The chain is the roster now: a typo here is not a tier that falls back,
+    # it is a rung that silently never runs.
+    llm = config.get("llm")
+    if llm is not None:
+        if not isinstance(llm, dict):
+            errors.append("'llm' must be a dictionary")
+        else:
+            chains = llm.get("chains")
+            if chains is not None and not isinstance(chains, dict):
+                errors.append("llm.chains must be a dictionary of tier -> model list")
+            elif isinstance(chains, dict):
+                from scripts.llm_chain import TIERS, resolve_backend
+
+                enabled_backends = {
+                    name
+                    for name in ("openrouter", "opencode", "gemini")
+                    if (config.get(name, {}) or {}).get("enabled")
+                }
+                for tier, models in chains.items():
+                    if tier not in TIERS:
+                        warnings.append(
+                            f"llm.chains.{tier} is not a recognized tier "
+                            "(expected: heavy, medium, light)"
+                        )
+                        continue
+                    if not isinstance(models, list) or not models:
+                        errors.append(f"llm.chains.{tier} must be a non-empty list")
+                        continue
+                    for model in models:
+                        backend = resolve_backend(model) if isinstance(model, str) else None
+                        if backend is None:
+                            errors.append(
+                                f"llm.chains.{tier}: {model!r} has no known routing "
+                                "prefix (expected openrouter/, opencode/, "
+                                "opencode-go/ or gemini/)"
                             )
+                        elif backend not in enabled_backends:
+                            warnings.append(
+                                f"llm.chains.{tier}: {model} needs the '{backend}' "
+                                "backend, which is not enabled — it will be skipped"
+                            )
+                missing = [t for t in TIERS if t not in chains]
+                if missing:
+                    warnings.append(
+                        f"llm.chains has no entry for {', '.join(missing)}; "
+                        "built-in defaults will be used"
+                    )
+                leads = [m[0] for t, m in chains.items()
+                         if t in TIERS and isinstance(m, list) and m]
+                if len(leads) == len(TIERS) and len(set(leads)) < len(TIERS):
+                    warnings.append(
+                        "llm.chains: two tiers lead with the same model, so they "
+                        "are no longer distinct tiers"
+                    )
 
     # --- Bedrock config ---
     bedrock = config.get("bedrock")

@@ -91,25 +91,19 @@ class TestOpenRouterClient:
         assert c._tier_failures["light"] == 2  # initial + 1 retry (default max_retries_per_model=1)
 
     @patch("scripts.openrouter_client.requests.post")
-    def test_out_of_usage_skips_straight_to_next_model(self, mock_post, key_env):
-        # 402 = payment required → out of usage → no retry, straight to next model.
+    def test_out_of_usage_fails_the_rung_without_retrying(self, mock_post, key_env):
+        # 402 = payment required → out of usage → fail immediately so the chain
+        # can advance. Choosing the next model is CompositeClient's job now.
         mock_post.side_effect = [
             _Resp(402, {"error": {"message": "insufficient balance"}}),
-            _ok_response("from-fallback"),
         ]
-        c = OpenRouterClient({
-            "enabled": True,
-            "models": {"light": "primary/model"},
-            "fallback_models": {"light": ["fallback/model"]},
-        })
-        result = c.invoke("hi", tier="light")
-        assert result == "from-fallback"
-        # primary (1) + fallback (1) — no retries in between
-        assert mock_post.call_count == 2
+        c = OpenRouterClient({"enabled": True})
+        assert c.invoke("hi", tier="light", model="primary/model") is None
+        assert mock_post.call_count == 1
 
     @patch("scripts.openrouter_client.requests.post")
     @patch("scripts.openrouter_client.time.sleep")
-    def test_primary_fails_fallback_succeeds(self, mock_sleep, mock_post, key_env):
+    def test_transient_error_is_retried_on_the_same_model(self, mock_sleep, mock_post, key_env):
         mock_post.side_effect = [
             _Resp(500, {}),
             _ok_response("from-fallback"),
@@ -152,16 +146,31 @@ class TestFreeTierRegressions:
     API on 2026-08-27, where the previous implementation got it wrong.
     """
 
-    def test_tiers_are_distinct_models(self):
-        """heavy/medium/light must never collapse onto the same model."""
-        c = OpenRouterClient({})
-        assert len({c.models["heavy"], c.models["medium"], c.models["light"]}) == 3
+    @staticmethod
+    def _configured_chains():
+        import yaml
 
-    def test_every_default_model_is_free(self):
-        """The whole point of the roster: no slug may route to a paid model."""
-        c = OpenRouterClient({})
-        for tier in ("heavy", "medium", "light"):
-            for model in [c.models[tier]] + c.fallback_models[tier]:
+        return yaml.safe_load(open("config.yaml"))["llm"]["chains"]
+
+    def test_tiers_lead_with_distinct_models(self):
+        """heavy/medium/light must never collapse onto the same model.
+
+        They did: `minimax/minimax-m3:free` stopped being free, medium fell
+        through to light's model, and both tiers silently became one.
+        """
+        leads = {tier: rungs[0] for tier, rungs in self._configured_chains().items()}
+        assert len(set(leads.values())) == 3, leads
+
+    def test_every_openrouter_rung_is_free(self):
+        """No `openrouter/` slug may route to a paid model.
+
+        Paid rungs are allowed in a chain, but they go through the opencode
+        transport and are named `opencode-go/*`, where the cost is visible.
+        """
+        for tier, rungs in self._configured_chains().items():
+            for model in rungs:
+                if not model.startswith("openrouter/"):
+                    continue
                 assert model.endswith(":free"), f"{tier} chain has non-free {model}"
                 assert "openrouter/auto" not in model
 
@@ -310,29 +319,6 @@ class TestFreeTierRegressions:
                 list(ex.map(lambda i: c.invoke("hi", tier="light"), range(40)))
         assert c._call_count == sum(c._tier_calls.values()) == 40
 
-    def test_preflight_may_not_move_a_model_between_tiers(self):
-        """A preflight record naming another tier must be ignored, not applied."""
-        c = OpenRouterClient({}, preflight_models={
-            "heavy": {"available": True, "tier": "light",
-                      "model": "openrouter/tiny:free"},
-        })
-        assert c.models["heavy"] == DEFAULT_MODELS["heavy"]
-
-    def test_preflight_override_applies_within_its_own_tier(self):
-        c = OpenRouterClient({}, preflight_models={
-            "heavy": {"available": True, "tier": "heavy",
-                      "model": "openrouter/dots-studio/dots-3-note-preview:free"},
-        })
-        assert c.models["heavy"] == "openrouter/dots-studio/dots-3-note-preview:free"
-        # The configured primary stays in the chain so a preflight blip is recoverable.
-        assert DEFAULT_MODELS["heavy"] in c.fallback_models["heavy"]
-
-    def test_unavailable_preflight_keeps_the_configured_model(self):
-        c = OpenRouterClient({}, preflight_models={
-            "heavy": {"available": False, "tier": "heavy", "model": "openrouter/dead:free"},
-        })
-        assert c.models["heavy"] == DEFAULT_MODELS["heavy"]
-
     def test_usage_summary_flags_a_billed_run(self, key_env):
         c = OpenRouterClient({})
         c._tier_calls["heavy"] = 1
@@ -356,9 +342,12 @@ class TestFreeTierRegressions:
         assert post.call_count == 3
 
     def test_max_retries_is_exposed_for_the_composite_budget_guard(self):
-        """CompositeClient reads .max_retries to size this backend's window."""
+        """CompositeClient reads .max_retries to size ONE rung's window.
+
+        There is no internal chain to multiply by any more, which is what made
+        the old budget arithmetic overrun its window.
+        """
         from scripts.composite_client import CompositeClient
 
         c = OpenRouterClient({"timeout": 75, "max_retries_per_model": 1})
-        chain = 1 + len(c.fallback_models["heavy"])
-        assert CompositeClient._worst_case_seconds(c) == 75 * 2 * chain
+        assert CompositeClient._worst_case_seconds(c) == 150

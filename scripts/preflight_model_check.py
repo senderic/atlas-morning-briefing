@@ -3,22 +3,26 @@
 """
 Pre-flight model availability check (runs ~15 min before the briefing).
 
-Probes the tiered model roster concurrently and writes .model-availability.json
-next to the config, which the briefing runner consumes to pin a per-tier model
-for the run.
+Probes each tier's model chain concurrently and writes .model-availability.json
+next to the config, which the briefing runner consumes to pin the rung a tier
+starts at for the run.
 
 Design rules learned the hard way:
 
-* **The roster comes from config, never from a table in this file.** A
-  hardcoded copy drifts from config.yaml, and because the runner lets preflight
-  override the configured model, that drift silently swaps tiers.
+* **The chain comes from config, never from a table in this file.** A hardcoded
+  copy drifts from config.yaml, and because the runner lets preflight pin a
+  rung, that drift silently swaps tiers.
 * **A probe must budget enough tokens for reasoning.** Free models emit
   reasoning tokens before any content; with max_tokens=10 the content field
   comes back empty and a perfectly healthy model is marked dead.
-* **A tier's result may only ever name a model from that tier's own chain**, so
+* **A tier's result may only ever name a rung from that tier's own chain**, so
   preflight can never promote a light model into the heavy slot.
-* **Report what actually happened.** If the primary works, say so; only claim
-  "all models failed" when every model in the chain failed.
+* **Skipping is per rung, not per backend.** `llm.preflight_skip` lists the
+  paid rungs, whose probe would be the only call that ever bills them. Free
+  rungs on the same transport are still probed — skipping a whole backend is
+  how a free model on a mostly-paid transport went unprobed and unused.
+* **Report what actually happened.** If the first rung works, say so; only
+  claim the chain is dead when every rung failed.
 """
 
 import argparse
@@ -41,16 +45,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
+from scripts.llm_chain import Rung, build_model_chains  # noqa: E402
 from scripts.llm_client import get_model_capabilities  # noqa: E402
 from scripts.openrouter_client import (  # noqa: E402
     API_BASE_URL,
-    DEFAULT_FALLBACK_MODELS as OR_DEFAULT_FALLBACKS,
-    DEFAULT_MODELS as OR_DEFAULT_MODELS,
     OpenRouterClient,
-)
-from scripts.opencode_client import (  # noqa: E402
-    DEFAULT_FALLBACK_MODELS as OC_DEFAULT_FALLBACKS,
-    DEFAULT_MODELS as OC_DEFAULT_MODELS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -229,41 +228,41 @@ def test_openrouter_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, 
     return result
 
 
-def test_model_chain(provider: str, tier: str, primary: str, fallbacks: List[str]) -> Dict[str, Any]:
-    """Probe a tier's chain in order, returning the first model that answers.
+def probe_chain(tier: str, rungs: List[Rung]) -> Dict[str, Any]:
+    """Probe a tier's chain in order, returning the first rung that answers.
 
-    The returned record always names a model drawn from THIS tier's chain, so a
+    The returned record always names a rung drawn from THIS tier's chain, so a
     preflight result can never move a model between tiers.
     """
-    test_func = test_opencode_model if provider == "opencode" else test_openrouter_model
-    chain = [primary] + [m for m in fallbacks if m != primary]
     attempts = []
 
-    for idx, model in enumerate(chain):
-        result = test_func(model)
-        attempts.append({"model": model, "available": result["available"],
-                         "error": result["error"]})
+    for idx, rung in enumerate(rungs):
+        test_func = (
+            test_opencode_model if rung.backend == "opencode" else test_openrouter_model
+        )
+        result = test_func(rung.model)
+        attempts.append({"model": rung.model, "backend": rung.backend,
+                         "available": result["available"], "error": result["error"]})
         if result["available"]:
             result.update({
-                "model": model, "tier": tier, "provider": provider,
-                "fallback_used": idx > 0, "attempts": attempts,
+                "model": rung.model, "tier": tier, "backend": rung.backend,
+                "rung_index": idx, "fallback_used": idx > 0, "attempts": attempts,
             })
             if idx > 0:
                 logger.info(
-                    "Preflight: %s/%s primary %s failed, using fallback %s",
-                    provider, tier, primary, model,
+                    "Preflight: %s rungs 0-%d failed, pinning %s",
+                    tier, idx - 1, rung.model,
                 )
             return result
 
-    logger.warning(
-        "Preflight: %s/%s ALL %d models failed (primary=%s)",
-        provider, tier, len(chain), primary,
-    )
+    logger.warning("Preflight: %s ALL %d rungs failed", tier, len(rungs))
     return {
-        "available": False, "latency_ms": 0, "error": attempts[-1]["error"],
+        "available": False, "latency_ms": 0,
+        "error": attempts[-1]["error"] if attempts else "no rungs probed",
         "cot_leaked": False, "reasoning_disabled_ok": None,
-        "model": primary, "tier": tier, "provider": provider,
-        "fallback_used": False, "attempts": attempts,
+        "model": rungs[0].model if rungs else "unknown", "tier": tier,
+        "backend": rungs[0].backend if rungs else "unknown",
+        "rung_index": None, "fallback_used": False, "attempts": attempts,
     }
 
 
@@ -275,32 +274,42 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def build_test_matrix(config: Dict[str, Any]) -> List[Tuple[str, str, str, List[str]]]:
-    """Derive (provider, tier, primary, fallbacks) tuples from the config.
+def build_test_matrix(config: Dict[str, Any]) -> List[Tuple[str, List[Rung]]]:
+    """Derive (tier, probeable rungs) from llm.chains.
 
-    Reading the roster from config is what keeps preflight and runtime in
+    Reading the chain from config is what keeps preflight and runtime in
     agreement; a local copy of the model table is how tiers get crossed.
+    Rungs are dropped here for two reasons only: their backend is disabled, or
+    they match `llm.preflight_skip` (the paid ones).
     """
-    defaults = {
-        "opencode": (OC_DEFAULT_MODELS, OC_DEFAULT_FALLBACKS),
-        "openrouter": (OR_DEFAULT_MODELS, OR_DEFAULT_FALLBACKS),
+    llm_config = config.get("llm", {}) or {}
+    skip_prefixes = tuple(llm_config.get("preflight_skip") or ())
+    enabled = {
+        name
+        for name in ("openrouter", "opencode")
+        if (config.get(name, {}) or {}).get("enabled")
     }
-    matrix = []
-    for provider, (default_models, default_fallbacks) in defaults.items():
-        section = config.get(provider, {}) or {}
-        if not section.get("enabled"):
-            continue
-        # A paid last-resort backstop should not be probed every morning —
-        # the probe itself would be the only thing that ever bills it.
-        if not section.get("preflight_check", True):
-            logger.info("Skipping preflight for %s (preflight_check: false)", provider)
-            continue
-        models = section.get("models", {}) or {}
-        fallbacks = section.get("fallback_models", {}) or {}
-        for tier in TIERS:
-            primary = models.get(tier, default_models[tier])
-            chain = list(fallbacks.get(tier, default_fallbacks[tier]))
-            matrix.append((provider, tier, primary, chain))
+
+    matrix: List[Tuple[str, List[Rung]]] = []
+    for tier, rungs in build_model_chains(config).items():
+        probeable = []
+        for rung in rungs:
+            if rung.backend not in enabled:
+                logger.debug(
+                    "Preflight skipping %s: backend %s not enabled",
+                    rung.model, rung.backend,
+                )
+                continue
+            if skip_prefixes and rung.model.startswith(skip_prefixes):
+                logger.info(
+                    "Preflight skipping %s (llm.preflight_skip): probing it would "
+                    "be the only call that bills it",
+                    rung.model,
+                )
+                continue
+            probeable.append(rung)
+        if probeable:
+            matrix.append((tier, probeable))
     return matrix
 
 
@@ -319,41 +328,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = load_config(config_path)
     matrix = build_test_matrix(config)
     if not matrix:
-        logger.warning("No LLM providers enabled in %s; skipping preflight", config_path)
+        logger.warning("No probeable rungs in %s; skipping preflight", config_path)
         return 0
 
-    providers = sorted({p for p, _, _, _ in matrix})
-    logger.info("Probing %d tiers across %s", len(matrix), ", ".join(providers))
+    total_rungs = sum(len(rungs) for _, rungs in matrix)
+    logger.info("Probing %d tiers (%d rungs)", len(matrix), total_rungs)
 
     results: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "config": str(config_path),
         "prompt_tokens_budget": TEST_MAX_TOKENS,
+        "chains": {},
     }
-    for provider in providers:
-        results[provider] = {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(test_model_chain, provider, tier, primary, chain): (provider, tier)
-            for provider, tier, primary, chain in matrix
+            executor.submit(probe_chain, tier, rungs): tier for tier, rungs in matrix
         }
         for future in as_completed(futures):
-            provider, tier = futures[future]
+            tier = futures[future]
             try:
                 result = future.result()
             except Exception as e:
-                logger.error("  ✗ %s/%s: %s", provider, tier, e)
-                results[provider][tier] = {
+                logger.error("  \u2717 %s: %s", tier, e)
+                results["chains"][tier] = {
                     "available": False, "latency_ms": 0, "error": str(e)[:200],
                     "cot_leaked": False, "reasoning_disabled_ok": None,
-                    "model": "unknown", "tier": tier, "provider": provider,
-                    "fallback_used": False, "attempts": [],
+                    "model": "unknown", "tier": tier, "backend": "unknown",
+                    "rung_index": None, "fallback_used": False, "attempts": [],
                 }
                 continue
-            results[provider][tier] = result
-            mark = "✓" if result["available"] else "✗"
-            note = " (fallback)" if result.get("fallback_used") else ""
+            results["chains"][tier] = result
+            mark = "\u2713" if result["available"] else "\u2717"
+            note = (
+                f" (rung {result['rung_index']})"
+                if result.get("rung_index")
+                else ""
+            )
             rd = result.get("reasoning_disabled_ok")
             # Tri-state: True = verified working, False = endpoint refuses,
             # None = not determined (no control configured, or the probe
@@ -364,18 +375,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             }.get(rd, "" if rd is None else "")
             if rd is None and result.get("reasoning_probe_inconclusive"):
                 rd_note = " reasoning-off:unknown"
-            logger.info("  %s %s/%s: %s%s%s (%dms)", mark, provider, tier,
+            logger.info("  %s %s: %s%s%s (%dms)", mark, tier,
                         result["model"], note, rd_note, result["latency_ms"])
 
     output_path.write_text(json.dumps(results, indent=2))
     logger.info("Pre-flight results written to %s", output_path)
 
     exit_code = 0
-    for provider in providers:
-        ok = [t for t in TIERS if results[provider].get(t, {}).get("available")]
-        logger.info("%s: %d/%d tiers available: %s", provider, len(ok), len(TIERS), ok)
-        if not ok:
-            exit_code = 1
+    ok = [t for t in TIERS if results["chains"].get(t, {}).get("available")]
+    logger.info("%d/%d tiers have a reachable rung: %s", len(ok), len(TIERS), ok)
+    if not ok:
+        exit_code = 1
     return exit_code
 
 
