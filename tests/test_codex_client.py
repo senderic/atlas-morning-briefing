@@ -64,6 +64,23 @@ class TestAvailability:
 
 
 class TestInvocation:
+    def test_approved_config_keys_control_reasoning_and_timeout(self):
+        response = completed(success_jsonl())
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=response) as run,
+        ):
+            client = make_client(
+                reasoning_effort="low",
+                timeout_seconds=17,
+                reasoning="high",
+                timeout=99,
+            )
+            assert client.invoke("request") == "A useful report."
+
+        assert 'model_reasoning_effort="low"' in run.call_args.args[0]
+        assert run.call_args.kwargs["timeout"] == 17
+
     def test_builds_exact_command_and_delimited_stdin(self):
         response = completed(success_jsonl())
         with (
@@ -106,7 +123,7 @@ class TestInvocation:
                 json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "first"}}),
                 "not json",
                 json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "last"}}),
-                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 4}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 4, "reasoning_output_tokens": 6}}),
             ]
         )
         with (
@@ -120,6 +137,7 @@ class TestInvocation:
             assert client.usage_stats["input_tokens"] == 10
             assert client.usage_stats["cached_input_tokens"] == 2
             assert client.usage_stats["output_tokens"] == 4
+            assert client.usage_stats["reasoning_output_tokens"] == 6
             assert client.usage_stats["model"] == "gpt-5.6-sol"
 
     def test_malformed_lines_are_ignored_when_completion_is_valid(self):
@@ -139,6 +157,19 @@ class TestInvocation:
             client = make_client()
             assert client.invoke("request") is None
             assert client.usage_stats["failures"] == 1
+
+    def test_top_level_agent_message_is_not_a_completed_agent_message(self):
+        raw = "\n".join(
+            [
+                json.dumps({"type": "agent_message", "text": "partial"}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(raw)),
+        ):
+            assert make_client().invoke("request") is None
 
     def test_explicit_error_event_is_rejected_even_with_message(self):
         raw = success_jsonl() + json.dumps({"type": "turn.failed", "error": {"message": "failed"}}) + "\n"
@@ -193,6 +224,24 @@ class TestCallLog:
         assert record["output_tokens"] == 23
         assert "secret" not in log_path.read_text()
 
+    def test_nonzero_stderr_is_sanitized_in_call_log(self, tmp_path):
+        log_path = tmp_path / "calls.jsonl"
+        hostile = "secret user prompt / auth-token=do-not-log"
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed("", returncode=7, stderr=hostile),
+            ),
+        ):
+            assert make_client(call_log_path=str(log_path)).invoke("request") is None
+
+        record = json.loads(log_path.read_text().strip())
+        assert record["status"] == "error"
+        assert record["error_category"] == "nonzero_exit"
+        assert record["exit_status"] == 7
+        assert hostile not in log_path.read_text()
+
     def test_logging_failure_does_not_fail_inference(self, tmp_path):
         with (
             patch("scripts.codex_client.shutil.which", return_value=CODEX),
@@ -210,6 +259,7 @@ def test_usage_summary_is_concise_markdown():
         input_tokens=100,
         cached_input_tokens=10,
         output_tokens=25,
+        reasoning_output_tokens=12,
         latency_s=3.5,
     )
     summary = client.get_usage_summary()
@@ -217,3 +267,4 @@ def test_usage_summary_is_concise_markdown():
     assert "2 calls" in summary
     assert "1 failed" in summary
     assert "100" in summary and "25" in summary
+    assert "12 reasoning output" in summary

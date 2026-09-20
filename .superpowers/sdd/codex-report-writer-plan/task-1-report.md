@@ -81,3 +81,38 @@ pytest -q tests/test_codex_client.py --tb=short
   never affect inference.
 - Prompt text is sent to the subprocess but is not written to call logs.
 - `git diff --check` passed before final verification.
+
+## Review fixes (follow-up)
+
+The review identified four compatibility/safety gaps. I added focused tests
+before changing production code. The RED command was:
+
+```text
+pytest -q tests/test_codex_client.py --tb=short
+...F.F..F.....F.F                                                        [100%]
+5 failed, 12 passed in 0.22s
+```
+
+The failures covered approved `reasoning_effort`/`timeout_seconds` keys,
+`reasoning_output_tokens`, rejection of a top-level agent message, sanitized
+nonzero-stderr logging, and usage-summary reporting.
+
+The implementation now gives the approved keys precedence over compatibility
+aliases, accounts/logs/summarizes `reasoning_output_tokens`, accepts final
+text only from `item.completed` agent-message items, and records only a
+sanitized error category plus exit status. Raw subprocess stderr is neither
+logged nor emitted by runtime error handling.
+
+Fix GREEN evidence:
+
+```text
+pytest -q tests/test_codex_client.py --tb=short
+.................                                                        [100%]
+17 passed in 0.09s
+
+pytest -q --tb=short
+1271 passed, 3 skipped in 14.28s
+```
+
+Follow-up self-review found no routing, configuration, prompt, or unrelated
+file changes. `git diff --check` passed.

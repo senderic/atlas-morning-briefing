@@ -35,8 +35,12 @@ class CodexClient(BaseLLMClient):
             config.get("executable", config.get("binary", config.get("cli_binary", "codex")))
         )
         self.model = str(config.get("model", self.DEFAULT_MODEL))
-        self.reasoning = str(config.get("reasoning", self.DEFAULT_REASONING))
-        self.timeout = float(config.get("timeout", self.DEFAULT_TIMEOUT))
+        self.reasoning = str(
+            config.get("reasoning_effort", config.get("reasoning", self.DEFAULT_REASONING))
+        )
+        self.timeout = float(
+            config.get("timeout_seconds", config.get("timeout", self.DEFAULT_TIMEOUT))
+        )
         self.max_calls = int(config.get("max_calls_per_run", config.get("max_calls", self.DEFAULT_MAX_CALLS)))
         self._available: Optional[bool] = None
         self._call_count = 0
@@ -48,7 +52,7 @@ class CodexClient(BaseLLMClient):
             "input_tokens": 0,
             "cached_input_tokens": 0,
             "output_tokens": 0,
-            "reasoning_tokens": 0,
+            "reasoning_output_tokens": 0,
             "model": self.model,
         }
         # These aliases make the state convenient to inspect and mirror the
@@ -139,14 +143,11 @@ class CodexClient(BaseLLMClient):
                 saw_failure = True
 
             item = event.get("item")
-            if event_type in {"item.completed", "item.complete"} and isinstance(item, dict):
+            if event_type == "item.completed" and isinstance(item, dict):
                 if item.get("status") in {"failed", "error"}:
                     saw_failure = True
                 if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                     message = item["text"]
-            elif event_type in {"agent_message", "agent_message.completed"}:
-                if isinstance(event.get("text"), str):
-                    message = event["text"]
 
             if event_type == "turn.completed":
                 saw_completion = True
@@ -175,7 +176,8 @@ class CodexClient(BaseLLMClient):
         started: float,
         model: str,
         status: str,
-        error: Optional[str] = None,
+        error_category: Optional[str] = None,
+        exit_status: Optional[int] = None,
         usage: Optional[Dict[str, Any]] = None,
     ) -> None:
         latency = time.monotonic() - started
@@ -189,10 +191,17 @@ class CodexClient(BaseLLMClient):
             "model": model,
             "latency_s": round(latency, 3),
         }
-        if error:
-            record["error"] = error[:500]
+        if error_category:
+            record["error_category"] = error_category
+        if exit_status is not None:
+            record["exit_status"] = exit_status
         if usage:
-            for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens"):
+            for key in (
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            ):
                 if key in usage:
                     record[key] = usage[key]
         self._log_call(record)
@@ -227,8 +236,21 @@ class CodexClient(BaseLLMClient):
                 text=True,
                 timeout=self.timeout,
             )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            self._finish_attempt(started=started, model=effective_model, status="error", error=str(exc))
+        except subprocess.TimeoutExpired:
+            self._finish_attempt(
+                started=started,
+                model=effective_model,
+                status="error",
+                error_category="timeout",
+            )
+            return None
+        except OSError:
+            self._finish_attempt(
+                started=started,
+                model=effective_model,
+                status="error",
+                error_category="os_error",
+            )
             return None
 
         if result.returncode != 0:
@@ -236,7 +258,8 @@ class CodexClient(BaseLLMClient):
                 started=started,
                 model=effective_model,
                 status="error",
-                error=(result.stderr or f"Codex exited with status {result.returncode}"),
+                error_category="nonzero_exit",
+                exit_status=result.returncode,
             )
             return None
 
@@ -246,12 +269,17 @@ class CodexClient(BaseLLMClient):
                 started=started,
                 model=effective_model,
                 status="error",
-                error="incomplete, failed, or empty Codex turn",
+                error_category="invalid_response",
                 usage=usage,
             )
             return None
 
-        for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens"):
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ):
             value = usage.get(key, 0)
             if isinstance(value, (int, float)):
                 self.usage_stats[key] += value
@@ -270,7 +298,7 @@ class CodexClient(BaseLLMClient):
             f"**Codex ({stats['model']}):** {stats['calls']} calls, "
             f"{stats['failures']} failed; "
             f"{stats['input_tokens']} input ({stats['cached_input_tokens']} cached), "
-            f"{stats['output_tokens']} output tokens; "
+            f"{stats['output_tokens']} output ({stats['reasoning_output_tokens']} reasoning output) tokens; "
             f"{stats['latency_s']:.1f}s"
         )
 
