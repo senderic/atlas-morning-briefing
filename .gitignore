@@ -47,6 +47,8 @@ logs/*.svg
 logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl
+logs/codex-calls.jsonl
+logs/local-codex-calls.jsonl
 logs/gemini-audit-*.txt
 # Quality-check run artifacts (scripts/quality_check.py)
 logs/source-health.jsonl

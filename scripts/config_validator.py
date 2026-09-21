@@ -209,6 +209,50 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     "'opencode.enabled' is true but 'opencode' binary not found "
                     "on PATH — install opencode or set 'opencode.enabled: false'"
                 )
+
+    # --- Codex report-writer config ---
+    codex = config.get("codex")
+    if codex is not None:
+        if not isinstance(codex, dict):
+            errors.append("'codex' must be a dictionary")
+        elif codex.get("enabled"):
+            binary = codex.get(
+                "binary", codex.get("executable", codex.get("cli_binary"))
+            )
+            if not isinstance(binary, str) or not binary.strip():
+                errors.append("'codex.binary' must be a non-empty string when enabled")
+
+            model = codex.get("model")
+            if not isinstance(model, str) or not model.strip():
+                errors.append("'codex.model' must be a non-empty string when enabled")
+
+            timeout = codex.get("timeout_seconds", codex.get("timeout", 300))
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or timeout <= 0
+            ):
+                errors.append("'codex.timeout_seconds' must be a positive number")
+
+            max_calls = codex.get(
+                "max_calls_per_run", codex.get("max_calls", 5)
+            )
+            if (
+                isinstance(max_calls, bool)
+                or not isinstance(max_calls, int)
+                or max_calls <= 0
+            ):
+                errors.append("'codex.max_calls_per_run' must be a positive integer")
+
+            reasoning = codex.get(
+                "reasoning_effort", codex.get("reasoning", "high")
+            )
+            supported_reasoning = {"low", "medium", "high", "xhigh"}
+            if reasoning not in supported_reasoning:
+                errors.append(
+                    "'codex.reasoning_effort' must be one of "
+                    f"{sorted(supported_reasoning)}"
+                )
     # --- LLM model chains ---
     # The chain is the roster now: a typo here is not a tier that falls back,
     # it is a rung that silently never runs.

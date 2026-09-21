@@ -1476,3 +1476,87 @@ class TestExecutiveSummaryLeadInstruction:
         lead_block = prompt[prompt.index("GRAMMATICAL SUBJECT"):prompt.index("glanceable")]
         for term in ("kill chain", "Nvidia", "ISR", "counter-UAS", "defense", "arXiv"):
             assert term.lower() not in lead_block.lower(), f"{term} hardcoded in lead instruction"
+
+
+class _RecordingWriter:
+    """In-memory report route that records the complete reader-facing prompt."""
+
+    available = True
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def invoke(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        return self.response
+
+
+class TestExecutiveSummaryEditorialPolicy:
+    def _synthesize(self, mock_client, default_config, news, response):
+        writer = _RecordingWriter(response)
+        intel = BriefingIntelligence(mock_client, default_config, report_writer=writer)
+
+        result = intel.synthesize_briefing(
+            papers=[], blogs=[], stocks=[], news=news, top_papers=[]
+        )
+
+        assert result == {"editorial_intro": response}
+        assert len(writer.calls) == 1
+        assert mock_client.invoke.call_count == 0
+        return writer.calls[0][0]
+
+    def test_completed_boardwalk_incident_stays_context_not_actionable_hazard(
+        self, mock_client, default_config
+    ):
+        """Catches turning an ended boardwalk incident into fresh avoidance advice."""
+        headline = "Mission Bay boardwalk reopened after Sept. 18 gas leak; no advisory remains"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Context, not a warning."
+        )
+
+        assert headline in prompt
+        assert "treat completed incidents as context rather than current hazards" in prompt.lower()
+        assert "only when supplied data establishes" in prompt.lower()
+
+    def test_duplicate_coverage_confirms_event_without_claiming_a_pattern(
+        self, mock_client, default_config
+    ):
+        """Catches treating several headlines about one incident as a local trend."""
+        title_one = "Mission Bay boardwalk reopened after Sept. 18 gas leak"
+        title_two = "City confirms boardwalk reopened after Sept. 18 gas leak"
+        prompt = self._synthesize(
+            mock_client,
+            default_config,
+            [{"title": title_one}, {"title": title_two}],
+            "The reports corroborate one completed event.",
+        )
+
+        assert title_one in prompt and title_two in prompt
+        assert "does not establish prevalence, a trend, or ongoing risk" in prompt.lower()
+
+    def test_active_closure_or_advisory_requires_clear_reader_action(
+        self, mock_client, default_config
+    ):
+        """Catches suppressing useful action when supplied data reports a live advisory."""
+        headline = "County issues active water-contact advisory at Pacific Beach through Monday"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Avoid water contact through Monday."
+        )
+
+        assert headline in prompt
+        assert "active closure or advisory" in prompt.lower()
+        assert "clearly state the action, timing, or decision" in prompt.lower()
+
+    def test_repeated_pattern_requires_clear_reader_action(
+        self, mock_client, default_config
+    ):
+        """Catches suppressing advice when the data actually documents recurrence."""
+        headline = "Third sewage spill this month closes the same Mission Bay shoreline"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Plan around recurring closures."
+        )
+
+        assert headline in prompt
+        assert "repeated pattern" in prompt.lower()
+        assert "clearly state the action, timing, or decision" in prompt.lower()

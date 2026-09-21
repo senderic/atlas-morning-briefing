@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Junjie Tang. MIT License. See LICENSE file for details.
 """Tests for config_validator module."""
 
+from pathlib import Path
+
 import pytest
+import yaml
 from scripts.config_validator import validate_config, check_environment
 
 
@@ -109,6 +112,113 @@ class TestValidateConfig:
         }
         is_valid, messages = validate_config(config)
         assert is_valid is True
+
+
+class TestCodexConfig:
+    @pytest.mark.parametrize(
+        ("codex", "missing"),
+        [
+            (
+                {
+                    "enabled": True,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "timeout_seconds": 300,
+                    "max_calls_per_run": 5,
+                },
+                "binary",
+            ),
+            (
+                {
+                    "enabled": True,
+                    "binary": "/opt/codex",
+                    "reasoning_effort": "high",
+                    "timeout_seconds": 300,
+                    "max_calls_per_run": 5,
+                },
+                "model",
+            ),
+            (
+                {
+                    "enabled": True,
+                    "binary": "/opt/codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "timeout_seconds": 0,
+                    "max_calls_per_run": 5,
+                },
+                "timeout_seconds",
+            ),
+            (
+                {
+                    "enabled": True,
+                    "binary": "/opt/codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "timeout_seconds": 300,
+                    "max_calls_per_run": 0,
+                },
+                "max_calls_per_run",
+            ),
+            (
+                {
+                    "enabled": True,
+                    "binary": "/opt/codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "unsupported",
+                    "timeout_seconds": 300,
+                    "max_calls_per_run": 5,
+                },
+                "reasoning_effort",
+            ),
+        ],
+    )
+    def test_enabled_codex_rejects_invalid_required_setting(self, codex, missing):
+        """Catches a malformed enabled writer config reaching cron unchecked."""
+        is_valid, messages = validate_config({"arxiv_topics": ["test"], "codex": codex})
+
+        assert is_valid is False
+        assert any(missing in message for message in messages)
+
+    def test_enabled_codex_with_supported_settings_is_valid(self):
+        """Catches rejecting the bounded writer configuration used by the run."""
+        config = {
+            "arxiv_topics": ["test"],
+            "codex": {
+                "enabled": True,
+                "binary": "/home/eric/.local/bin/codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "timeout_seconds": 300,
+                "max_calls_per_run": 5,
+            },
+        }
+
+        is_valid, messages = validate_config(config)
+
+        assert is_valid is True
+        assert not any("codex" in message.lower() for message in messages)
+
+    def test_checked_in_configs_enable_the_same_bounded_codex_writer(self):
+        """Catches the local run silently drifting from the main writer setup."""
+        root = Path(__file__).resolve().parent.parent
+        with (root / "config.yaml").open() as stream:
+            main = yaml.safe_load(stream)["codex"]
+        with (root / "config_local.yaml").open() as stream:
+            local = yaml.safe_load(stream)["codex"]
+
+        expected = {
+            "enabled": True,
+            "binary": "/home/eric/.local/bin/codex",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "timeout_seconds": 300,
+            "max_calls_per_run": 5,
+        }
+        assert {key: main[key] for key in expected} == expected
+        assert {key: local[key] for key in expected} == expected
+        assert main["call_log_path"] == "logs/codex-calls.jsonl"
+        assert local["call_log_path"] == "logs/local-codex-calls.jsonl"
 
 
 class TestCheckEnvironment:

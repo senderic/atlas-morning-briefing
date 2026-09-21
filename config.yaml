@@ -427,6 +427,16 @@ gemini:
     medium: "flash"
     light: "flash-lite"
 
+# Codex writes only reader-facing report prose; analysis remains on the LLM chain.
+codex:
+  enabled: true
+  binary: "/home/eric/.local/bin/codex"
+  model: "gpt-5.6-sol"
+  reasoning_effort: "high"
+  timeout_seconds: 300
+  max_calls_per_run: 5
+  call_log_path: "logs/codex-calls.jsonl"
+
 # OpenCode CLI backend. Requires the `opencode` binary on PATH.
 # A TRANSPORT, not a tier: inference runs as `opencode run -m <model>`, and
 # which of its models serve which tier is decided by llm.chains below. Both
