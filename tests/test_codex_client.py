@@ -79,7 +79,7 @@ class TestInvocation:
             assert client.invoke("request") == "A useful report."
 
         assert 'model_reasoning_effort="low"' in run.call_args.args[0]
-        assert run.call_args.kwargs["timeout"] == 17
+        assert 0 < run.call_args.kwargs["timeout"] <= 17
 
     def test_builds_exact_command_and_delimited_stdin(self):
         response = completed(success_jsonl())
@@ -113,7 +113,7 @@ class TestInvocation:
         assert "system rules" in kwargs["input"]
         assert "--- USER PROMPT ---" in kwargs["input"]
         assert "user request" in kwargs["input"]
-        assert kwargs["timeout"] == 42
+        assert 0 < kwargs["timeout"] <= 42
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
 
@@ -147,6 +147,20 @@ class TestInvocation:
             patch("scripts.codex_client.subprocess.run", return_value=completed(raw)),
         ):
             assert make_client().invoke("request") == "A useful report."
+
+    def test_post_terminal_agent_message_is_rejected_not_selected(self):
+        """Catches an incomplete later turn replacing the completed prose."""
+        raw = success_jsonl("completed prose") + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "later partial prose"},
+            }
+        )
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(raw)),
+        ):
+            assert make_client().invoke("request") is None
 
     def test_incomplete_turn_is_rejected(self):
         raw = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "partial"}})
@@ -205,6 +219,49 @@ class TestInvocation:
             assert client.invoke("one") == "A useful report."
             assert client.invoke("two") is None
             run.assert_called_once()
+
+    def test_fast_calls_share_the_standalone_cumulative_timeout(self):
+        """Catches each fast report section receiving a fresh 10-second budget."""
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.time.time", side_effect=[100.0, 103.0, 108.0]),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(success_jsonl()),
+            ) as run,
+        ):
+            client = make_client(timeout_seconds=10)
+            assert client.invoke("first") == "A useful report."
+            assert client.invoke("second") == "A useful report."
+
+        assert [call.kwargs["timeout"] for call in run.call_args_list] == [7.0, 2.0]
+
+    def test_shared_deadline_clamps_the_subprocess_timeout(self, monkeypatch):
+        """Catches a wrapper deadline being ignored by an individual attempt."""
+        monkeypatch.setenv("ATLAS_CODEX_DEADLINE_EPOCH", "105")
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.time.time", return_value=102.0),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(success_jsonl()),
+            ) as run,
+        ):
+            assert make_client(timeout_seconds=10).invoke("request") == "A useful report."
+
+        assert run.call_args.kwargs["timeout"] == 3.0
+
+    def test_exhausted_shared_deadline_skips_the_subprocess(self, monkeypatch):
+        """Catches a report section launching Codex after the shared window ends."""
+        monkeypatch.setenv("ATLAS_CODEX_DEADLINE_EPOCH", "105")
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.time.time", return_value=105.0),
+            patch("scripts.codex_client.subprocess.run") as run,
+        ):
+            assert make_client(timeout_seconds=10).invoke("request") is None
+
+        run.assert_not_called()
 
 
 class TestCallLog:

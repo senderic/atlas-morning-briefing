@@ -13,6 +13,11 @@ export PATH="$HOME/.nvm/versions/node/v20.19.5/bin:$HOME/.linuxbrew/bin:/home/li
 # Navigate to project directory
 cd "$DIR" || exit 1
 
+# Atlas and local are sequential, so their report-writer attempts share the
+# configured 300-second Codex window instead of receiving one window each.
+# CodexClient also creates this window for standalone runner invocations.
+export ATLAS_CODEX_DEADLINE_EPOCH="$(( $(date +%s) + 300 ))"
+
 # Pre-flight model availability check. Probes the tiered model roster from
 # config.yaml and writes .model-availability.json, which both briefings read to
 # pin a working model per tier. A non-zero exit means some tier had no reachable

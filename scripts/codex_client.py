@@ -3,6 +3,8 @@
 
 import json
 import logging
+import math
+import os
 import shutil
 import subprocess
 import time
@@ -41,6 +43,7 @@ class CodexClient(BaseLLMClient):
         self.timeout = float(
             config.get("timeout_seconds", config.get("timeout", self.DEFAULT_TIMEOUT))
         )
+        self._budget_deadline = self._resolve_budget_deadline()
         self.max_calls = int(config.get("max_calls_per_run", config.get("max_calls", self.DEFAULT_MAX_CALLS)))
         self._available: Optional[bool] = None
         self._call_count = 0
@@ -68,6 +71,18 @@ class CodexClient(BaseLLMClient):
             self.call_log_path: Optional[Path] = path
         else:
             self.call_log_path = None
+
+    def _resolve_budget_deadline(self) -> float:
+        """Use the wrapper's shared wall-clock deadline or start a local one."""
+        shared_deadline = os.environ.get("ATLAS_CODEX_DEADLINE_EPOCH")
+        if shared_deadline:
+            try:
+                deadline = float(shared_deadline)
+            except (TypeError, ValueError):
+                deadline = 0.0
+            if math.isfinite(deadline):
+                return deadline
+        return time.time() + self.timeout
 
     @property
     def available(self) -> bool:
@@ -133,6 +148,12 @@ class CodexClient(BaseLLMClient):
                 continue
 
             event_type = str(event.get("type", "")).lower()
+            # A completed turn is terminal.  A later semantic event belongs
+            # to another/incomplete turn (or is an invalid stream), never to
+            # the prose and usage already selected for this invocation.
+            if saw_completion and event_type:
+                saw_failure = True
+                continue
             if (
                 event_type in {"error", "turn.failed", "turn.error", "item.failed", "item.error"}
                 or event_type.endswith(".failed")
@@ -222,6 +243,11 @@ class CodexClient(BaseLLMClient):
             logger.warning("Codex call budget exhausted (%d / %d)", self._call_count, self.max_calls)
             return None
 
+        remaining_budget = self._budget_deadline - time.time()
+        if remaining_budget <= 0:
+            logger.warning("Codex cumulative time budget exhausted")
+            return None
+
         effective_model = model or self.model
         self._call_count += 1
         self.calls += 1
@@ -234,7 +260,7 @@ class CodexClient(BaseLLMClient):
                 input=self._prompt_payload(prompt, system_prompt),
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=min(self.timeout, remaining_budget),
             )
         except subprocess.TimeoutExpired:
             self._finish_attempt(

@@ -21,6 +21,30 @@ class _Client:
 
 
 class TestReportWriter:
+    def test_primary_exception_log_excludes_exception_text(self, caplog):
+        """Catches provider/prompt text leaking through the writer warning."""
+        hostile = "auth-token=do-not-log --- USER PROMPT --- secret"
+        codex = _Client()
+        codex.invoke = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(hostile))
+        fallback = _Client("Fallback prose.")
+
+        assert ReportWriter(codex, fallback).invoke("write this") == "Fallback prose."
+
+        assert hostile not in caplog.text
+        assert "RuntimeError" in caplog.text
+
+    def test_fallback_exception_log_excludes_exception_text(self, caplog):
+        """Catches provider/prompt text leaking through fallback warning."""
+        hostile = "auth-token=do-not-log --- SYSTEM PROMPT --- secret"
+        codex = _Client(None)
+        fallback = _Client()
+        fallback.invoke = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(hostile))
+
+        assert ReportWriter(codex, fallback).invoke("write this") is None
+
+        assert hostile not in caplog.text
+        assert "RuntimeError" in caplog.text
+
     def test_codex_prose_is_served_without_fallback(self):
         """Catches a regression where a good Codex result still bills the chain."""
         codex = _Client("Reader-ready prose.", model="codex-model")

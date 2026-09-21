@@ -63,7 +63,7 @@ class ReportWriter(BaseLLMClient):
                     )
                 )
             except Exception as exc:  # a writer failure must retain the old fallback
-                logger.warning("Codex report writer failed: %s", exc)
+                logger.warning("Codex report writer failed (%s)", type(exc).__name__)
                 result = None
             if result:
                 self._record("codex")
@@ -82,7 +82,7 @@ class ReportWriter(BaseLLMClient):
                     )
                 )
             except Exception as exc:  # preserve deterministic report fallback
-                logger.warning("Fallback report writer failed: %s", exc)
+                logger.warning("Fallback report writer failed (%s)", type(exc).__name__)
                 result = None
             if result:
                 self._record("fallback")

@@ -115,6 +115,46 @@ class TestValidateConfig:
 
 
 class TestCodexConfig:
+    def test_implicit_enabled_codex_rejects_invalid_timeout(self):
+        """Catches validation allowing a mapping the runtime enables by default."""
+        is_valid, messages = validate_config(
+            {"arxiv_topics": ["test"], "codex": {"timeout_seconds": -1}}
+        )
+
+        assert is_valid is False
+        assert any("timeout_seconds" in message for message in messages)
+
+    def test_explicitly_disabled_codex_mapping_remains_exempt(self):
+        """Catches disabled writer settings being treated as runnable config."""
+        is_valid, messages = validate_config(
+            {
+                "arxiv_topics": ["test"],
+                "codex": {"enabled": False, "timeout_seconds": -1},
+            }
+        )
+
+        assert is_valid is True
+        assert not any("codex" in message.lower() for message in messages)
+
+    def test_validator_uses_runtime_executable_alias_precedence(self):
+        """Catches validating binary while runtime would select executable."""
+        is_valid, messages = validate_config(
+            {
+                "arxiv_topics": ["test"],
+                "codex": {
+                    "executable": "",
+                    "binary": "/opt/codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "timeout_seconds": 300,
+                    "max_calls_per_run": 5,
+                },
+            }
+        )
+
+        assert is_valid is False
+        assert any("codex.binary" in message for message in messages)
+
     @pytest.mark.parametrize("timeout_literal", [".inf", ".nan"])
     def test_enabled_codex_rejects_nonfinite_yaml_timeout(self, timeout_literal):
         """Catches an unbounded or invalid subprocess timeout reaching cron."""

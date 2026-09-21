@@ -216,9 +216,9 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if codex is not None:
         if not isinstance(codex, dict):
             errors.append("'codex' must be a dictionary")
-        elif codex.get("enabled"):
+        elif bool(codex.get("enabled", True)):
             binary = codex.get(
-                "binary", codex.get("executable", codex.get("cli_binary"))
+                "executable", codex.get("binary", codex.get("cli_binary"))
             )
             if not isinstance(binary, str) or not binary.strip():
                 errors.append("'codex.binary' must be a non-empty string when enabled")
