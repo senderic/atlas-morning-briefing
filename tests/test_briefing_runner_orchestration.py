@@ -64,6 +64,22 @@ class TestRunOrchestration:
         assert len(md_files) == 1
         assert len(epub_files) == 1
 
+    def test_default_codex_writer_never_starts_a_real_cli_process(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Catches a test config accidentally invoking the local Codex CLI."""
+        monkeypatch.chdir(tmp_path)
+        runner = BriefingRunner(base_config, dry_run=True)
+        papers = [{"title": "P1", "summary": "abs", "published": "", "arxiv_url": ""}]
+        with patch("scripts.codex_client.subprocess.run") as subprocess_run, \
+             patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            runner.run()
+
+        subprocess_run.assert_not_called()
+
     def test_writer_generates_executive_and_extension_from_raw_inputs(self, base_config, tmp_path, monkeypatch):
         """Catches report writing being nested inside unavailable analysis work."""
         monkeypatch.chdir(tmp_path)

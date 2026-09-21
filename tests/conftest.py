@@ -11,6 +11,7 @@ from.
 
 import pytest
 
+import scripts.codex_client as codex_client
 import scripts.quality_check as quality_check
 
 
@@ -24,3 +25,13 @@ def _never_write_the_real_score_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         quality_check, "DEFAULT_SCORES_PATH", str(tmp_path / "quality-scores.jsonl")
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_discover_real_codex_cli(monkeypatch):
+    """Keep runner tests from invoking the machine's Codex executable.
+
+    Codex-client unit tests explicitly patch this discovery seam and mock
+    subprocess execution, so they continue to exercise their intended paths.
+    """
+    monkeypatch.setattr(codex_client.shutil, "which", lambda executable: None)

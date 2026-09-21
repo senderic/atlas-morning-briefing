@@ -185,9 +185,9 @@ class BriefingRunner:
             self.llm_client = CompositeClient(
                 clients, chains, timeout=chain_timeout(config)
             )
-        codex_config = config.get("codex")
+        codex_config = config.get("codex", {})
         self.codex_client = CodexClient(
-            codex_config if isinstance(codex_config, dict) else {"enabled": False}
+            codex_config if isinstance(codex_config, dict) else {}
         )
         self.report_writer = ReportWriter(self.codex_client, self.llm_client)
         self.intelligence = BriefingIntelligence(

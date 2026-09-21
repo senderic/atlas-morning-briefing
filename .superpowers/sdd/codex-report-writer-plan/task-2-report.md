@@ -7,8 +7,8 @@ It prefers the configured Codex client for reader-facing prose, rejects empty
 or chain-of-thought-leaking output, and makes one heavy-tier call through the
 existing analysis chain only when Codex cannot provide acceptable prose.
 
-`BriefingRunner` now creates the Codex client from the `codex` mapping (or a
-disabled mapping when it is absent), retains `CompositeClient` as the analysis
+`BriefingRunner` now creates the Codex client from the `codex` mapping (or its
+defaults when the mapping is absent), retains `CompositeClient` as the analysis
 client, and passes the writer separately into `BriefingIntelligence`.
 
 ## Routing
@@ -67,9 +67,9 @@ whitespace errors.
 ## Concern
 
 No implementation blocker. The Codex mapping remains intentionally absent from
-the checked-in YAML files; Task 3 owns enabling/configuring it. Without that
-mapping, the writer is disabled as primary and the existing analysis chain
-continues serving the three prose calls.
+the checked-in YAML files; Task 3 owns explicit YAML enablement/configuration.
+Without that mapping, `CodexClient` uses its own defaults and the established
+analysis chain remains the per-call fallback.
 
 ## Recovery audit (2026-09-20)
 
@@ -106,5 +106,56 @@ Task files: `.gitignore`, `.superpowers/sdd/.gitignore`, this report,
 
 Self-review found no scope expansion into YAML or editorial policy. The only
 recovery change is the focused independent-call regression test. Remaining
-concern: Codex stays disabled in checked-in configurations until Task 3 owns
-the configuration change; fallback delivery remains intentional meanwhile.
+concern: explicit Codex YAML configuration remains Task 3's concern; fallback
+delivery remains intentional meanwhile.
+
+## Review fix round 1 (2026-09-20)
+
+Review found that an absent `codex` mapping was converted to
+`{"enabled": False}`, overriding `CodexClient` defaults. Added
+`test_absent_codex_mapping_preserves_codex_client_defaults` first. RED command:
+`uv run pytest -q --tb=short tests/test_briefing_runner.py::TestStatus::test_absent_codex_mapping_preserves_codex_client_defaults`;
+result: `Expected: CodexClient({})`, `Actual: CodexClient({'enabled': False})`
+and `1 failed in 1.41s`.
+
+GREEN minimal fix: `BriefingRunner` now passes `{}` when `config["codex"]` is
+absent or not a mapping, retaining `CodexClient` defaults. Focused verification
+with Codex unavailable on PATH (to keep test execution offline and
+deterministic): `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /home/eric/.local/bin/uv run pytest -q --tb=short tests/test_briefing_runner.py tests/test_report_writer.py tests/test_intelligence_full.py tests/test_briefing_runner_orchestration.py tests/test_local_briefing.py tests/test_briefing_extensions.py` — `301 passed in 2.45s`.
+Full verification under the same offline test environment: `1283 passed, 3
+skipped in 13.56s`.
+
+Files in this fix: `scripts/briefing_runner.py`,
+`tests/test_briefing_runner.py`, and this report. Self-review: no changes to
+`CodexClient`, YAML, editorial policy, fallback-count semantics, or the
+controller ledger. The default-enabled production behavior can invoke the
+local Codex CLI when present; the test PATH removes that external dependency
+while preserving unit coverage of the constructor contract.
+
+### Test isolation follow-up
+
+The unmocked paths were all `BriefingRunner` constructions with no `codex`
+mapping that subsequently called `run()` (the orchestration and local-briefing
+test fixtures, plus their derived runner configurations). They can reach
+executive synthesis and therefore executable discovery. No live `pytest`,
+`uv`, or `codex exec` process remained when cleanup was checked; the prior
+full-suite process had already exited before the stop instruction arrived.
+
+Added `test_default_codex_writer_never_starts_a_real_cli_process` first.
+Its RED command was
+`uv run pytest -q --tb=short tests/test_briefing_runner_orchestration.py::TestRunOrchestration::test_default_codex_writer_never_starts_a_real_cli_process`;
+it observed a mocked `subprocess.run` call beginning `['codex', 'exec', ...]`
+and failed with `Expected 'run' to not have been called` (`1 failed in
+1.38s`). The minimal fixture fix is an autouse test guard that makes Codex
+executable discovery unavailable. `tests/test_codex_client.py` continues to
+explicitly patch discovery and `subprocess.run` for its controlled client
+tests.
+
+GREEN focused command:
+`uv run pytest -q --tb=short tests/test_briefing_runner_orchestration.py::TestRunOrchestration::test_default_codex_writer_never_starts_a_real_cli_process tests/test_briefing_runner.py::TestStatus::test_absent_codex_mapping_preserves_codex_client_defaults tests/test_codex_client.py` — `19 passed in 1.24s`.
+Required exact full command: `uv run pytest -q --tb=short` — `1284 passed, 3
+skipped in 13.71s`; an immediate process audit found no `pytest`, `uv`, or
+`codex exec` process. Files added to this follow-up: `tests/conftest.py` and
+`tests/test_briefing_runner_orchestration.py`. Self-review: the guard is test
+only, affects executable discovery at the external boundary, and leaves
+production defaults untouched.

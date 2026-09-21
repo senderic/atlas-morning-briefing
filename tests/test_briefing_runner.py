@@ -180,6 +180,16 @@ class TestStatus:
         assert runner.status["writer_backend"] == "unavailable"
         assert runner.status["writer_fallback_count"] == 0
 
+    def test_absent_codex_mapping_preserves_codex_client_defaults(self, minimal_config):
+        """Catches disabling Codex solely because its config mapping is absent."""
+        codex = MagicMock(spec=BaseLLMClient)
+        codex.available = False
+        codex.model = "default-model"
+        with patch("scripts.briefing_runner.CodexClient", return_value=codex) as client:
+            BriefingRunner(minimal_config, dry_run=True)
+
+        client.assert_called_once_with({})
+
     def test_writer_routing_summary_is_appended_once(self, runner):
         """Catches a footer that omits writer routing or duplicates client usage."""
         runner.llm_client.get_usage_summary = MagicMock(return_value="ANALYSIS USAGE")
