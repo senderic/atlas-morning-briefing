@@ -64,6 +64,34 @@ class TestRunOrchestration:
         assert len(md_files) == 1
         assert len(epub_files) == 1
 
+    def test_writer_generates_executive_and_extension_from_raw_inputs(self, base_config, tmp_path, monkeypatch):
+        """Catches report writing being nested inside unavailable analysis work."""
+        monkeypatch.chdir(tmp_path)
+        base_config["extension_sections"] = [{"key": "reader_angle", "heading": "Reader Angle"}]
+        runner = BriefingRunner(base_config, dry_run=True)
+        writer = MagicMock()
+        writer.available = True
+        writer.invoke.side_effect = ["Writer lede.", "Writer extension."]
+        writer.get_usage_summary.return_value = ""
+        runner.report_writer = writer
+        runner.intelligence.report_writer = writer
+        analysis_client = MagicMock()
+        analysis_client.available = False
+        runner.intelligence.client = analysis_client
+
+        papers = [{"title": "Raw paper", "summary": "Raw abstract", "published": "", "arxiv_url": ""}]
+        with patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            assert runner.run() in (0, 1)
+
+        markdown = next((tmp_path / "briefings").glob("Test-*.md")).read_text()
+        assert "Writer lede." in markdown
+        assert "## Reader Angle" in markdown
+        assert "Writer extension." in markdown
+        analysis_client.invoke.assert_not_called()
+
     def test_run_with_pdf_enabled(self, base_config, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         base_config["pdf"]["enabled"] = True

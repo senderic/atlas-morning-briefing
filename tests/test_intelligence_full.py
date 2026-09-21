@@ -61,6 +61,53 @@ def intel_unavailable(client_unavailable, default_config):
     return BriefingIntelligence(client_unavailable, default_config)
 
 
+class TestReportWriterRouting:
+    def test_analysis_calls_stay_on_existing_client_when_writer_is_present(self, mock_client, default_config):
+        """Catches moving enrichment work onto the report-writing route."""
+        mock_client.invoke.return_value = "THEME: Existing analysis result"
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        intel = BriefingIntelligence(mock_client, default_config, report_writer=writer)
+
+        assert intel.detect_emerging_themes([{"title": "New topic"}], [], []) == [
+            "Existing analysis result"
+        ]
+        writer.invoke.assert_not_called()
+        mock_client.invoke.assert_called_once()
+
+    def test_writer_synthesizes_raw_inputs_when_analysis_is_unavailable(self, client_unavailable, default_config):
+        """Catches report prose being wrongly gated on the analysis chain."""
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        writer.invoke.return_value = "Writer executive summary."
+        intel = BriefingIntelligence(
+            client_unavailable, default_config, report_writer=writer
+        )
+
+        result = intel.synthesize_briefing(
+            papers=[{"title": "Raw paper"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+
+        assert result == {"editorial_intro": "Writer executive summary."}
+        writer.invoke.assert_called_once()
+        client_unavailable.invoke.assert_not_called()
+
+    def test_writer_handles_weekly_deep_dive_without_analysis_chain(self, client_unavailable, default_config):
+        """Catches Saturday writing being skipped when enrichment is unavailable."""
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        writer.invoke.return_value = "Writer weekly essay."
+        intel = BriefingIntelligence(
+            client_unavailable, default_config, report_writer=writer
+        )
+
+        result = intel.generate_weekly_deep_dive([{"date": "2026-09-19", "title": "Raw news"}])
+
+        assert result == "Writer weekly essay."
+        writer.invoke.assert_called_once()
+        client_unavailable.invoke.assert_not_called()
+
+
 # ---------- pure helpers ----------
 
 

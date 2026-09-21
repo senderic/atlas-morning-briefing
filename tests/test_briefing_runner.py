@@ -2,6 +2,9 @@
 """Tests for briefing_runner module."""
 
 import pytest
+from unittest.mock import MagicMock, patch
+
+from scripts.llm_client import BaseLLMClient
 from scripts.briefing_runner import BriefingRunner
 
 
@@ -161,6 +164,32 @@ class TestStatus:
         status = json.loads(status_path.read_text())
         assert "timestamp" in status
         assert "elapsed_seconds" in status
+
+    def test_codex_writer_status_is_distinct_from_analysis_status(self, minimal_config):
+        """Catches hiding the optional writer behind intelligence_enabled."""
+        minimal_config["codex"] = {"enabled": True, "model": "writer-model"}
+        codex = MagicMock(spec=BaseLLMClient)
+        codex.available = True
+        codex.model = "writer-model"
+        with patch("scripts.briefing_runner.CodexClient", return_value=codex):
+            runner = BriefingRunner(minimal_config, dry_run=True)
+
+        assert runner.status["intelligence_enabled"] is False
+        assert runner.status["writer_enabled"] is True
+        assert runner.status["writer_model"] == "writer-model"
+        assert runner.status["writer_backend"] == "unavailable"
+        assert runner.status["writer_fallback_count"] == 0
+
+    def test_writer_routing_summary_is_appended_once(self, runner):
+        """Catches a footer that omits writer routing or duplicates client usage."""
+        runner.llm_client.get_usage_summary = MagicMock(return_value="ANALYSIS USAGE")
+        runner.report_writer.get_usage_summary = MagicMock(return_value="WRITER ROUTING")
+
+        markdown = runner.generate_markdown_briefing([], [], [], [], [])
+
+        assert markdown.count("ANALYSIS USAGE") == 1
+        assert markdown.count("WRITER ROUTING") == 1
+        assert "ANALYSIS USAGE\n\nWRITER ROUTING" in markdown
 
 
 class TestPreflightModelLoading:

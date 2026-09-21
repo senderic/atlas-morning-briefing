@@ -560,7 +560,13 @@ class TestLocalRunOrchestration:
         main_runner.intelligence.assess_reproduction_feasibility.side_effect = lambda p: p
         main_runner.intelligence.generate_author_blurbs.side_effect = lambda items, t: items
         main_runner.intelligence.synthesize_briefing.return_value = {"editorial_intro": "Main summary"}
-        main_runner.intelligence.client.invoke.return_value = "Extension section body"
+        main_runner.report_writer = MagicMock()
+        main_runner.report_writer.available = True
+        main_runner.report_writer.model = "test-writer"
+        main_runner.report_writer.last_backend = "codex"
+        main_runner.report_writer.fallback_count = 0
+        main_runner.report_writer.invoke.return_value = "Extension section body"
+        main_runner.report_writer.get_usage_summary.return_value = ""
         main_runner.intelligence.detect_entity_mentions.return_value = []
         main_runner._enrich_papers = MagicMock(side_effect=lambda p, t: p)
 
@@ -572,10 +578,10 @@ class TestLocalRunOrchestration:
             rc = main_runner.run()
 
         assert rc in (0, 1)
-        # One client call per declared extension section.
+        # One writer call per declared extension section.
         tiers = [
             kwargs.get("tier")
-            for _, kwargs in main_runner.intelligence.client.invoke.call_args_list
+            for _, kwargs in main_runner.report_writer.invoke.call_args_list
         ]
         assert tiers == ["heavy", "heavy"]
 

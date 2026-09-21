@@ -83,6 +83,7 @@ htmlcov/
 !skills/*.md
 !.opencode/commands/*.md
 !.opencode/command/*.md
+!.superpowers/sdd/codex-report-writer-plan/task-2-report.md
 atlas-morning-briefing.json
 .env
 uv.lock

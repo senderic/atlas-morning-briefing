@@ -49,6 +49,8 @@ from scripts.event_dates import has_only_past_dates
 from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
+from scripts.codex_client import CodexClient
+from scripts.report_writer import ReportWriter
 from scripts.briefing_extensions import generate_section, load_extension_sections
 from scripts.intelligence import SYSTEM_PROMPT as INTELLIGENCE_SYSTEM_PROMPT
 from scripts.intelligence import BriefingIntelligence
@@ -145,6 +147,10 @@ class BriefingRunner:
             "synthesis_degraded": False,
             "geo_filtered_out": 0,
             "intelligence_enabled": False,
+            "writer_enabled": False,
+            "writer_model": "",
+            "writer_backend": "unavailable",
+            "writer_fallback_count": 0,
             "errors": [],
             "pdf_generated": False,
             "epub_generated": False,
@@ -179,8 +185,16 @@ class BriefingRunner:
             self.llm_client = CompositeClient(
                 clients, chains, timeout=chain_timeout(config)
             )
-        self.intelligence = BriefingIntelligence(self.llm_client, config)
+        codex_config = config.get("codex")
+        self.codex_client = CodexClient(
+            codex_config if isinstance(codex_config, dict) else {"enabled": False}
+        )
+        self.report_writer = ReportWriter(self.codex_client, self.llm_client)
+        self.intelligence = BriefingIntelligence(
+            self.llm_client, config, report_writer=self.report_writer
+        )
         self.status["intelligence_enabled"] = self.intelligence.available
+        self._refresh_writer_status()
 
         snapshot_cfg = config.get("snapshot", {})
         self.snapshot_manager = SnapshotManager(
@@ -981,9 +995,18 @@ class BriefingRunner:
                 md.append(f"- {error}\n")
             md.append("\n")
 
-        # Gemini Usage Summary
+        # Analysis usage is owned by the composite. The report writer emits
+        # only its routing state, so fallback-client usage appears once.
         if self.llm_client:
             md.append(self.llm_client.get_usage_summary(start_time=start_time, end_time=end_time))
+        if self.report_writer:
+            writer_summary = self.report_writer.get_usage_summary(
+                start_time=start_time, end_time=end_time
+            )
+            if writer_summary:
+                if md and md[-1] and not md[-1].endswith("\n"):
+                    md.append("\n\n")
+                md.append(writer_summary)
 
         return "".join(md)
 
@@ -1584,6 +1607,7 @@ class BriefingRunner:
         Args:
             output_dir: Directory to save status file.
         """
+        self._refresh_writer_status()
         self.status["errors"] = self.errors
         self.status["pipeline"] = self.config.get("pipeline_name", "")
         status_filename = self.config.get("status_file_path", "status.json")
@@ -1594,6 +1618,23 @@ class BriefingRunner:
             logger.info(f"Status saved: {status_path}")
         except IOError as e:
             logger.warning(f"Failed to save status: {e}")
+
+    def _refresh_writer_status(self) -> None:
+        """Keep the writer's routing health separate from analysis health."""
+        writer = getattr(self, "report_writer", None)
+        if writer is None:
+            return
+        self.status["writer_enabled"] = writer.available
+        model = getattr(writer, "model", "")
+        self.status["writer_model"] = model if isinstance(model, str) else ""
+        backend = getattr(writer, "last_backend", "unavailable")
+        fallback_count = getattr(writer, "fallback_count", 0)
+        self.status["writer_backend"] = (
+            backend if isinstance(backend, str) else "unavailable"
+        )
+        self.status["writer_fallback_count"] = (
+            fallback_count if isinstance(fallback_count, int) else 0
+        )
 
     def _load_previous_state(self) -> Dict[str, Any]:
         """Load previous briefing state for cross-day trend tracking."""
@@ -1811,7 +1852,8 @@ class BriefingRunner:
         # --- Score papers (combines TF-IDF + semantic if available) ---
         top_papers = self.score_papers(papers)
 
-        # --- Intelligence layer: assess top papers & synthesize ---
+        # --- Intelligence layer: assess top papers ---
+        entity_mentions = []
         if self.intelligence.available:
             top_papers = self.intelligence.assess_reproduction_feasibility(top_papers)
 
@@ -1838,17 +1880,34 @@ class BriefingRunner:
                 fut_top_papers_blurbs.result()
                 fut_recent_papers_blurbs.result()
 
+            # Feature 3: Competitive Intelligence (entity tracking)
+            tracked_entities = self.config.get("tracked_entities", [])
+            if tracked_entities:
+                logger.info("=== Intelligence Layer: Entity Tracking ===")
+                entity_mentions = self.intelligence.detect_entity_mentions(
+                    papers, blogs, news, tracked_entities
+                )
+                # Add to synthesis for rendering in Executive Summary
+                synthesis["entity_mentions"] = entity_mentions
+
+        # Report writing remains useful when the analysis chain is unavailable:
+        # the prompts can work directly from raw collected items. Keep it
+        # separate so only the three reader-facing calls use this route.
+        if self.intelligence.report_writer_available:
+            logger.info("=== Report Writer: Executive Synthesis ===")
             synthesis = self.intelligence.synthesize_briefing(
                 papers, blogs[:5], stocks, news[:5], top_papers[:3],
                 emerging_themes=emerging_themes,
                 previous_state=previous_state,
             )
+            if entity_mentions:
+                synthesis["entity_mentions"] = entity_mentions
 
             for section in self.extension_sections:
                 try:
                     body = generate_section(
                         section,
-                        self.intelligence.client,
+                        self.report_writer,
                         INTELLIGENCE_SYSTEM_PROMPT,
                         papers=papers,
                         blogs=blogs,
@@ -1862,17 +1921,6 @@ class BriefingRunner:
                     logger.warning(
                         "Extension section %s failed: %s", section.key, e
                     )
-
-            # Feature 3: Competitive Intelligence (entity tracking)
-            tracked_entities = self.config.get("tracked_entities", [])
-            entity_mentions = []
-            if tracked_entities:
-                logger.info("=== Intelligence Layer: Entity Tracking ===")
-                entity_mentions = self.intelligence.detect_entity_mentions(
-                    papers, blogs, news, tracked_entities
-                )
-                # Add to synthesis for rendering in Executive Summary
-                synthesis["entity_mentions"] = entity_mentions
 
         now = datetime.now()
         weekly_deep_dive = ""
@@ -1897,8 +1945,8 @@ class BriefingRunner:
                 })
 
             # On Saturday, generate the deep dive and clear weekly_items
-            if is_saturday and self.intelligence.available and weekly_items:
-                logger.info("=== Intelligence Layer: Weekly Deep Dive (Saturday) ===")
+            if is_saturday and self.intelligence.report_writer_available and weekly_items:
+                logger.info("=== Report Writer: Weekly Deep Dive (Saturday) ===")
                 weekly_deep_dive = self.intelligence.generate_weekly_deep_dive(weekly_items)
                 # Clear weekly items after generation
                 weekly_items = []

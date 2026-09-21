@@ -144,15 +144,24 @@ def _strip_trailing_rationale(text: str) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, client: BaseLLMClient, config: Dict[str, Any]):
+    def __init__(
+        self,
+        client: BaseLLMClient,
+        config: Dict[str, Any],
+        report_writer: Optional[BaseLLMClient] = None,
+    ):
         """
         Initialize BriefingIntelligence.
 
         Args:
             client: BaseLLMClient instance.
             config: Full config dictionary.
+            report_writer: Optional reader-facing prose client. Analysis stays
+                on ``client``; only synthesis and long-form report writing use
+                this separate route.
         """
         self.client = client
+        self.report_writer = report_writer
         self.config = config
         self.topics = config.get("arxiv_topics", [])
         # Domain framing for prompts is config-driven, never hardcoded here.
@@ -185,6 +194,12 @@ class BriefingIntelligence:
     def available(self) -> bool:
         """Check if intelligence features are available."""
         return self.client.available
+
+    @property
+    def report_writer_available(self) -> bool:
+        """Whether reader-facing prose can be generated independently."""
+        writer = self.report_writer or self.client
+        return writer.available
 
     def _priority_block(self) -> str:
         """
@@ -1421,7 +1436,7 @@ class BriefingIntelligence:
             Dictionary with key:
               - 'editorial_intro': Executive summary paragraph for the briefing.
         """
-        if not self.available:
+        if not self.report_writer_available:
             return {}
 
         # Build a compact summary of all data for the synthesis prompt
@@ -1599,18 +1614,19 @@ class BriefingIntelligence:
             f"{cross_source_note}"
         )
 
-        result = self.client.invoke(
+        writer = self.report_writer or self.client
+        result = writer.invoke(
             prompt,
             tier="heavy",
             system_prompt=SYSTEM_PROMPT,
             reasoning_enabled=True,
         )
-        if result and is_cot_leak(result):
+        if self.report_writer is None and result and is_cot_leak(result):
             logger.warning(
                 "Editorial synthesis leaked CoT scaffolding; "
                 "retrying without reasoning."
             )
-            result = self.client.invoke(
+            result = writer.invoke(
                 prompt,
                 tier="heavy",
                 system_prompt=SYSTEM_PROMPT,
@@ -1875,7 +1891,7 @@ class BriefingIntelligence:
         Returns:
             Markdown string for the "This Week in AI" section (500-800 words).
         """
-        if not self.available or not weekly_items:
+        if not self.report_writer_available or not weekly_items:
             return ""
 
         # Group items by date
@@ -1927,15 +1943,16 @@ class BriefingIntelligence:
             f"<week_items>\n{context_str}\n</week_items>"
         )
 
-        result = self.client.invoke(
+        writer = self.report_writer or self.client
+        result = writer.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
-        if result and is_cot_leak(result):
+        if self.report_writer is None and result and is_cot_leak(result):
             logger.warning(
                 "Weekly Deep Dive leaked CoT scaffolding; "
                 "retrying without reasoning."
             )
-            result = self.client.invoke(
+            result = writer.invoke(
                 prompt,
                 tier="heavy",
                 system_prompt=SYSTEM_PROMPT,
