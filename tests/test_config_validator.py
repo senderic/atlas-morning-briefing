@@ -115,6 +115,27 @@ class TestValidateConfig:
 
 
 class TestCodexConfig:
+    @pytest.mark.parametrize("timeout_literal", [".inf", ".nan"])
+    def test_enabled_codex_rejects_nonfinite_yaml_timeout(self, timeout_literal):
+        """Catches an unbounded or invalid subprocess timeout reaching cron."""
+        config = yaml.safe_load(
+            f"""
+            arxiv_topics: [test]
+            codex:
+              enabled: true
+              binary: /opt/codex
+              model: gpt-5.6-sol
+              reasoning_effort: high
+              timeout_seconds: {timeout_literal}
+              max_calls_per_run: 5
+            """
+        )
+
+        is_valid, messages = validate_config(config)
+
+        assert is_valid is False
+        assert any("timeout_seconds" in message and "finite" in message for message in messages)
+
     @pytest.mark.parametrize(
         ("codex", "missing"),
         [

@@ -7,6 +7,7 @@ Validates config.yaml values at startup to catch errors early.
 """
 
 import logging
+import math
 import os
 import shutil
 from typing import Any, Dict, List, Tuple
@@ -230,9 +231,10 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
             if (
                 isinstance(timeout, bool)
                 or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
                 or timeout <= 0
             ):
-                errors.append("'codex.timeout_seconds' must be a positive number")
+                errors.append("'codex.timeout_seconds' must be a positive finite number")
 
             max_calls = codex.get(
                 "max_calls_per_run", codex.get("max_calls", 5)

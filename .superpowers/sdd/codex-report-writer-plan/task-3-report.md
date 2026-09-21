@@ -90,3 +90,41 @@ unmocked Codex subprocess.
 ## Concerns
 
 None.
+
+## Review fix round 1 (2026-09-20)
+
+Review found that the positive-timeout check accepted YAML's non-finite float
+literals: `.inf` bypassed the bounded-failure-time contract and `.nan` could
+reach the subprocess timeout boundary. Added a real YAML-to-`validate_config`
+regression first for both literals; it asserts the enabled Codex mapping is
+rejected with a finite-timeout error.
+
+RED command:
+
+`uv run pytest -q tests/test_config_validator.py::TestCodexConfig::test_enabled_codex_rejects_nonfinite_yaml_timeout --tb=short`
+
+Observed: `2 failed in 0.08s`, both at `assert is_valid is False` because the
+validator accepted `.inf` and `.nan`.
+
+GREEN minimal fix: import `math` and require `math.isfinite(timeout)` alongside
+the existing numeric and positive checks. The validation error now says the
+timeout must be a positive finite number.
+
+GREEN command:
+
+`uv run pytest -q tests/test_config_validator.py::TestCodexConfig::test_enabled_codex_rejects_nonfinite_yaml_timeout --tb=short`
+
+Observed: `2 passed in 0.05s`.
+
+Additional verification:
+
+- `uv run pytest -q tests/test_config_validator.py --tb=short` — `28 passed in 0.15s`.
+- Required full run, exactly once for this review fix: `uv run pytest -q --tb=short` — `1297 passed, 3 skipped in 13.75s`.
+- `git diff --check` — no whitespace errors.
+- `pgrep -af '[c]odex exec'` — no real Codex process launched or remained.
+
+Files changed in this review fix: `scripts/config_validator.py`,
+`tests/test_config_validator.py`, and this report. Self-review: the only
+production change rejects non-finite timeout values at configuration validation;
+it does not change YAML values, prompt wording, routing, Codex client behavior,
+`config.json`, mapping-parity semantics, or the controller ledger.
