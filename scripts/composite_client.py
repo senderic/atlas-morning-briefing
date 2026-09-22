@@ -222,6 +222,10 @@ class CompositeClient(BaseLLMClient):
         """
         rows = []
         for client in self.clients.values():
+            # Model tiers are not credentials. Only clients that explicitly
+            # rotate multiple real API keys belong in this table.
+            if not getattr(client, "rotates_api_keys", False):
+                continue
             # Ask each client to suppress its own inline key table; the
             # composite renders one unified table with a Provider column.
             if hasattr(client, "render_key_rotation"):
@@ -308,7 +312,7 @@ class CompositeClient(BaseLLMClient):
             dedup[(provider, key_idx)] = (preview, success, failures)
 
         lines = ["---\n\n## API Key Rotation Summary\n\n"]
-        lines.append("| Provider | Key | Preview / Model | Success | Failures |\n")
+        lines.append("| Provider | Key | Preview | Success | Failures |\n")
         lines.append("| :--- | :--- | :--- | :---: | :---: |\n")
         for (provider, key_idx), (preview, success, failures) in sorted(
             dedup.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))

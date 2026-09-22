@@ -271,7 +271,7 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
                 enabled_backends = {
                     name
-                    for name in ("openrouter", "opencode", "gemini")
+                    for name in ("openrouter", "nvidia", "opencode", "gemini")
                     if (config.get(name, {}) or {}).get("enabled")
                 }
                 for tier, models in chains.items():
@@ -289,8 +289,8 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                         if backend is None:
                             errors.append(
                                 f"llm.chains.{tier}: {model!r} has no known routing "
-                                "prefix (expected openrouter/, opencode/, "
-                                "opencode-go/ or gemini/)"
+                                "prefix (expected openrouter/, nvidia-direct/, "
+                                "opencode/, opencode-go/ or gemini/)"
                             )
                         elif backend not in enabled_backends:
                             warnings.append(

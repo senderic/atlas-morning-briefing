@@ -98,6 +98,8 @@ _DETECTION_ORDER: List[str] = ["gemini", "agy"]
 class GeminiCLIClient(BaseLLMClient):
     """Tiered LLM CLI client (auto-detects between `agy` and `gemini`)."""
 
+    rotates_api_keys = True
+
     # Default model IDs for each tier — used by both agy and gemini.
     DEFAULT_MODELS = {
         "heavy": "pro",

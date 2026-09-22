@@ -471,8 +471,8 @@ class OpencodeClient(BaseLLMClient):
         Generate a formatted markdown summary of opencode usage and estimated costs.
 
         The opencode CLI does not expose token counts, so input/output tokens
-        are estimated at ~4 bytes per token. Costs use configurable DeepSeek
-        V4 Flash pricing (default: $0.14/1M input, $0.28/1M output).
+        are estimated at ~4 bytes per token. Costs use the configured rates;
+        the production chain sets both to zero for its free model.
         """
         total_calls = sum(self._tier_calls.values())
         total_failures = sum(self._tier_failures.values())
@@ -483,8 +483,10 @@ class OpencodeClient(BaseLLMClient):
         out_rate = self._pricing["output_per_million"]
 
         lines = ["\n---\n\n## Opencode Usage Summary\n\n"]
-        lines.append("| Tier | Success | Failures | Input (est.) | Output (est.) | Est. Cost |\n")
-        lines.append("| :--- | :---: | :---: | :--- | :--- | :--- |\n")
+        lines.append(
+            "| Tier | Model | Success | Failures | Input (est.) | Output (est.) | Est. Cost |\n"
+        )
+        lines.append("| :--- | :--- | :---: | :---: | :--- | :--- | :--- |\n")
 
         total_cost = 0.0
         total_in_tok = 0
@@ -504,9 +506,10 @@ class OpencodeClient(BaseLLMClient):
             total_cost += cost
             total_in_tok += in_tok
             total_out_tok += out_tok
+            served = self._tier_served_by[tier] or self.models.get(tier, "?")
 
             lines.append(
-                f"| {tier.capitalize()} | {calls} | {failures} | "
+                f"| {tier.capitalize()} | `{served}` | {calls} | {failures} | "
                 f"{in_tok:,} | "
                 f"{out_tok:,} | "
                 f"${cost:.4f} |\n"
@@ -516,32 +519,18 @@ class OpencodeClient(BaseLLMClient):
         total_fail_label = f"**{total_failures}**"
         total_cost_label = f"**${total_cost:.4f}**"
         lines.append(
-            f"| **Total** | {total_label} | {total_fail_label} | "
+            f"| **Total** | | {total_label} | {total_fail_label} | "
             f"**{total_in_tok:,}** | **{total_out_tok:,}** | {total_cost_label} |\n\n"
         )
 
         lines.append(
-            f"*Costs estimated at ${in_rate:.2f}/1M input and ${out_rate:.2f}/1M output "
-            f"(DeepSeek V4 Flash paid-tier rates). "
-            f"Tokens estimated at ~4 bytes per token. "
-            f"This run used free opencode models (nemotron-3-ultra-free / deepseek-v4-flash-free) "
-            f"via the opencode CLI — actual cost was $0.00.*\n\n"
+            f"*Costs use the configured rates of ${in_rate:.2f}/1M input and "
+            f"${out_rate:.2f}/1M output. Tokens are estimated at ~4 bytes per token."
         )
-
-        # Surface which model actually served each tier. Whether that was the
-        # chain's first choice is CompositeClient's to say — this client only
-        # ever sees the one rung it was handed.
-        served_lines = []
-        for tier in ["heavy", "medium", "light"]:
-            served = self._tier_served_by[tier]
-            if self._tier_calls[tier] == 0:
-                continue
-            if served:
-                served_lines.append(f"- **{tier}**: served by `{served}`")
-        if served_lines:
-            lines.append("**Model fallback activity:**\n\n")
-            lines.extend(f"{l}\n" for l in served_lines)
-            lines.append("\n")
+        if in_rate == 0 and out_rate == 0:
+            lines.append(" Configured OpenCode models are free, so estimated cost is $0.00.*\n\n")
+        else:
+            lines.append("*\n\n")
 
         if start_time and end_time:
             duration = end_time - start_time

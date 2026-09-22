@@ -148,28 +148,31 @@ class TestCompositeClient:
         client.usage = ""
         assert CompositeClient({"a": client}, {}).get_usage_summary() == ""
 
-    def test_unified_key_rotation_summary_has_provider_column(self):
+    def test_key_rotation_summary_contains_only_real_rotating_credentials(self):
         class _KeyClient(_FakeClient):
-            def __init__(self, name, rows):
+            def __init__(self, name, rows, rotates_api_keys):
                 super().__init__(name)
                 self._rows = rows
+                self.rotates_api_keys = rotates_api_keys
                 self.render_key_rotation = True
 
             def get_key_rotation_rows(self):
                 return self._rows
 
-        a = _KeyClient("a", [("gemini", 0, "AIza...1234", 5, 1)])
+        a = _KeyClient("a", [("gemini", 0, "AIza...1234", 5, 1)], True)
         b = _KeyClient(
-            "b", [("opencode-go", "medium", "opencode-go/deepseek-v4-flash", 3, 0)]
+            "b",
+            [("opencode-go", "medium", "opencode-go/deepseek-v4-flash", 3, 0)],
+            False,
         )
         out = CompositeClient({"a": a, "b": b}, {}).get_usage_summary()
         assert "## API Key Rotation Summary" in out
-        assert "| Provider | Key | Preview / Model | Success | Failures |" in out
+        assert "| Provider | Key | Preview | Success | Failures |" in out
         assert "| gemini | 0 | `AIza...1234` | 5 | 1 |" in out
-        assert "| opencode-go | medium | `opencode-go/deepseek-v4-flash` | 3 | 0 |" in out
+        assert "opencode-go/deepseek-v4-flash" not in out
         # Clients were told to suppress their own inline key tables
         assert a.render_key_rotation is False
-        assert b.render_key_rotation is False
+        assert b.render_key_rotation is True
 
     def test_no_key_rotation_when_no_rows(self):
         client = _FakeClient("a", result=None)

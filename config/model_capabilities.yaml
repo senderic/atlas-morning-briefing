@@ -181,6 +181,22 @@ model_capabilities:
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  openrouter/nex-agi/nex-n2.5-pro:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  openrouter/inclusionai/ling-3.0-flash-vl:free:
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "reasoning"
+    api_param_value: {enabled: false}
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
   # --- reasoning cannot be disabled on these endpoints (HTTP 400) ---
   # Kept for reference so nobody re-adds the parameter.
   openrouter/minimax/minimax-m2.7:free:
@@ -196,6 +212,27 @@ model_capabilities:
     non_reasoning_variant: null
 
   openrouter/inclusionai/ling-3.0-flash-fin:free:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # ===== NVIDIA direct NIM models =====
+  # The direct NIM endpoint returns reasoning separately where applicable but
+  # does not use OpenRouter's `reasoning: {enabled: false}` control contract.
+  nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  nvidia-direct/nvidia/nemotron-3-super-120b-a12b:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:
     supports_reasoning_control: false
     reasoning_control_method: "none"
     known_cot_leakage: false

@@ -96,12 +96,18 @@ class ReportWriter(BaseLLMClient):
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
     ) -> str:
-        """Describe routing only; fallback usage stays owned by its client."""
-        del start_time, end_time
+        """Render Codex token/cost usage plus routing, without fallback duplication."""
         if not self.calls:
             return ""
+        try:
+            codex_usage = self.codex.get_usage_summary(
+                start_time=start_time, end_time=end_time
+            )
+        except Exception:
+            codex_usage = ""
         fallback_word = "fallback" if self.fallback_count == 1 else "fallbacks"
-        return (
-            f"**Report writer ({self.model or 'Codex'}):** {self.calls} calls, "
+        routing = (
+            f"**Report writer routing ({self.model or 'Codex'}):** {self.calls} calls, "
             f"{self.fallback_count} {fallback_word}; last backend: {self.last_backend}"
         )
+        return f"{codex_usage}\n\n{routing}" if codex_usage else routing

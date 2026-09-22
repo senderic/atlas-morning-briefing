@@ -329,7 +329,10 @@ class TestFreeTierRegressions:
     def test_usage_summary_reports_zero_for_a_free_run(self, key_env):
         c = OpenRouterClient({})
         c._tier_calls["heavy"] = 1
-        assert "billed **$0.00**" in c.get_usage_summary()
+        summary = c.get_usage_summary()
+        assert "billed **$0.00**" in summary
+        assert "Est. Cost" in summary
+        assert "$0.0000" in summary
 
     def test_retry_semantics_match_opencode(self, key_env):
         """max_retries_per_model = N means N+1 attempts, as in OpencodeClient."""

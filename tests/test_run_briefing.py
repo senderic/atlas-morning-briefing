@@ -3,30 +3,29 @@
 import os
 import shutil
 import subprocess
-import time
 
 
-def test_sequential_wrapper_exports_one_codex_deadline_to_both_runners(tmp_path):
-    """Catches main and local runs receiving separate Codex timeout windows."""
+def test_sequential_wrapper_does_not_export_a_codex_wall_clock_deadline(tmp_path):
+    """Catches pipeline startup time suppressing later report-writer calls."""
     root = tmp_path / "briefing"
     root.mkdir()
     wrapper = root / "run_briefing.sh"
     shutil.copy2("run_briefing.sh", wrapper)
     python = root / ".venv" / "bin" / "python3"
     python.parent.mkdir(parents=True)
-    observed = tmp_path / "deadlines.txt"
+    observed = tmp_path / "deadline-presence.txt"
     python.write_text(
         "#!/bin/bash\n"
-        'printf "%s\\n" "$ATLAS_CODEX_DEADLINE_EPOCH" >> "$ATLAS_WRAPPER_OBSERVATIONS"\n'
+        'if [ -n "${ATLAS_CODEX_DEADLINE_EPOCH+x}" ]; then '
+        'printf "set\\n"; else printf "unset\\n"; fi >> "$ATLAS_WRAPPER_OBSERVATIONS"\n'
     )
     python.chmod(0o755)
 
-    started = time.time()
     result = subprocess.run(
         ["bash", str(wrapper)],
         cwd=root,
         env={
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if k != "ATLAS_CODEX_DEADLINE_EPOCH"},
             "ATLAS_WRAPPER_OBSERVATIONS": str(observed),
             "SKIP_QUALITY_CHECK": "1",
         },
@@ -36,7 +35,5 @@ def test_sequential_wrapper_exports_one_codex_deadline_to_both_runners(tmp_path)
     )
 
     assert result.returncode == 0, result.stderr
-    deadlines = observed.read_text().splitlines()
-    assert len(deadlines) == 3  # preflight, Atlas, then local runner
-    assert len(set(deadlines)) == 1
-    assert started + 295 <= float(deadlines[0]) <= time.time() + 305
+    observations = observed.read_text().splitlines()
+    assert observations == ["unset", "unset", "unset"]

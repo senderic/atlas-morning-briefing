@@ -51,6 +51,7 @@ from scripts.openrouter_client import (  # noqa: E402
     API_BASE_URL,
     OpenRouterClient,
 )
+from scripts.nvidia_client import NvidiaClient  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -118,6 +119,35 @@ def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, An
     if not text.strip():
         err = (result.stderr or "")[:200] or "Empty response"
         return _probe_result(False, elapsed, err)
+    return _probe_result(True, elapsed)
+
+
+def test_nvidia_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, Any]:
+    """Probe one model through NVIDIA's direct OpenAI-compatible NIM API."""
+    start = time.monotonic()
+    client = NvidiaClient(
+        {
+            "enabled": True,
+            "timeout": timeout,
+            "max_retries_per_model": 0,
+            "max_calls_per_run": 1,
+            "max_tokens": TEST_MAX_TOKENS,
+            "temperature": 0,
+        }
+    )
+    if not client.available:
+        return _probe_result(False, 0, "No NVIDIA API key")
+    try:
+        content = client.invoke(TEST_PROMPT, tier="medium", model=model)
+    except Exception as exc:
+        return _probe_result(
+            False,
+            (time.monotonic() - start) * 1000,
+            f"{type(exc).__name__}: {str(exc)[:150]}",
+        )
+    elapsed = (time.monotonic() - start) * 1000
+    if not content or not content.strip():
+        return _probe_result(False, elapsed, "Empty response")
     return _probe_result(True, elapsed)
 
 
@@ -237,9 +267,16 @@ def probe_chain(tier: str, rungs: List[Rung]) -> Dict[str, Any]:
     attempts = []
 
     for idx, rung in enumerate(rungs):
-        test_func = (
-            test_opencode_model if rung.backend == "opencode" else test_openrouter_model
-        )
+        test_func = {
+            "opencode": test_opencode_model,
+            "nvidia": test_nvidia_model,
+            "openrouter": test_openrouter_model,
+        }.get(rung.backend)
+        if test_func is None:
+            result = _probe_result(False, 0, f"No probe for backend {rung.backend}")
+            attempts.append({"model": rung.model, "backend": rung.backend,
+                             "available": False, "error": result["error"]})
+            continue
         result = test_func(rung.model)
         attempts.append({"model": rung.model, "backend": rung.backend,
                          "available": result["available"], "error": result["error"]})
@@ -286,7 +323,7 @@ def build_test_matrix(config: Dict[str, Any]) -> List[Tuple[str, List[Rung]]]:
     skip_prefixes = tuple(llm_config.get("preflight_skip") or ())
     enabled = {
         name
-        for name in ("openrouter", "opencode")
+        for name in ("openrouter", "nvidia", "opencode")
         if (config.get(name, {}) or {}).get("enabled")
     }
 

@@ -85,6 +85,10 @@ class OpenRouterClient(BaseLLMClient):
         config = config or {}
         self.enabled = config.get("enabled", True)
         self.provider = config.get("provider", "openrouter")
+        self.display_name = config.get("display_name", "OpenRouter")
+        self.free_model_description = config.get(
+            "free_model_description", "`:free` models"
+        )
         self.render_key_rotation = True  # CompositeClient sets False to unify
         self.api_key = (
             config.get("api_key")
@@ -187,13 +191,13 @@ class OpenRouterClient(BaseLLMClient):
         """
         if kwargs:
             logger.debug(
-                "OpenRouter ignoring unexpected kwargs to invoke(): %s",
-                ", ".join(kwargs),
+                "%s ignoring unexpected kwargs to invoke(): %s",
+                self.display_name, ", ".join(kwargs),
             )
         if not self.available:
             return None
         if tier not in self.models:
-            logger.warning("OpenRouter unknown tier %r; using medium", tier)
+            logger.warning("%s unknown tier %r; using medium", self.display_name, tier)
             tier = "medium"
 
         model = model or self.models[tier]
@@ -205,8 +209,8 @@ class OpenRouterClient(BaseLLMClient):
         while True:
             if not self._reserve_call():
                 logger.warning(
-                    "OpenRouter call budget exhausted (%d / %d calls)",
-                    self._call_count, self.max_calls,
+                    "%s call budget exhausted (%d / %d calls)",
+                    self.display_name, self._call_count, self.max_calls,
                 )
                 return None
             try:
@@ -218,7 +222,7 @@ class OpenRouterClient(BaseLLMClient):
                     reasoning_enabled=model_reasoning,
                 )
             except Exception as e:
-                logger.error("OpenRouter call exception (model=%s): %s", model, e)
+                logger.error("%s call exception (model=%s): %s", self.display_name, model, e)
                 result, action = None, "retry"
 
             if result:
@@ -232,23 +236,23 @@ class OpenRouterClient(BaseLLMClient):
                 # reasoning off recovers this; it is not a dead endpoint.
                 if model_reasoning:
                     logger.info(
-                        "OpenRouter %s (tier=%s) exhausted max_tokens on reasoning; "
+                        "%s %s (tier=%s) exhausted max_tokens on reasoning; "
                         "retrying with reasoning disabled",
-                        model, tier,
+                        self.display_name, model, tier,
                     )
                     model_reasoning = False
                     continue
                 logger.warning(
-                    "OpenRouter %s (tier=%s) returned empty content even with "
+                    "%s %s (tier=%s) returned empty content even with "
                     "reasoning disabled; failing this rung",
-                    model, tier,
+                    self.display_name, model, tier,
                 )
                 return None
 
             if action == "fallback":
                 logger.warning(
-                    "OpenRouter non-recoverable error for %s (tier=%s); failing this rung",
-                    model, tier,
+                    "%s non-recoverable error for %s (tier=%s); failing this rung",
+                    self.display_name, model, tier,
                 )
                 return None  # the chain advances to the next rung
 
@@ -256,8 +260,8 @@ class OpenRouterClient(BaseLLMClient):
             attempts += 1
             if attempts > self.max_retries:
                 logger.warning(
-                    "OpenRouter exhausted retries for %s (tier=%s); failing this rung",
-                    model, tier,
+                    "%s exhausted retries for %s (tier=%s); failing this rung",
+                    self.display_name, model, tier,
                 )
                 return None
             backoff = min(
@@ -265,8 +269,8 @@ class OpenRouterClient(BaseLLMClient):
                 RETRY_BACKOFF_MAX,
             )
             logger.info(
-                "OpenRouter retrying %s (tier=%s, attempt=%d/%d, backoff %.1fs)",
-                model, tier, attempts, self.max_retries, backoff,
+                "%s retrying %s (tier=%s, attempt=%d/%d, backoff %.1fs)",
+                self.display_name, model, tier, attempts, self.max_retries, backoff,
             )
             time.sleep(backoff)
 
@@ -346,8 +350,8 @@ class OpenRouterClient(BaseLLMClient):
 
         start = time.time()
         logger.info(
-            "Invoking OpenRouter (tier=%s, model=%s, call=%d/%d, reasoning_enabled=%s)",
-            tier, model, self._call_count, self.max_calls, reasoning_enabled,
+            "Invoking %s (tier=%s, model=%s, call=%d/%d, reasoning_enabled=%s)",
+            self.display_name, tier, model, self._call_count, self.max_calls, reasoning_enabled,
         )
 
         # Cap in-flight requests so parallel enrichment cannot stampede the
@@ -358,7 +362,7 @@ class OpenRouterClient(BaseLLMClient):
                     self.api_base, headers=headers, json=payload, timeout=self._timeout,
                 )
             except requests.RequestException as e:
-                logger.error("OpenRouter request failed (model=%s): %s", model, e)
+                logger.error("%s request failed (model=%s): %s", self.display_name, model, e)
                 with self._lock:
                     self._tier_failures[tier] += 1
                 return None, "retry"  # network errors are usually transient
@@ -371,9 +375,9 @@ class OpenRouterClient(BaseLLMClient):
                 and _REASONING_MANDATORY in resp.text.lower()
             ):
                 logger.info(
-                    "OpenRouter %s requires reasoning; resending without the "
+                    "%s %s requires reasoning; resending without the "
                     "suppression parameter (update model_capabilities.yaml)",
-                    model,
+                    self.display_name, model,
                 )
                 retry_payload, _, _ = self._build_payload(
                     model, prompt, system_prompt, reasoning_enabled=True
@@ -384,7 +388,7 @@ class OpenRouterClient(BaseLLMClient):
                         timeout=self._timeout,
                     )
                 except requests.RequestException as e:
-                    logger.error("OpenRouter retry failed (model=%s): %s", model, e)
+                    logger.error("%s retry failed (model=%s): %s", self.display_name, model, e)
                     with self._lock:
                         self._tier_failures[tier] += 1
                     return None, "retry"
@@ -393,8 +397,8 @@ class OpenRouterClient(BaseLLMClient):
         if resp.status_code != 200:
             action = classify_error(status_code=resp.status_code, text=resp.text)
             logger.error(
-                "OpenRouter HTTP %s (model=%s, %.1fs, action=%s): %s",
-                resp.status_code, model, elapsed, action, resp.text[:300],
+                "%s HTTP %s (model=%s, %.1fs, action=%s): %s",
+                self.display_name, resp.status_code, model, elapsed, action, resp.text[:300],
             )
             with self._lock:
                 self._tier_failures[tier] += 1
@@ -403,7 +407,7 @@ class OpenRouterClient(BaseLLMClient):
         try:
             data = resp.json()
         except ValueError as e:
-            logger.error("OpenRouter invalid JSON response (model=%s): %s", model, e)
+            logger.error("%s invalid JSON response (model=%s): %s", self.display_name, model, e)
             with self._lock:
                 self._tier_failures[tier] += 1
             return None, "retry"
@@ -416,8 +420,8 @@ class OpenRouterClient(BaseLLMClient):
                 text=str(err.get("message", "")),
             )
             logger.error(
-                "OpenRouter error in 200 body (model=%s, action=%s): %s",
-                model, action, str(err)[:300],
+                "%s error in 200 body (model=%s, action=%s): %s",
+                self.display_name, model, action, str(err)[:300],
             )
             with self._lock:
                 self._tier_failures[tier] += 1
@@ -441,28 +445,28 @@ class OpenRouterClient(BaseLLMClient):
                 self._tier_failures[tier] += 1
             if finish_reason == "length" or reasoning_len:
                 logger.warning(
-                    "OpenRouter empty content (model=%s, finish=%s, reasoning=%d chars) "
+                    "%s empty content (model=%s, finish=%s, reasoning=%d chars) "
                     "— reasoning consumed the token budget",
-                    model, finish_reason, reasoning_len,
+                    self.display_name, model, finish_reason, reasoning_len,
                 )
                 return None, "reasoning_overflow"
-            logger.warning("OpenRouter empty content (model=%s)", model)
+            logger.warning("%s empty content (model=%s)", self.display_name, model)
             return None, "retry"
 
         # Check for CoT leakage when reasoning was disabled
         if not reasoning_enabled and self.detect_cot_leakage(content):
             logger.warning(
-                "OpenRouter CoT leakage detected for %s (tier=%s) with reasoning "
+                "%s CoT leakage detected for %s (tier=%s) with reasoning "
                 "disabled; treating as failure and falling back",
-                model, tier,
+                self.display_name, model, tier,
             )
             with self._lock:
                 self._tier_failures[tier] += 1
             return None, "fallback"
 
         logger.info(
-            "OpenRouter response received (model=%s, %.1fs, %d chars)",
-            model, elapsed, len(content),
+            "%s response received (model=%s, %.1fs, %d chars)",
+            self.display_name, model, elapsed, len(content),
         )
         return content, "ok"
 
@@ -516,12 +520,15 @@ class OpenRouterClient(BaseLLMClient):
         in_rate = self._pricing["input_per_million"]
         out_rate = self._pricing["output_per_million"]
 
-        lines = ["\n---\n\n## OpenRouter Usage Summary\n\n"]
-        lines.append("| Tier | Model | Calls | Failures | Input (tok) | Output (tok) |\n")
-        lines.append("| :--- | :--- | :---: | :---: | :--- | :--- |\n")
+        lines = [f"\n---\n\n## {self.display_name} Usage Summary\n\n"]
+        lines.append(
+            "| Tier | Model | Calls | Failures | Input (tok) | Output (tok) | Est. Cost |\n"
+        )
+        lines.append("| :--- | :--- | :---: | :---: | :--- | :--- | :--- |\n")
 
         total_in = 0
         total_out = 0
+        total_estimated_cost = 0.0
         for tier in ("heavy", "medium", "light"):
             calls = self._tier_calls[tier]
             failures = self._tier_failures[tier]
@@ -531,15 +538,18 @@ class OpenRouterClient(BaseLLMClient):
             out_tok = self._tier_output_tokens[tier]
             total_in += in_tok
             total_out += out_tok
+            estimated_cost = (in_tok * in_rate + out_tok * out_rate) / 1_000_000
+            total_estimated_cost += estimated_cost
             served = self._tier_served_by.get(tier) or self.models.get(tier, "?")
             lines.append(
                 f"| {tier.capitalize()} | `{served}` | {calls} | {failures} | "
-                f"{in_tok:,} | {out_tok:,} |\n"
+                f"{in_tok:,} | {out_tok:,} | ${estimated_cost:.4f} |\n"
             )
 
         lines.append(
             f"| **Total** | | **{total_calls}** | **{total_failures}** | "
-            f"**{total_in:,}** | **{total_out:,}** |\n\n"
+            f"**{total_in:,}** | **{total_out:,}** | "
+            f"**${total_estimated_cost:.4f}** |\n\n"
         )
 
         # The roster is all `:free` models, so the API-reported cost should be
@@ -547,14 +557,14 @@ class OpenRouterClient(BaseLLMClient):
         # routing to a paid model is impossible to miss.
         if self._billed_cost > 0:
             lines.append(
-                f"*⚠️ **OpenRouter billed ${self._billed_cost:.6f}** this run — a "
+                f"*⚠️ **{self.display_name} billed ${self._billed_cost:.6f}** this run — a "
                 "non-free model was reached. Check the model roster in "
                 "`config.yaml`.*\n\n"
             )
         else:
             lines.append(
-                "*OpenRouter billed **$0.00** this run (all tiers served by "
-                "`:free` models).*\n\n"
+                f"*{self.display_name} billed **$0.00** this run (all tiers served by "
+                f"{self.free_model_description}).*\n\n"
             )
         if in_rate or out_rate:
             est = (total_in * in_rate + total_out * out_rate) / 1_000_000

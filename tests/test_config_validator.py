@@ -90,6 +90,27 @@ class TestValidateConfig:
         assert is_valid is True  # Warning, not error
         assert any("tickers" in m for m in messages)
 
+    def test_enabled_direct_nvidia_chain_has_no_backend_warning(self):
+        config = {
+            "arxiv_topics": ["test"],
+            "nvidia": {"enabled": True},
+            "llm": {
+                "chains": {
+                    "heavy": ["nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b"],
+                    "medium": ["nvidia-direct/nvidia/nemotron-3-super-120b-a12b"],
+                    "light": [
+                        "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+                    ],
+                }
+            },
+        }
+
+        is_valid, messages = validate_config(config)
+
+        assert is_valid is True
+        assert not any("not enabled" in message for message in messages)
+        assert not any("no known routing prefix" in message for message in messages)
+
     def test_warning_for_empty_topics(self):
         config = {"arxiv_topics": []}
         is_valid, messages = validate_config(config)

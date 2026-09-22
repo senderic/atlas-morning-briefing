@@ -61,6 +61,16 @@ class TestChainComesFromConfig:
         matrix = pf.build_test_matrix({"openrouter": {"enabled": True}})
         assert {t for t, _ in matrix} == {"heavy", "medium", "light"}
 
+    def test_direct_nvidia_backend_is_probeable(self):
+        config = {
+            "nvidia": {"enabled": True},
+            "llm": {"chains": {
+                "medium": ["nvidia-direct/nvidia/nemotron-3-super-120b-a12b"],
+            }},
+        }
+        by_tier = dict(pf.build_test_matrix(config))
+        assert by_tier["medium"][0].backend == "nvidia"
+
 
 class TestPaidRungsAreNotProbed:
     """Probing a paid rung daily is the only thing that ever bills it.
@@ -215,6 +225,25 @@ class TestChainReporting:
         assert oc.call_count == 1 and orc.call_count == 1
         assert result["model"] == "openrouter/h:free"
         assert result["backend"] == "openrouter"
+
+    def test_direct_nvidia_rung_uses_nvidia_probe(self):
+        from scripts.llm_chain import Rung
+
+        rungs = [
+            Rung(
+                model="nvidia-direct/nvidia/nemotron-3-super-120b-a12b",
+                backend="nvidia",
+            )
+        ]
+        with patch.object(
+            pf,
+            "test_nvidia_model",
+            side_effect=lambda m, timeout=None: pf._probe_result(True, 1.0),
+        ) as probe:
+            result = pf.probe_chain("medium", rungs)
+
+        probe.assert_called_once()
+        assert result["backend"] == "nvidia"
 
 
 class TestReasoningProbeIsTriState:

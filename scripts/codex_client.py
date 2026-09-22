@@ -3,8 +3,6 @@
 
 import json
 import logging
-import math
-import os
 import shutil
 import subprocess
 import time
@@ -24,6 +22,14 @@ class CodexClient(BaseLLMClient):
     DEFAULT_REASONING = "high"
     DEFAULT_TIMEOUT = 300
     DEFAULT_MAX_CALLS = 5
+    # API-equivalent rates for GPT-5.6 Sol. Codex CLI remains authenticated
+    # through the user's subscription; these rates estimate comparable API
+    # value and are not a claim that the CLI call incurred a token charge.
+    DEFAULT_PRICING = {
+        "input_per_million": 2.0,
+        "cached_input_per_million": 0.2,
+        "output_per_million": 10.0,
+    }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         config = config or {}
@@ -43,8 +49,12 @@ class CodexClient(BaseLLMClient):
         self.timeout = float(
             config.get("timeout_seconds", config.get("timeout", self.DEFAULT_TIMEOUT))
         )
-        self._budget_deadline = self._resolve_budget_deadline()
         self.max_calls = int(config.get("max_calls_per_run", config.get("max_calls", self.DEFAULT_MAX_CALLS)))
+        pricing = config.get("pricing", {}) or {}
+        self._pricing = {
+            key: float(pricing.get(key, default))
+            for key, default in self.DEFAULT_PRICING.items()
+        }
         self._available: Optional[bool] = None
         self._call_count = 0
 
@@ -71,18 +81,6 @@ class CodexClient(BaseLLMClient):
             self.call_log_path: Optional[Path] = path
         else:
             self.call_log_path = None
-
-    def _resolve_budget_deadline(self) -> float:
-        """Use the wrapper's shared wall-clock deadline or start a local one."""
-        shared_deadline = os.environ.get("ATLAS_CODEX_DEADLINE_EPOCH")
-        if shared_deadline:
-            try:
-                deadline = float(shared_deadline)
-            except (TypeError, ValueError):
-                deadline = 0.0
-            if math.isfinite(deadline):
-                return deadline
-        return time.time() + self.timeout
 
     @property
     def available(self) -> bool:
@@ -227,6 +225,30 @@ class CodexClient(BaseLLMClient):
                     record[key] = usage[key]
         self._log_call(record)
 
+    def _accumulate_usage(self, usage: Optional[Dict[str, Any]]) -> None:
+        """Account for tokens reported by any completed CLI turn."""
+        if not usage:
+            return
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ):
+            value = usage.get(key, 0)
+            if isinstance(value, (int, float)):
+                self.usage_stats[key] += value
+
+    def _estimated_cost(self) -> float:
+        stats = self.usage_stats
+        cached = max(0, stats["cached_input_tokens"])
+        fresh = max(0, stats["input_tokens"] - cached)
+        return (
+            fresh * self._pricing["input_per_million"]
+            + cached * self._pricing["cached_input_per_million"]
+            + stats["output_tokens"] * self._pricing["output_per_million"]
+        ) / 1_000_000
+
     def invoke(
         self,
         prompt: str,
@@ -243,11 +265,6 @@ class CodexClient(BaseLLMClient):
             logger.warning("Codex call budget exhausted (%d / %d)", self._call_count, self.max_calls)
             return None
 
-        remaining_budget = self._budget_deadline - time.time()
-        if remaining_budget <= 0:
-            logger.warning("Codex cumulative time budget exhausted")
-            return None
-
         effective_model = model or self.model
         self._call_count += 1
         self.calls += 1
@@ -260,7 +277,7 @@ class CodexClient(BaseLLMClient):
                 input=self._prompt_payload(prompt, system_prompt),
                 capture_output=True,
                 text=True,
-                timeout=min(self.timeout, remaining_budget),
+                timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
             self._finish_attempt(
@@ -290,6 +307,7 @@ class CodexClient(BaseLLMClient):
             return None
 
         message, usage, completed, failed = self._parse_jsonl(result.stdout)
+        self._accumulate_usage(usage)
         if failed or not completed or not usage or not message or not message.strip():
             self._finish_attempt(
                 started=started,
@@ -300,15 +318,6 @@ class CodexClient(BaseLLMClient):
             )
             return None
 
-        for key in (
-            "input_tokens",
-            "cached_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-        ):
-            value = usage.get(key, 0)
-            if isinstance(value, (int, float)):
-                self.usage_stats[key] += value
         self.usage_stats["model"] = effective_model
         self._finish_attempt(started=started, model=effective_model, status="success", usage=usage)
         return message.strip()
@@ -318,15 +327,36 @@ class CodexClient(BaseLLMClient):
     ) -> str:
         del start_time, end_time
         stats = self.usage_stats
+        lines = ["\n---\n\n## Codex Usage Summary\n\n"]
         if not stats["calls"]:
-            return "**Codex:** no calls"
-        return (
-            f"**Codex ({stats['model']}):** {stats['calls']} calls, "
-            f"{stats['failures']} failed; "
-            f"{stats['input_tokens']} input ({stats['cached_input_tokens']} cached), "
-            f"{stats['output_tokens']} output ({stats['reasoning_output_tokens']} reasoning output) tokens; "
-            f"{stats['latency_s']:.1f}s"
+            lines.append(
+                f"**Codex (`{stats['model']}`):** no calls; estimated API-equivalent "
+                "cost **$0.000000**.\n"
+            )
+            return "".join(lines)
+
+        cost = self._estimated_cost()
+        call_word = "call" if stats["calls"] == 1 else "calls"
+        lines.append(
+            f"**{stats['calls']} {call_word}**, {stats['failures']} failed; "
+            f"{stats['latency_s']:.1f}s total latency.\n\n"
         )
+        lines.append(
+            "| Model | Input (total / cached) | Output (total / reasoning) | "
+            "Est. API Cost |\n"
+        )
+        lines.append("| :--- | :--- | :--- | :--- |\n")
+        lines.append(
+            f"| `{stats['model']}` | {stats['input_tokens']:,} / "
+            f"{stats['cached_input_tokens']:,} | {stats['output_tokens']:,} / "
+            f"{stats['reasoning_output_tokens']:,} | ${cost:.6f} |\n\n"
+        )
+        lines.append(
+            "*API-equivalent estimate only: Codex CLI uses subscription authentication, "
+            "not an API key. Cached input uses its configured discounted rate; "
+            "reasoning tokens are included in total output and are not counted twice.*\n"
+        )
+        return "".join(lines)
 
 
 # Keep the explicit CLI spelling available to callers that distinguish this

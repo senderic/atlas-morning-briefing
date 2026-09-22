@@ -436,19 +436,21 @@ codex:
   timeout_seconds: 300
   max_calls_per_run: 5
   call_log_path: "logs/codex-calls.jsonl"
+  # API-equivalent estimate shown in the footer. Codex CLI uses subscription
+  # authentication, so this is informational rather than a billed API charge.
+  pricing:
+    input_per_million: 2.0
+    cached_input_per_million: 0.2
+    output_per_million: 10.0
 
 # OpenCode CLI backend. Requires the `opencode` binary on PATH.
 # A TRANSPORT, not a tier: inference runs as `opencode run -m <model>`, and
 # which of its models serve which tier is decided by llm.chains below. Both
-# free (`opencode/*` Zen contributor tier) and paid (`opencode-go/*`) models
-# are reachable through it, so this backend is neither "the free one" nor "the
-# paid one" — cost is a property of the rung, not of the transport.
-# Verified 2026-08-27: deepseek-v4-pro 14s, deepseek-v4-flash 8s,
-# glm-5.3-flash 21s on a real ranking prompt.
+# Only free `opencode/*` Zen contributor models are used by this pipeline;
+# OpenCode Go subscription models are intentionally excluded from all chains.
 opencode:
   enabled: true
-  # Small budget on purpose: paid rungs live behind this transport, and capping
-  # it bounds what a bad day can cost.
+  # A call cap prevents a failed transport from consuming the entire run.
   max_calls_per_run: 20
   # TIMEOUT BUDGET — one model, not a chain. Worst case is
   # timeout x (1 + max_retries_per_model) = 150s, which must fit inside
@@ -456,17 +458,17 @@ opencode:
   # fast to the next one rather than burn the window retrying a stalled model.
   timeout: 150
   max_retries_per_model: 0
-  # Estimated DeepSeek V4 Flash paid rates, used for the usage-summary footer.
+  # The configured OpenCode model is free.
   pricing:
-    input_per_million: 0.14
-    output_per_million: 0.28
+    input_per_million: 0.0
+    output_per_million: 0.0
 
 # THE fallback chain. Each tier is an ordered list of MODELS, tried front to
 # back; the backend that serves a rung is inferred from its routing prefix
-# (`openrouter/`, `opencode/`, `opencode-go/`, `gemini/`).
+# (`openrouter/`, `opencode/`, `gemini/`).
 #
-# Order is cost: free rungs first, paid ones last. Because the chain orders
-# models rather than backends, a free model on the opencode transport can sit
+# Every configured rung is free. Because the chain orders models rather than
+# backends, a free model on the opencode transport can sit
 # ahead of a free model on OpenRouter's — which the old backend_priority shape
 # could not express, and which is why `opencode/muse-spark-*` sat configured as
 # a heavy primary while serving zero calls.
@@ -478,27 +480,41 @@ llm:
   chains:
     heavy:
       - "opencode/muse-spark-1.3-contributor-free"          # free (Zen contributor)
+      - "nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b"   # free NVIDIA NIM
       - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # free, 550B / 1M ctx
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
-      - "opencode-go/deepseek-v4-pro"                       # PAID backstop
     medium:
+      - "nvidia-direct/nvidia/nemotron-3-super-120b-a12b"   # free NVIDIA NIM
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, degrade to light
-      - "opencode-go/minimax-m3"                            # PAID backstop
+      - "openrouter/nex-agi/nex-n2.5-pro:free"              # free, 262k ctx
     light:
+      - "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" # free NVIDIA NIM
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, 120B-A12B / 262k
       - "openrouter/cohere/north-mini-code:free"            # free, 256k ctx
-      - "opencode-go/qwen3.6-plus"                          # PAID backstop
+      - "openrouter/inclusionai/ling-3.0-flash-vl:free"     # free, 262k ctx
   # Per-RUNG window. Each rung is one model, so this only has to cover that
   # model's own timeout x (1 + retries) — 150s for both transports today.
   # The old per-backend window had to cover a whole internal chain, and a
   # backend that overran it was cut off mid-chain on every call.
   rung_timeout_seconds: 500
-  # Rungs the 05:45 preflight must not probe. These are the paid ones: a probe
-  # would be the only call that ever bills them on a healthy day. Free rungs on
-  # the same transport (`opencode/muse-spark-*`) ARE probed.
-  preflight_skip:
-    - "opencode-go/"
+  # Every configured rung is free, so preflight may probe any of them.
+  preflight_skip: []
+
+# NVIDIA-hosted NIM API, used directly so medium/light calls do not depend on
+# OpenRouter account health. The build.nvidia.com endpoints used here are free.
+nvidia:
+  enabled: true
+  api_base: "https://integrate.api.nvidia.com/v1/chat/completions"
+  max_calls_per_run: 100
+  max_concurrent_requests: 4
+  timeout: 75
+  max_retries_per_model: 1
+  max_tokens: 4096
+  temperature: 0.3
+  pricing:
+    input_per_million: 0.0
+    output_per_million: 0.0
 
 # OpenRouter configuration (OpenAI-compatible API) — the PRIMARY backend.
 # Requires an API key: OPENROUTER_API_KEY or OPENAI_API_KEY (pointing at
@@ -510,10 +526,7 @@ openrouter:
   # NOT in any chain, and why (re-verify before adding):
   #   minimax/minimax-m3:free            404 as of 2026-09-11, "unavailable for
   #                                      free, the paid version is available" —
-  #                                      it was medium's primary, and its death
-  #                                      silently collapsed medium onto light's
-  #                                      model. The paid slug is a rung in the
-  #                                      medium chain as opencode-go/minimax-m3.
+  #                                      paid models are intentionally excluded.
   #   z-ai/glm-5.2:free                  persistently 429 "rate-limited upstream"
   #   google/gemma-4-*:free              404, blocked by this account's data policy
   #   nvidia/nemotron-3.5-lightning:free 400 "DEGRADED function cannot be invoked"

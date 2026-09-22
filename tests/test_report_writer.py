@@ -6,10 +6,17 @@ from scripts.report_writer import ReportWriter
 class _Client:
     """Small in-memory client: only the external process is substituted."""
 
-    def __init__(self, response=None, available=True, model="test-model"):
+    def __init__(
+        self,
+        response=None,
+        available=True,
+        model="test-model",
+        usage="UNDERLYING CLIENT USAGE",
+    ):
         self.response = response
         self.available = available
         self.model = model
+        self.usage = usage
         self.calls = []
 
     def invoke(self, prompt, **kwargs):
@@ -17,7 +24,7 @@ class _Client:
         return self.response
 
     def get_usage_summary(self, *args, **kwargs):
-        return "UNDERLYING CLIENT USAGE"
+        return self.usage
 
 
 class TestReportWriter:
@@ -100,10 +107,15 @@ class TestReportWriter:
         assert writer.backends == ["fallback", "codex"]
         assert writer.fallback_count == 1
 
-    def test_usage_summary_describes_routing_without_underlying_usage(self):
-        """Catches footer duplication of the CompositeClient's own usage lines."""
-        codex = _Client(None, available=False, model="codex-model")
-        fallback = _Client("Fallback-only report.")
+    def test_usage_summary_includes_codex_usage_but_not_fallback_usage(self):
+        """Catches missing Codex tokens or duplicated CompositeClient usage."""
+        codex = _Client(
+            None,
+            available=False,
+            model="codex-model",
+            usage="CODEX TOKEN AND COST USAGE",
+        )
+        fallback = _Client("Fallback-only report.", usage="COMPOSITE USAGE")
         writer = ReportWriter(codex, fallback)
         writer.invoke("write this")
 
@@ -111,4 +123,5 @@ class TestReportWriter:
 
         assert "Report writer" in summary
         assert "1 fallback" in summary
-        assert "UNDERLYING CLIENT USAGE" not in summary
+        assert "CODEX TOKEN AND COST USAGE" in summary
+        assert "COMPOSITE USAGE" not in summary

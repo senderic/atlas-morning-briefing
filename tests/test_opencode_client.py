@@ -334,6 +334,23 @@ class TestUsageSummary:
         assert client.get_usage_summary() == ""
         assert client.get_usage_summary(100.0, 200.0) == ""
 
+    def test_names_the_model_and_uses_configured_free_pricing(self):
+        client = OpencodeClient(
+            {"pricing": {"input_per_million": 0.0, "output_per_million": 0.0}}
+        )
+        client._tier_calls["heavy"] = 1
+        client._tier_input_chars["heavy"] = 400
+        client._tier_output_chars["heavy"] = 80
+        client._tier_served_by["heavy"] = "opencode/muse-spark-1.3-contributor-free"
+
+        summary = client.get_usage_summary()
+
+        assert "| Tier | Model |" in summary
+        assert "`opencode/muse-spark-1.3-contributor-free`" in summary
+        assert "100" in summary and "20" in summary
+        assert "$0.0000" in summary
+        assert "DeepSeek V4 Flash paid-tier rates" not in summary
+
 
 # ---------------------------------------------------------------------------
 # TestDefaults

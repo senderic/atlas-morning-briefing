@@ -7,7 +7,10 @@ reachable only through the mostly-paid transport could never be tried before
 every model on the free transport had failed, and in practice never was.
 """
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from scripts.llm_chain import (
     DEFAULT_CHAINS,
@@ -22,9 +25,26 @@ from scripts.llm_chain import (
 )
 
 
+@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml"])
+def test_production_chains_have_no_opencode_go(config_name):
+    """Catches paid OpenCode Go returning to any production routing tier."""
+    config_path = Path(__file__).resolve().parents[1] / config_name
+    config = yaml.safe_load(config_path.read_text())
+    chains = build_model_chains(config)
+
+    for tier in ("heavy", "medium", "light"):
+        assert chains[tier]
+        assert all(not rung.model.startswith("opencode-go/") for rung in chains[tier])
+
+    for tier in ("medium", "light"):
+        assert chains[tier][0].backend == "nvidia"
+        assert all(rung.backend in {"nvidia", "openrouter"} for rung in chains[tier])
+
+
 class TestResolveBackend:
     @pytest.mark.parametrize("model,backend", [
         ("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter"),
+        ("nvidia-direct/nvidia/nemotron-3-super-120b-a12b", "nvidia"),
         ("opencode/muse-spark-1.3-contributor-free", "opencode"),
         ("opencode-go/deepseek-v4-pro", "opencode"),
         ("gemini/pro", "gemini"),
@@ -86,6 +106,20 @@ class TestBuildClients:
                "opencode": {"enabled": False},
                "gemini": {"enabled": False}}
         assert set(build_clients(cfg)) == {"openrouter"}
+
+    def test_builds_direct_nvidia_backend(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+        cfg = {
+            "openrouter": {"enabled": False},
+            "opencode": {"enabled": False},
+            "gemini": {"enabled": False},
+            "nvidia": {"enabled": True},
+        }
+
+        clients = build_clients(cfg)
+
+        assert set(clients) == {"nvidia"}
+        assert type(clients["nvidia"]).__name__ == "NvidiaClient"
 
     def test_clients_are_keyed_by_backend_name(self):
         cfg = {"openrouter": {"enabled": True, "api_key": "k"},

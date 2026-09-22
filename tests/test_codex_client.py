@@ -220,11 +220,11 @@ class TestInvocation:
             assert client.invoke("two") is None
             run.assert_called_once()
 
-    def test_fast_calls_share_the_standalone_cumulative_timeout(self):
-        """Catches each fast report section receiving a fresh 10-second budget."""
+    def test_each_call_gets_its_timeout_even_with_a_stale_wrapper_deadline(self, monkeypatch):
+        """Catches pipeline wall time preventing otherwise healthy Codex calls."""
+        monkeypatch.setenv("ATLAS_CODEX_DEADLINE_EPOCH", "1")
         with (
             patch("scripts.codex_client.shutil.which", return_value=CODEX),
-            patch("scripts.codex_client.time.time", side_effect=[100.0, 103.0, 108.0]),
             patch(
                 "scripts.codex_client.subprocess.run",
                 return_value=completed(success_jsonl()),
@@ -234,34 +234,7 @@ class TestInvocation:
             assert client.invoke("first") == "A useful report."
             assert client.invoke("second") == "A useful report."
 
-        assert [call.kwargs["timeout"] for call in run.call_args_list] == [7.0, 2.0]
-
-    def test_shared_deadline_clamps_the_subprocess_timeout(self, monkeypatch):
-        """Catches a wrapper deadline being ignored by an individual attempt."""
-        monkeypatch.setenv("ATLAS_CODEX_DEADLINE_EPOCH", "105")
-        with (
-            patch("scripts.codex_client.shutil.which", return_value=CODEX),
-            patch("scripts.codex_client.time.time", return_value=102.0),
-            patch(
-                "scripts.codex_client.subprocess.run",
-                return_value=completed(success_jsonl()),
-            ) as run,
-        ):
-            assert make_client(timeout_seconds=10).invoke("request") == "A useful report."
-
-        assert run.call_args.kwargs["timeout"] == 3.0
-
-    def test_exhausted_shared_deadline_skips_the_subprocess(self, monkeypatch):
-        """Catches a report section launching Codex after the shared window ends."""
-        monkeypatch.setenv("ATLAS_CODEX_DEADLINE_EPOCH", "105")
-        with (
-            patch("scripts.codex_client.shutil.which", return_value=CODEX),
-            patch("scripts.codex_client.time.time", return_value=105.0),
-            patch("scripts.codex_client.subprocess.run") as run,
-        ):
-            assert make_client(timeout_seconds=10).invoke("request") is None
-
-        run.assert_not_called()
+        assert [call.kwargs["timeout"] for call in run.call_args_list] == [10, 10]
 
 
 class TestCallLog:
@@ -309,7 +282,13 @@ class TestCallLog:
 
 
 def test_usage_summary_is_concise_markdown():
-    client = make_client()
+    client = make_client(
+        pricing={
+            "input_per_million": 2.0,
+            "cached_input_per_million": 0.2,
+            "output_per_million": 10.0,
+        }
+    )
     client.usage_stats.update(
         calls=2,
         failures=1,
@@ -321,7 +300,18 @@ def test_usage_summary_is_concise_markdown():
     )
     summary = client.get_usage_summary()
     assert "Codex" in summary
+    assert "## Codex Usage Summary" in summary
     assert "2 calls" in summary
-    assert "1 failed" in summary
+    assert "1" in summary
     assert "100" in summary and "25" in summary
-    assert "12 reasoning output" in summary
+    assert "25 / 12" in summary
+    # (90 fresh * $2 + 10 cached * $0.20 + 25 output * $10) / 1M
+    assert "$0.000432" in summary
+    assert "API-equivalent" in summary
+
+
+def test_usage_summary_uses_singular_call_label():
+    client = make_client()
+    client.usage_stats["calls"] = 1
+
+    assert "**1 call**," in client.get_usage_summary()

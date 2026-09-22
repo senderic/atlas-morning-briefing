@@ -40,6 +40,7 @@ TIERS = ("heavy", "medium", "light")
 # strips its own, in OpenRouterClient._to_api_model.
 BACKEND_PREFIXES = {
     "openrouter/": "openrouter",
+    "nvidia-direct/": "nvidia",
     "opencode-go/": "opencode",
     "opencode/": "opencode",
     "gemini/": "gemini",
@@ -127,6 +128,7 @@ def build_clients(
     preflight_models = preflight_models or {}
     gemini_config = config.get("gemini", config.get("bedrock", {})) or {}
     openrouter_config = config.get("openrouter", {}) or {}
+    nvidia_config = config.get("nvidia", {}) or {}
     opencode_config = config.get("opencode", {}) or {}
 
     def _openrouter():
@@ -137,13 +139,23 @@ def build_clients(
         from scripts.gemini_client import GeminiCLIClient
         return GeminiCLIClient(gemini_config)
 
+    def _nvidia():
+        from scripts.nvidia_client import NvidiaClient
+        return NvidiaClient(nvidia_config)
+
     def _opencode():
         from scripts.opencode_client import OpencodeClient
         return OpencodeClient(opencode_config)
 
-    builders = {"openrouter": _openrouter, "gemini": _gemini, "opencode": _opencode}
+    builders = {
+        "openrouter": _openrouter,
+        "nvidia": _nvidia,
+        "gemini": _gemini,
+        "opencode": _opencode,
+    }
     enabled = {
         "openrouter": bool(openrouter_config.get("enabled")),
+        "nvidia": bool(nvidia_config.get("enabled")),
         "gemini": bool(gemini_config.get("enabled")),
         "opencode": bool(opencode_config.get("enabled")),
     }
