@@ -10,6 +10,7 @@ deterministic fallback when unavailable).
 """
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import sys
 import time
 from datetime import datetime
 from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -67,6 +69,47 @@ SYNTHESIS_UNAVAILABLE_TEXT = (
 )
 
 DEFAULT_FILE_NAMING = "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+
+
+class _SummaryHTMLTextExtractor(HTMLParser):
+    """Reduce feed-supplied HTML to text before Markdown-length truncation."""
+
+    BLOCK_TAGS = {"br", "div", "figcaption", "li", "p"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: List[tuple[str, Optional[str]]]
+    ) -> None:
+        del attrs
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def text(self) -> str:
+        lines = "".join(self.parts).splitlines()
+        return "\n".join(
+            line for line in (" ".join(line.split()) for line in lines)
+            if line
+        ).strip()
+
+
+def _summary_as_plain_text(value: str) -> str:
+    """Keep raw RSS HTML from becoming structural Markdown/HTML output."""
+    if not re.search(r"</?[A-Za-z][^>]*>", value):
+        return html.unescape(value)
+    parser = _SummaryHTMLTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return parser.text()
 
 
 def format_briefing_filename(file_naming: str, now: datetime) -> str:
@@ -1175,6 +1218,12 @@ class BriefingRunner:
         """Remove title/source echo from LLM-generated summary."""
         if not summary:
             return summary
+        # RSS descriptions routinely contain figures and images. Convert the
+        # complete value before the caller applies its display-length cap: if
+        # the cap cuts through an HTML attribute, Markdown treats the rest of
+        # the briefing (including usage tables) as part of that broken tag and
+        # the email sanitizer discards it.
+        summary = _summary_as_plain_text(str(summary))
         # Strip leading * / ** markdown bold and "Summary:" prefix
         s = summary.lstrip("* ").strip()
         if s.lower().startswith("summary:"):

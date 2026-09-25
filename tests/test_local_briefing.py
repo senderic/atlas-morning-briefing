@@ -272,6 +272,34 @@ class TestConfigDrivenDefaults:
 
 
 class TestLocalMarkdownRendering:
+    def test_raw_feed_html_cannot_hide_usage_footer_in_email(self, local_runner):
+        """Catches a truncated RSS tag swallowing the rest of the HTML email."""
+        from scripts.email_distributor import EmailDistributor
+
+        local_runner.llm_client.get_usage_summary = MagicMock(
+            return_value="\n---\n\n## LM Usage Summary\n\n| Input | Output |\n| ---: | ---: |\n| 123 | 45 |\n"
+        )
+        local_runner.report_writer.get_usage_summary = MagicMock(return_value="")
+        blogs = [{
+            "title": "Local update",
+            "source": "Local RSS",
+            "link": "https://example.com/update",
+            # The renderer truncates unprocessed summaries. Before the fix,
+            # that cut could land inside this tag and make the HTML sanitizer
+            # discard the token footer and everything after the article.
+            "summary": '<figure><img alt="' + ("x" * 400) + '">Visible update</figure>',
+        }]
+
+        markdown = local_runner.generate_markdown_briefing(
+            papers=[], blogs=blogs, stocks=[], news=[], top_papers=[]
+        )
+        html = EmailDistributor("", "")._markdown_to_html(markdown)
+
+        assert "Visible update" in html
+        assert "LM Usage Summary" in html
+        assert "123" in html
+        assert "45" in html
+
     def test_local_title(self, local_runner):
         news = _sample_news(5)
         blogs = _sample_blogs(4)
