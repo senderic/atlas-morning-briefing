@@ -624,13 +624,13 @@ class TestRankAndSummarizeNews:
         result = intel.rank_and_summarize_news(news, ["t"])
         assert result[0]["brief_summary"] == "desc text"
 
-    def test_llm_returns_none_early_returns_news(self, intel, mock_client):
+    def test_llm_returns_none_retains_source_excerpts(self, intel, mock_client):
         """When LLM is None on first call, function returns news[:5] without summaries."""
         news = [{"title": f"n{i}", "source": "s", "description": "d"} for i in range(3)]
         mock_client.invoke.return_value = None
         result = intel.rank_and_summarize_news(news, ["t"])
-        # No brief_summary added on this short-circuit path
-        assert all("brief_summary" not in n for n in result)
+        # A failed ranker must not turn available descriptions into bare links.
+        assert all(n["brief_summary"] == n["description"] for n in result)
         assert len(result) == 3
 
     def test_enforces_source_diversity(self, intel, mock_client):
@@ -664,6 +664,54 @@ class TestRankAndSummarizeNews:
 
 
 class TestRankAndSummarizeBlogs:
+    def test_selected_news_is_supplied_to_complementary_blog_selection(self, intel, mock_client):
+        blogs = [{"title": "Torrey Pines Road construction", "source": "Council", "summary": "Night work 7 pm–3 am"}]
+        news = [{"title": "Heat warning extended", "brief_summary": "Warning continues through Thursday."}]
+        mock_client.invoke.return_value = "[1] SCORE:5/5 Night work on Torrey Pines Road."
+        intel.rank_and_summarize_blogs(blogs, [], covered_news=news)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "Heat warning extended" in prompt
+        assert "Warning continues through Thursday." in prompt
+        assert "complement" in prompt.lower()
+
+    def test_stories_beyond_old_fifteen_item_window_can_be_selected(self, intel, mock_client):
+        blogs = [{"title": f"Routine {i}", "source": "outlet", "summary": "routine"} for i in range(20)]
+        blogs.append({"title": "Torrey Pines Road night closures", "source": "Council", "summary": "7 pm to 3 am"})
+        mock_client.invoke.return_value = "[21] SCORE:5/5 Torrey Pines Road work runs 7 pm to 3 am."
+        result = intel.rank_and_summarize_blogs(blogs, ["road closures"])
+        assert "Torrey Pines Road night closures" in mock_client.invoke.call_args.args[0]
+        assert result[0]["title"] == "Torrey Pines Road night closures"
+
+    def test_synthesis_keeps_raw_roadwork_evidence_when_summarizer_fails(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        blog = {"source": "Council", "title": "K-rail Replacement", "summary": "Torrey Pines Road, Sunday–Thursday, 7 pm–3 am; sidewalk impacted."}
+        intel.synthesize_briefing([], [blog], [], [], [])
+        assert "Torrey Pines Road, Sunday–Thursday, 7 pm–3 am" in mock_client.invoke.call_args.args[0]
+
+    def test_synthesis_receives_authoritative_alert_windows(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        alerts = [{"event": "Coastal Flood Advisory", "onset": "2026-10-07T06:00:00-07:00",
+                   "expires": "2026-10-09T11:00:00-07:00", "area": "San Diego coast"}]
+        intel.synthesize_briefing([], [], [], [], [], alerts=alerts)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "2026-10-09T11:00:00-07:00" in prompt
+        assert "take precedence" in prompt
+        assert "San Diego coast" in prompt
+
+    def test_old_newsletter_next_week_is_anchored_to_its_issue_date(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        article = {"source": "Council", "title": "Road construction", "input_type": "email_newsletter",
+                   "published": "2026-10-03T01:50:03+00:00", "summary": "Night construction begins next week."}
+        intel.synthesize_briefing([], [article], [], [], [])
+        assert "week starting 2026-10-05" in mock_client.invoke.call_args.args[0]
+
+    def test_failed_ranker_selects_relevant_item_from_whole_pool(self, intel, mock_client):
+        mock_client.invoke.return_value = None
+        blogs = [{"title": f"Routine sports {i}", "source": "sports", "summary": "game"} for i in range(20)]
+        blogs.append({"title": "Agent Evaluation benchmark", "source": "research", "summary": "Measures agent evaluation and tool use."})
+        result = intel.rank_and_summarize_blogs(blogs, ["Agent Evaluation"])
+        assert result[0]["title"] == "Agent Evaluation benchmark"
+
     def test_unavailable(self, intel_unavailable):
         blogs = [{"title": f"b{i}", "source": "s", "summary": ""} for i in range(5)]
         assert len(intel_unavailable.rank_and_summarize_blogs(blogs, ["t"])) == 5
@@ -706,6 +754,25 @@ class TestRankAndSummarizeBlogs:
         intel.rank_and_summarize_blogs(blogs, ["t"])
         prompt = mock_client.invoke.call_args.args[0].lower()
         assert "never explain, list, or justify" in prompt
+
+    def test_newsletter_prompt_includes_story_content_beyond_email_preamble(
+        self, intel, mock_client
+    ):
+        """Catches ranking only the weather/header at the top of a newsletter."""
+        blogs = [{
+            "title": "Axios San Diego",
+            "source": "Axios San Diego",
+            "input_type": "email_newsletter",
+            "summary": ("Newsletter preamble. " * 300)
+            + "Pacific Beach Middle School field closed after reaching red status.",
+        }]
+        mock_client.invoke.return_value = "[1] SCORE:5/5 Field closure summary."
+
+        intel.rank_and_summarize_blogs(blogs, ["local warnings"])
+
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "Pacific Beach Middle School field closed" in prompt
+        assert "include every actionable warning" in prompt.lower()
 
 
 # ---------- rank_and_summarize_happenings ----------
@@ -824,7 +891,32 @@ class TestEnforceSourceDiversity:
 # ---------- correlate_stocks_and_news ----------
 
 
+def test_source_blurbs_can_be_disabled_without_losing_story_attribution(intel, mock_client):
+    intel.config["features"] = {"source_blurbs": False}
+    items = [{"title": "Road repairs", "source": "City Council", "author": "Joe LaCava",
+              "author_blurb": "Unverified reputation claim"}]
+    result = intel.generate_author_blurbs(items, "blogs")
+    assert result[0]["source"] == "City Council"
+    assert result[0]["author"] == "Joe LaCava"
+    assert "author_blurb" not in result[0]
+    mock_client.invoke.assert_not_called()
+
+
 class TestCorrelateStocksAndNews:
+    def test_unrelated_headline_cannot_become_a_stock_driver(self, intel, mock_client):
+        stocks = [{"symbol": "NVDA", "name": "NVIDIA", "percent_change": 2.1}]
+        mock_client.invoke.return_value = "NVDA | 1 | AI optimism lifts"
+        result = intel.correlate_stocks_and_news(stocks, [{"title": "Army debates doctrine", "url": "https://army.mil/news"}])
+        assert "news_correlation" not in result[0]
+        mock_client.invoke.assert_not_called()
+
+    def test_related_news_retains_the_supporting_source(self, intel, mock_client):
+        stocks = [{"symbol": "NVDA", "name": "NVIDIA", "percent_change": 2.1}]
+        mock_client.invoke.return_value = "NVDA | 1 | New inference platform"
+        result = intel.correlate_stocks_and_news(stocks, [{"title": "NVIDIA announces inference platform", "url": "https://nvidia.com/news/platform"}])
+        assert result[0]["news_correlation"] == "New inference platform"
+        assert result[0]["news_correlation_source"] == "https://nvidia.com/news/platform"
+
     def test_unavailable(self, intel_unavailable):
         stocks = [{"symbol": "X"}]
         assert intel_unavailable.correlate_stocks_and_news(stocks, []) == stocks
@@ -837,8 +929,8 @@ class TestCorrelateStocksAndNews:
             {"symbol": "GOOD", "name": "G", "percent_change": 1.0},
             {"symbol": "BAD", "error": "fail"},
         ]
-        news = [{"title": "Some headline"}]
-        mock_client.invoke.return_value = "GOOD | strong earnings"
+        news = [{"title": "GOOD reports strong earnings", "url": "https://example.com/earnings"}]
+        mock_client.invoke.return_value = "GOOD | 1 | strong earnings"
         result = intel.correlate_stocks_and_news(stocks, news)
         good = next(s for s in result if s["symbol"] == "GOOD")
         assert good["news_correlation"] == "strong earnings"

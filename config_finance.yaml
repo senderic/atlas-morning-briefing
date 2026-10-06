@@ -144,6 +144,7 @@ section_headings:
 
 # --- Disable defense-specific features ---
 features:
+  source_blurbs: false  # keep feed attribution; omit unverified reputation claims
   solo_founder_angle: false
   agent_cost_optimization: false
   weekly_deep_dive: false
@@ -306,11 +307,13 @@ llm:
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
     medium:
       - "nvidia-direct/nvidia/nemotron-3-super-120b-a12b"   # free NVIDIA NIM
+      - "opencode/nemotron-3.5-lightning-free"             # free CLI; independent of HTTP credentials
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, degrade to light
       - "openrouter/nex-agi/nex-n2.5-pro:free"              # free, 262k ctx
     light:
       - "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" # free NVIDIA NIM
+      - "opencode/ling-3.1-flash-free"                     # free CLI
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, 120B-A12B / 262k
       - "openrouter/cohere/north-mini-code:free"            # free, 256k ctx
       - "openrouter/inclusionai/ling-3.0-flash-vl:free"     # free, 262k ctx
@@ -327,6 +330,7 @@ llm:
 # OpenRouter account health. The build.nvidia.com endpoints used here are free.
 nvidia:
   enabled: true
+  reasoning_budget: 512  # reserve output tokens for the answer on Nemotron Super
   api_base: "https://integrate.api.nvidia.com/v1/chat/completions"
   max_calls_per_run: 100
   max_concurrent_requests: 4

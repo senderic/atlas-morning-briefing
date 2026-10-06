@@ -46,6 +46,29 @@ def _sample_happenings(n=3):
     return [{"title": f"Event {i}", "url": f"https://e/{i}"} for i in range(n)]
 
 
+def test_expired_roundup_is_not_rescued_by_a_future_date_in_its_excerpt(tmp_path, monkeypatch):
+    """Oct. 2-4 recommendations expired even if the snippet names Climate Week."""
+    runner = _make_runner(tmp_path, monkeypatch)
+    item = {"title": "Best things to do this weekend: Aug. 21-23",
+            "description": "Climate Week runs Aug. 21 to Aug. 28."}
+    with patch("scripts.briefing_runner.datetime", _fake_datetime(25)):
+        assert runner._drop_past_happenings([item]) == []
+
+
+def test_local_event_gate_rejects_undated_advertising_but_keeps_active_ranges(tmp_path, monkeypatch):
+    runner = _make_runner(tmp_path, monkeypatch)
+    runner.config["happenings_require_dates"] = True
+    items = [
+        {"title": "Mission Bay attractions", "description": "Book a hotel today."},
+        {"title": "Beach cleanup August 26", "description": "Meet at 9 am."},
+        {"title": "Climate Week", "description": "From Aug. 21 to Aug. 28, events run daily."},
+    ]
+    with patch("scripts.briefing_runner.datetime", _fake_datetime(25)):
+        assert [x["title"] for x in runner._drop_past_happenings(items)] == [
+            "Beach cleanup August 26", "Climate Week"
+        ]
+
+
 class TestLoadOrFetchHappenings:
     def test_fetch_on_configured_weekday(self, tmp_path, monkeypatch):
         runner = _make_runner(tmp_path, monkeypatch)
@@ -94,6 +117,100 @@ class TestLoadOrFetchHappenings:
             result = runner._load_or_fetch_happenings({})
         assert result == fetched
         mock_fetch.assert_called_once()
+
+
+class TestHappeningsExclusions:
+    """Reader dislikes must apply before fresh or cached events are shown."""
+
+    def test_broad_category_terms_filter_fresh_results(self, tmp_path, monkeypatch):
+        """Catches category preferences being advisory rather than enforced."""
+        runner = _make_runner(tmp_path, monkeypatch)
+        runner.config["happenings_exclusions"] = {
+            "categories": [{
+                "name": "rap concerts",
+                "terms": ["rap concert", "hip-hop concert", "hip hop show"],
+            }],
+            "events": [],
+        }
+        fetched = [
+            {
+                "title": "Waterfront Hip-Hop Concert",
+                "description": "Live music Saturday at the amphitheater.",
+                "url": "https://events.example/hip-hop",
+            },
+            {
+                "title": "Pacific Beach cleanup",
+                "description": "Meet Saturday at the pier.",
+                "url": "https://events.example/cleanup",
+            },
+        ]
+
+        with patch("scripts.briefing_runner.datetime", _fake_datetime(8)), \
+             patch.object(runner, "run_happenings_aggregation", return_value=fetched):
+            result = runner._load_or_fetch_happenings({})
+
+        assert [item["title"] for item in result] == ["Pacific Beach cleanup"]
+        assert runner._happenings_cache == result
+
+    def test_individual_title_and_url_rules_filter_fresh_results(
+        self, tmp_path, monkeypatch
+    ):
+        """Catches one-off dislikes returning under a known title or URL."""
+        runner = _make_runner(tmp_path, monkeypatch)
+        runner.config["happenings_exclusions"] = {
+            "categories": [],
+            "events": [
+                {
+                    "name": "Belmont Park beer festival",
+                    "title_terms": ["Belmont Park Beer Festival"],
+                },
+                {
+                    "name": "boardwalk fun run",
+                    "urls": ["https://events.example/fun-run/"],
+                },
+            ],
+        }
+        fetched = [
+            {
+                "title": "Annual Belmont Park Beer Festival returns",
+                "url": "https://events.example/beer-fest",
+            },
+            {
+                "title": "Mission Beach Boardwalk 5K",
+                "url": "https://www.events.example/fun-run",
+            },
+            {
+                "title": "Kate Sessions movie night",
+                "url": "https://events.example/movie",
+            },
+        ]
+
+        with patch("scripts.briefing_runner.datetime", _fake_datetime(8)), \
+             patch.object(runner, "run_happenings_aggregation", return_value=fetched):
+            result = runner._load_or_fetch_happenings({})
+
+        assert [item["title"] for item in result] == ["Kate Sessions movie night"]
+
+    def test_new_preference_filters_an_existing_cache(self, tmp_path, monkeypatch):
+        """Catches a newly stated dislike waiting until the next Brave refresh."""
+        runner = _make_runner(tmp_path, monkeypatch)
+        runner.config["happenings_exclusions"] = {
+            "categories": [{"name": "rap concerts", "terms": ["rap concert"]}],
+            "events": [],
+        }
+        state = {
+            "cached_happenings": [
+                {"title": "Mission Bay rap concert", "url": "https://e/rap"},
+                {"title": "Crown Point cleanup", "url": "https://e/cleanup"},
+            ],
+            "cached_happenings_date": "2026-08-08",
+        }
+
+        with patch("scripts.briefing_runner.datetime", _fake_datetime(10)):
+            result = runner._load_or_fetch_happenings(state)
+
+        assert [item["title"] for item in result] == ["Crown Point cleanup"]
+        assert runner._happenings_cache == result
 
 
 class TestSaveStateCache:

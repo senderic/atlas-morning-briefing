@@ -1,4 +1,4 @@
 {
-  "model": "opencode/deepseek-v4-flash-free",
-  "small_model": "opencode/deepseek-v4-flash-free"
+  "model": "opencode/ling-3.1-flash-free",
+  "small_model": "opencode/ling-3.1-flash-free"
 }

@@ -5,7 +5,8 @@ Opencode CLI client.
 
 Calls `opencode run --format json` as a subprocess and parses the NDJSON
 event stream to extract response text. Uses free-tier OpenCode models
-(opencode/muse-spark-1.3-contributor-free, opencode/deepseek-v4-flash-free)
+(opencode/muse-spark-1.3-contributor-free,
+opencode/nemotron-3.5-lightning-free, opencode/ling-3.1-flash-free)
 by default.
 
 Reasoning control is handled via the capability registry (config/model_capabilities.yaml)
@@ -30,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
     "heavy": "opencode/muse-spark-1.3-contributor-free",
-    "medium": "opencode/deepseek-v4-flash-free",
-    "light": "opencode/deepseek-v4-flash-free",
+    "medium": "opencode/nemotron-3.5-lightning-free",
+    "light": "opencode/ling-3.1-flash-free",
 }
 
 DEFAULT_PRICING = {

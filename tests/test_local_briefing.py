@@ -309,6 +309,30 @@ class TestLocalMarkdownRendering:
         )
         assert "# San Diego Local News Briefing" in md
 
+    def test_final_render_drops_past_date_added_to_happening_summary(
+        self, local_runner, monkeypatch
+    ):
+        """Catches stale events that become evident only after LLM enrichment."""
+        import scripts.briefing_runner as br
+        from datetime import datetime as real_datetime
+
+        class SeptemberFirst(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 9, 1)
+
+        monkeypatch.setattr(br, "datetime", SeptemberFirst)
+        md = local_runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[], news=[], top_papers=[],
+            happenings=[{
+                "title": "Weekend street fair",
+                "url": "https://events.example/fair",
+                "brief_summary": "The fair ran August 29-30 in Pacific Beach.",
+            }],
+        )
+
+        assert "Weekend street fair" not in md
+
     def test_local_news_heading(self, local_runner):
         news = _sample_news(5)
         blogs = _sample_blogs(4)
@@ -657,6 +681,17 @@ class TestShippedLocalConfig:
     def test_happenings_lead_the_content_sections(self):
         order = self._config()["section_order"]
         assert order.index("happenings") < order.index("news") < order.index("blogs")
+
+    def test_happenings_heading_is_rendered_as_things_to_do(self):
+        config = self._config()
+        runner = BriefingRunner(config=config, dry_run=True)
+
+        rendered = runner._render_happenings([{
+            "title": "Pacific Beach cleanup",
+            "url": "https://events.example/cleanup",
+        }])
+
+        assert "## Things To Do In and Around Pacific Beach" in rendered
 
     def test_alerts_lead_the_section_order(self):
         assert self._config()["section_order"][0] == "alerts"

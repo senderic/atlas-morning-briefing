@@ -107,6 +107,61 @@ blog_feeds:
   - name: "Eric Newcomer"
     url: "https://www.newcomer.co/feed"
 
+# --- Email newsletters (read-only IMAP) ---
+# Exact sender allowlist only. The scanner opens INBOX read-only and uses
+# BODY.PEEK so it cannot mark messages read. Official single-topic mail stays
+# one item; TLDR is split into linked editorial stories and sponsors are
+# discarded. Public fallback URLs avoid copying personalized click tokens into
+# the briefing or snapshots.
+email_newsletters:
+  enabled: true
+  host: "imap.gmail.com"
+  port: 993
+  mailbox: "INBOX"
+  username_env: "GMAIL_USER"
+  password_env: "GMAIL_APP_PASSWORD"
+  lookback_days: 7
+  max_messages: 2
+  max_articles: 24
+  max_chars: 12000
+  sources:
+    - name: "Kaggle"
+      from: "no-reply@kaggle.com"
+      fallback_link: "https://www.kaggle.com/competitions"
+      footer_markers: ["This email was sent to"]
+    - name: "Ollama"
+      from: "hello@ollama.com"
+      fallback_link: "https://ollama.com/blog"
+      footer_markers: ["You are receiving this email because"]
+    - name: "Claude"
+      from: "no-reply@email.claude.com"
+      fallback_link: "https://www.anthropic.com/news"
+      footer_markers:
+        - "You are receiving this email"
+        - "This email was sent to"
+    - name: "TLDR"
+      from: "dan@tldrnewsletter.com"
+      mode: "stories"
+      story_title_pattern: '\(\d+ minute read\)$'
+      exclude_title_terms: ["Sponsor"]
+      max_stories: 4
+      story_summary_chars: 1200
+    - name: "ByteByteGo"
+      from: "bytebytego@substack.com"
+      preferred_link_domains: ["blog.bytebytego.com"]
+      fallback_link: "https://blog.bytebytego.com/"
+      footer_markers: ["Unsubscribe"]
+
+# Whole-message newsletters can exceed the normal RSS excerpt; story-level
+# items are already bounded independently by story_summary_chars.
+email_newsletter_prompt_chars: 10000
+ranking_candidate_limit: 60
+
+# Collapse syndicated copies before they consume news slots.
+news_similarity_dedup:
+  enabled: true
+  threshold: 0.55
+
 # Interest profile for relevance filtering
 interest_profile:
   - topic: "AI in Defense and Electronic Warfare"
@@ -394,6 +449,9 @@ max_news: 15
 # Concurrency settings
 max_workers: 6
 
+features:
+  source_blurbs: false  # keep feed attribution; omit unverified reputation claims
+
 # Legacy alias for llm.rung_timeout_seconds, read only when that is absent.
 composite:
   timeout_seconds: 500
@@ -485,11 +543,13 @@ llm:
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
     medium:
       - "nvidia-direct/nvidia/nemotron-3-super-120b-a12b"   # free NVIDIA NIM
+      - "opencode/nemotron-3.5-lightning-free"             # free CLI; independent of HTTP credentials
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, degrade to light
       - "openrouter/nex-agi/nex-n2.5-pro:free"              # free, 262k ctx
     light:
       - "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" # free NVIDIA NIM
+      - "opencode/ling-3.1-flash-free"                     # free CLI
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, 120B-A12B / 262k
       - "openrouter/cohere/north-mini-code:free"            # free, 256k ctx
       - "openrouter/inclusionai/ling-3.0-flash-vl:free"     # free, 262k ctx
@@ -505,6 +565,7 @@ llm:
 # OpenRouter account health. The build.nvidia.com endpoints used here are free.
 nvidia:
   enabled: true
+  reasoning_budget: 512  # reserve output tokens for the answer on Nemotron Super
   api_base: "https://integrate.api.nvidia.com/v1/chat/completions"
   max_calls_per_run: 100
   max_concurrent_requests: 4

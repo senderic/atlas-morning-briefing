@@ -22,6 +22,14 @@ model_capabilities:
     known_cot_leakage: false
     non_reasoning_variant: null
 
+  # Probed through the CLI on 2026-10-06; normal response text without a
+  # reasoning-control flag. Runtime leakage detection remains enabled.
+  opencode/ling-3.1-flash-free:
+    supports_reasoning_control: false
+    reasoning_control_method: "none"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
   opencode/nemotron-3.5-lightning-free:
     supports_reasoning_control: false
     reasoning_control_method: "model_swap"
@@ -218,8 +226,7 @@ model_capabilities:
     non_reasoning_variant: null
 
   # ===== NVIDIA direct NIM models =====
-  # The direct NIM endpoint returns reasoning separately where applicable but
-  # does not use OpenRouter's `reasoning: {enabled: false}` control contract.
+  # Direct NIM uses chat_template_kwargs, not OpenRouter's reasoning object.
   nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b:
     supports_reasoning_control: false
     reasoning_control_method: "none"
@@ -227,14 +234,18 @@ model_capabilities:
     non_reasoning_variant: null
 
   nvidia-direct/nvidia/nemotron-3-super-120b-a12b:
-    supports_reasoning_control: false
-    reasoning_control_method: "none"
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "chat_template_kwargs"
+    api_param_value: {enable_thinking: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 
   nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:
-    supports_reasoning_control: false
-    reasoning_control_method: "none"
+    supports_reasoning_control: true
+    reasoning_control_method: "api_param"
+    api_param_name: "chat_template_kwargs"
+    api_param_value: {enable_thinking: false}
     known_cot_leakage: false
     non_reasoning_variant: null
 

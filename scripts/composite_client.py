@@ -57,6 +57,8 @@ class CompositeClient(BaseLLMClient):
         # a hanging model can't stall the run).
         self._timeout = timeout if timeout is not None else 240.0
         self._served_by: List[str] = []  # which model handled each call
+        self._call_count = 0
+        self._health_lock = threading.Lock()
         # tier -> (model, rung index). Only this layer knows a rung's position,
         # so "served by the second choice" is only reportable from here.
         self._tier_rung: Dict[str, Tuple[str, int]] = {}
@@ -151,6 +153,8 @@ class CompositeClient(BaseLLMClient):
         `model`, if given, pins the call to that one rung — used by diagnostics
         that need to exercise a specific model rather than the chain.
         """
+        with self._health_lock:
+            self._call_count += 1
         rungs = self.chains.get(tier) or []
         if model is not None:
             rungs = [r for r in rungs if r.model == model] or [
@@ -189,7 +193,8 @@ class CompositeClient(BaseLLMClient):
                 )
                 continue
             if result:
-                self._served_by.append(rung.model)
+                with self._health_lock:
+                    self._served_by.append(rung.model)
                 self._tier_rung[tier] = (rung.model, idx)
                 logger.info(
                     "Composite: served tier=%s by %s (rung %d)", tier, rung.model, idx
@@ -213,7 +218,14 @@ class CompositeClient(BaseLLMClient):
 
     def _counts(self) -> Tuple[int, int]:
         """Return (successful_served, total_calls)."""
-        return len(self._served_by), len(self._served_by)
+        return len(self._served_by), self._call_count
+
+    def get_health(self) -> Dict[str, int]:
+        """Report completed call outcomes, rather than credential presence."""
+        with self._health_lock:
+            successful = len(self._served_by)
+            return {"calls": self._call_count, "successful": successful,
+                    "failed": self._call_count - successful}
 
     def _collect_key_rows(self) -> list:
         """Aggregate per-key rotation rows across all backend clients.

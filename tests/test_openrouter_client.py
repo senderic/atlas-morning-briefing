@@ -36,6 +36,16 @@ def key_env(monkeypatch):
 
 
 class TestOpenRouterClient:
+    @patch("scripts.openrouter_client.requests.post")
+    def test_rejected_account_stops_other_models_for_this_run(self, post, key_env):
+        """Changing models cannot repair an account-level 401."""
+        post.return_value = _Resp(401, {"error": {"message": "User not found"}})
+        client = OpenRouterClient({"enabled": True})
+        assert client.invoke("rank", model="openrouter/first:free") is None
+        assert client.available is False
+        assert client.invoke("judge", model="openrouter/second:free") is None
+        assert post.call_count == 1
+
     def test_default_models(self):
         c = OpenRouterClient({})
         assert c.models["heavy"] == DEFAULT_MODELS["heavy"]

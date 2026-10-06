@@ -6,6 +6,13 @@ import logging
 from scripts.geo_filter import apply_config_filter, filter_by_place, is_local
 
 
+def test_newsletter_display_name_uses_article_link_for_trusted_source():
+    """A public Balboa Park link must not be judged as an unknown tracker."""
+    item = {"title": "Halloween workshops", "source": "Balboa Park Explorer",
+            "link": "https://balboapark.org/events/"}
+    assert is_local(item, ["san diego"], trusted_sources=["balboapark.org"])
+
+
 TERMS = ["san diego", "pacific beach", "california"]
 
 

@@ -52,9 +52,11 @@ DEFAULT_CHAINS: Dict[str, List[str]] = {
         "openrouter/dots-studio/dots-3-note-preview:free",
     ],
     "medium": [
+        "opencode/nemotron-3.5-lightning-free",
         "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     ],
     "light": [
+        "opencode/ling-3.1-flash-free",
         "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     ],
 }

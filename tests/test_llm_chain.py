@@ -25,7 +25,7 @@ from scripts.llm_chain import (
 )
 
 
-@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml"])
+@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
 def test_production_chains_have_no_opencode_go(config_name):
     """Catches paid OpenCode Go returning to any production routing tier."""
     config_path = Path(__file__).resolve().parents[1] / config_name
@@ -38,7 +38,24 @@ def test_production_chains_have_no_opencode_go(config_name):
 
     for tier in ("medium", "light"):
         assert chains[tier][0].backend == "nvidia"
-        assert all(rung.backend in {"nvidia", "openrouter"} for rung in chains[tier])
+        assert all(rung.backend in {"nvidia", "openrouter", "opencode"} for rung in chains[tier])
+
+
+@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
+def test_ranker_and_judge_can_run_without_http_provider_credentials(config_name):
+    """Missing NVIDIA and rejected OpenRouter must not strand medium/light."""
+    from scripts.composite_client import CompositeClient
+
+    class FreeCLI:
+        available = True
+        def invoke(self, prompt, model=None, **kwargs):
+            assert model.endswith("-free")
+            return "ranked or judged"
+
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / config_name).read_text())
+    client = CompositeClient({"opencode": FreeCLI()}, build_model_chains(config))
+    assert client.invoke("rank newsletters", tier="medium") == "ranked or judged"
+    assert client.invoke("summarize papers", tier="light") == "ranked or judged"
 
 
 class TestResolveBackend:

@@ -8,6 +8,37 @@ top.
 
 ---
 
+## 2026-10-06 — Briefing review: lost newsletter detail and silent analysis failure
+
+Reviewed Oct. 1, 2, 3, 5 and 6 Atlas/local outputs and their raw snapshots.
+OpenRouter rejected the account with HTTP 401; failed ranking reduced content
+to arrival order and bare links. The judge had stopped producing scores.
+Live NVIDIA calls also exhausted the answer allowance on reasoning: the old
+"reasoning disabled" retry sent no effective NIM control.
+
+Bounded NVIDIA reasoning and registered its actual chat-template control;
+added independent free OpenCode medium/light fallbacks in all three configs,
+defaults and the capability registry. Cache rejected transports for the run.
+Report completed analysis calls and degradation instead of credential presence.
+
+Split Axios/council digests, expand SDUT collection, share sender budgets,
+anchor issue-relative dates, preserve raw source evidence and public links.
+Local newsletter selection complements news. Remove expired/undated event
+promotions and out-of-area spam, preserve active ranges, and ignore outlet
+branding in duplicate detection. Use source-backed related stock news rather
+than invented drivers; omit unverified newsroom reputation blurbs. Official
+NWS windows now reach the executive writer and override older article dates.
+
+Validation: **1,374 passed, 3 skipped**; isolated real replays succeeded with
+11/11 Atlas and 5/5 local analysis calls. Live IMAP extracted 31 stories without
+opaque reader links. Judge scores were Atlas 8/8 and local 12/12 (original local
+7/12); these are one model comparison, not a guarantee. Final invariant scans:
+no CRITICAL/WARN, one local INFO for a legitimately thin events section. No
+distribution; production Atlas/local state and status hashes unchanged.
+
+Previews and evidence: `briefings/review/2026-10-06/`. See
+`references/briefing_review_2026-10-06.md` for access limits and follow-up.
+
 ## 2026-07-18 — Empty briefing: opencode not on cron PATH, no fallback model
 
 **Symptom:** The 06:00 cron run delivered an empty briefing (65 lines,

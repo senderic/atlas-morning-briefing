@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-DEFAULT_FIELDS = ("title", "description", "snippet", "summary", "url", "source")
+DEFAULT_FIELDS = ("title", "description", "snippet", "summary", "url", "link", "source")
 
 
 def _haystack(item: Dict[str, Any], fields: Sequence[str]) -> str:
@@ -45,9 +45,9 @@ def _haystack(item: Dict[str, Any], fields: Sequence[str]) -> str:
 
 def _hostname(item: Dict[str, Any]) -> str:
     source = (item.get("source") or "").lower()
-    if source:
+    if source and "." in source and not any(c.isspace() for c in source):
         return source
-    url = item.get("url") or ""
+    url = item.get("url") or item.get("link") or ""
     try:
         return (urlparse(url).hostname or "").lower()
     except ValueError:

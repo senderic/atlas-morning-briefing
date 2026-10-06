@@ -1,8 +1,8 @@
 #!/bin/bash
 # Atlas Morning Briefing Runner Wrapper Script
-# Runs main briefing first, then local (San Diego/CA) — sequential to avoid
-# simultaneous API hits against Brave + Gemini from the same IP — and then
-# audits what they produced.
+# By default, runs main then local sequentially. Cron uses RUN_MAIN_ONLY at
+# 06:00 and RUN_LOCAL_ONLY at 07:00 so Axios San Diego has arrived before the
+# local report. The quality audit follows the local run.
 
 # Resolve script directory so relative paths work correctly from cron
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,33 +13,49 @@ export PATH="$HOME/.nvm/versions/node/v20.19.5/bin:$HOME/.linuxbrew/bin:/home/li
 # Navigate to project directory
 cd "$DIR" || exit 1
 
+RUN_MAIN_ONLY="${RUN_MAIN_ONLY:-0}"
+RUN_LOCAL_ONLY="${RUN_LOCAL_ONLY:-0}"
+if [ "$RUN_MAIN_ONLY" = "1" ] && [ "$RUN_LOCAL_ONLY" = "1" ]; then
+    echo "RUN_MAIN_ONLY and RUN_LOCAL_ONLY cannot both be 1" | logger -t atlas-briefing
+    exit 2
+fi
+
+RC_MAIN=0
+RC_LOCAL=0
+
 # Pre-flight model availability check. Probes the tiered model roster from
 # config.yaml and writes .model-availability.json, which both briefings read to
 # pin a working model per tier. A non-zero exit means some tier had no reachable
 # model; the run continues on the configured defaults either way.
-"$DIR/.venv/bin/python3" "$DIR/scripts/preflight_model_check.py" \
-    --config "$DIR/config.yaml" 2>&1 | logger -t preflight-check
-RC_PREFLIGHT="${PIPESTATUS[0]}"
-if [ "$RC_PREFLIGHT" -ne 0 ]; then
-    logger -t preflight-check "Pre-flight check failed (rc=$RC_PREFLIGHT), continuing with config defaults"
+if [ "$RUN_LOCAL_ONLY" != "1" ]; then
+    "$DIR/.venv/bin/python3" "$DIR/scripts/preflight_model_check.py" \
+        --config "$DIR/config.yaml" 2>&1 | logger -t preflight-check
+    RC_PREFLIGHT="${PIPESTATUS[0]}"
+    if [ "$RC_PREFLIGHT" -ne 0 ]; then
+        logger -t preflight-check "Pre-flight check failed (rc=$RC_PREFLIGHT), continuing with config defaults"
+    fi
 fi
 
-# Main briefing (defense/tech) runs first.
+# Main briefing (defense/tech) runs first, or alone for the 06:00 cron job.
 # PIPESTATUS, not $?: the pipe ends in logger, so $? is logger's status and a
 # failed briefing would look like a success to cron.
-"$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config.yaml" --log-level DEBUG "$@" 2>&1 | logger -t atlas-briefing
-RC_MAIN="${PIPESTATUS[0]}"
+if [ "$RUN_LOCAL_ONLY" != "1" ]; then
+    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config.yaml" --log-level DEBUG "$@" 2>&1 | logger -t atlas-briefing
+    RC_MAIN="${PIPESTATUS[0]}"
+fi
 
-# Local briefing (San Diego / CA) runs after main completes
-"$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config_local.yaml" --log-level DEBUG "$@" 2>&1 | logger -t local-briefing
-RC_LOCAL="${PIPESTATUS[0]}"
+# Local briefing runs after main in manual/full mode, or alone at 07:00 in cron.
+if [ "$RUN_MAIN_ONLY" != "1" ]; then
+    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config_local.yaml" --log-level DEBUG "$@" 2>&1 | logger -t local-briefing
+    RC_LOCAL="${PIPESTATUS[0]}"
+fi
 
 # Audit what was just produced. Chained rather than scheduled at a fixed time:
 # run length varies with LLM backend health (15 min one morning, 32 the next),
 # so a clock-based check raced the pipeline and reported the local briefing
 # missing when it was still being written. Running here means the audit starts
 # when the work is actually finished, whatever that takes.
-if [ "${SKIP_QUALITY_CHECK:-0}" != "1" ]; then
+if [ "$RUN_MAIN_ONLY" != "1" ] && [ "${SKIP_QUALITY_CHECK:-0}" != "1" ]; then
     QC_ARGS=()
     # Briefings run Mon-Sat, so the weekly deep probe rides along on Saturday
     # rather than firing on a Sunday when there is no briefing to audit.

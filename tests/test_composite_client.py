@@ -40,6 +40,14 @@ def _chain(*models, tier="medium"):
 
 
 class TestCompositeClient:
+    def test_health_reports_failed_enrichment_even_when_a_backend_is_available(self):
+        client = _FakeClient("or", results={"openrouter/m1": "summary"})
+        chain = CompositeClient({"openrouter": client}, _chain("openrouter/m1"))
+        assert chain.invoke("rank") == "summary"
+        client.results["openrouter/m1"] = None
+        assert chain.invoke("judge") is None
+        assert chain.get_health() == {"calls": 2, "successful": 1, "failed": 1}
+
     def test_requires_at_least_one_client(self):
         with pytest.raises(ValueError):
             CompositeClient({}, {})

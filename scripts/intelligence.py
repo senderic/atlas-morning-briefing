@@ -9,6 +9,7 @@ briefing pipeline. Falls back gracefully when the LLM client is unavailable.
 
 import logging
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
@@ -17,6 +18,25 @@ from scripts.leak_detection import is_cot_leak
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _newsletter_date_note(article: Dict[str, Any]) -> str:
+    """Anchor an issue's relative language before a model can carry it forward."""
+    if article.get("input_type") != "email_newsletter":
+        return ""
+    text = str(article.get("summary") or "") + " " + str(article.get("brief_summary") or "")
+    if not re.search(r"\bnext\s+week\b", text, re.IGNORECASE):
+        return ""
+    try:
+        published = datetime.fromisoformat(str(article.get("published") or "").replace("Z", "+00:00"))
+        issued = published.astimezone().date()
+    except (ValueError, TypeError):
+        return ""
+    next_monday = issued + timedelta(days=7 - issued.weekday())
+    return (
+        f"Calendar anchor: this issue's 'next week' means the week starting {next_monday.isoformat()}, "
+        "not next week relative to today's briefing. Use the anchored calendar date."
+    )
 
 
 SYSTEM_PROMPT = (
@@ -582,6 +602,12 @@ class BriefingIntelligence:
         Returns:
             Items with added 'author_blurb' key.
         """
+        if item_type in {"news", "blogs"} and not self.config.get("features", {}).get("source_blurbs", True):
+            # Attribution comes from the feed. A model's recalled awards,
+            # ownership and reputation are not verified source evidence.
+            for item in items:
+                item.pop("author_blurb", None)
+            return items
         if not self.available or not items:
             return items
 
@@ -997,10 +1023,11 @@ class BriefingIntelligence:
         """
         if not self.available or not news:
             logger.info(f"News ranking skipped: available={self.available}, news_count={len(news)}")
-            return news[:5]
+            return self._fallback_items(news, topics)
 
         news_lines = []
-        for i, article in enumerate(news[:20]):
+        candidates = news[:int(self.config.get("ranking_candidate_limit", 60))]
+        for i, article in enumerate(candidates):
             title = _sanitize_prompt_input(article.get("title", ""), max_length=300)
             source = _sanitize_prompt_input(article.get("source", ""), max_length=100)
             snippet = _sanitize_prompt_input(
@@ -1025,7 +1052,10 @@ class BriefingIntelligence:
             "In each summary, lead with what actually happened and the concrete "
             "stakes, then deliver the 'so what' -- the implication or what it "
             "signals. Active voice, specific names and numbers, no hype, no "
-            f"filler. {self._rank_directive()} Be factual. Do not invent details."
+            f"filler. {self._rank_directive()} Use only facts in that item's supplied "
+            "text. Do not invent dates, locations, patrols, attendance rules or "
+            "causes, and do not borrow facts from a different item. Label any "
+            "implication as an inference rather than an observed fact."
             f"{self._actionability_note()}"
         )
 
@@ -1033,7 +1063,7 @@ class BriefingIntelligence:
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
-            return news[:5]
+            return self._fallback_items(news, topics)
 
         logger.debug(f"News LLM response:\n{result[:500]}")
 
@@ -1042,8 +1072,8 @@ class BriefingIntelligence:
         logger.info(f"News parsing: {len(parsed)} items parsed from LLM response")
         ranked_news = []
         for idx, text in parsed:
-            if 0 <= idx < len(news):
-                article = news[idx].copy()
+            if 0 <= idx < len(candidates):
+                article = candidates[idx].copy()
                 article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked_news.append(article)
 
@@ -1062,8 +1092,8 @@ class BriefingIntelligence:
         if retry_result:
             parsed_retry = self._parse_ranked_response(retry_result)
             for idx, text in parsed_retry:
-                if 0 <= idx < len(news):
-                    article = news[idx].copy()
+                if 0 <= idx < len(candidates):
+                    article = candidates[idx].copy()
                     article["brief_summary"] = _strip_trailing_rationale(text)
                     ranked_news.append(article)
             if ranked_news:
@@ -1072,12 +1102,7 @@ class BriefingIntelligence:
                 return diversified[:5]
 
         logger.warning("News ranking failed after retry, using description fallback")
-        fallback = []
-        for article in news[:5]:
-            a = article.copy()
-            a["brief_summary"] = a.get("description", a.get("snippet", ""))
-            fallback.append(a)
-        return fallback
+        return self._fallback_items(news, topics)
 
     def rank_and_summarize_happenings(
         self, happenings: List[Dict[str, Any]], max_items: int = 6
@@ -1183,12 +1208,13 @@ class BriefingIntelligence:
         return fallback
 
     def rank_and_summarize_blogs(
-        self, blogs: List[Dict[str, Any]], topics: List[str]
+        self, blogs: List[Dict[str, Any]], topics: List[str],
+        covered_news: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Rank blogs by relevance and generate 1-2 sentence summaries for top items.
 
-        Uses the light tier model to save cost.
+        Uses the medium tier model; optional news context avoids repetition.
 
         Args:
             blogs: List of blog article dictionaries.
@@ -1198,26 +1224,71 @@ class BriefingIntelligence:
             Top 5 blog articles, ranked and summarized.
         """
         if not self.available or not blogs:
-            return blogs[:5]
+            return self._fallback_items(blogs, topics)
 
         blog_lines = []
-        for i, article in enumerate(blogs[:15]):
+        candidates = blogs[:int(self.config.get("ranking_candidate_limit", 60))]
+        for i, article in enumerate(candidates):
             title = _sanitize_prompt_input(article.get("title", ""), max_length=300)
             source = _sanitize_prompt_input(article.get("source", ""), max_length=100)
-            summary = _sanitize_prompt_input(article.get("summary", "")[:200], max_length=300)
-            blog_lines.append(f"[{i+1}] {title} ({source}): {summary}")
+            # A newsletter's lead story normally begins after its masthead,
+            # weather, and other preamble. The RSS-sized 200-character window
+            # hid the actual local reporting from the ranker.
+            summary_limit = (
+                int(self.config.get("email_newsletter_prompt_chars", 10_000))
+                if article.get("input_type") == "email_newsletter"
+                else 200
+            )
+            summary = _sanitize_prompt_input(
+                article.get("summary", "")[:summary_limit],
+                max_length=summary_limit + 100,
+            )
+            published = _sanitize_prompt_input(article.get("published", ""), max_length=60)
+            blog_lines.append(f"[{i+1}] {title} ({source}; published {published}): {summary}\n{_newsletter_date_note(article)}")
 
         blogs_block = "\n".join(blog_lines)
+        covered_note = ""
+        if covered_news:
+            covered = "\n".join(
+                _sanitize_prompt_input(f"{n.get('title', '')}: {n.get('brief_summary', '')}", max_length=700)
+                for n in covered_news[:5]
+            )
+            covered_note = (
+                "The news section already covers these developments:\n"
+                f"<covered_news>\n{covered}\n</covered_news>\n\n"
+                "Choose complementary stories rather than repeating those "
+                "weather advisories, outages or incidents. Prioritize original "
+                "newsletter details such as roads and construction hours, "
+                "benefit or coverage changes, fees and deadlines. Repeat a "
+                "development only if this item adds a specific decision or "
+                "actionable detail absent from the news section.\n\n"
+            )
+        newsletter_note = ""
+        if any(
+            article.get("input_type") == "email_newsletter"
+            for article in candidates
+        ):
+            newsletter_note = (
+                "For an email newsletter, include every actionable warning, "
+                "closure, fee or bill change, time-sensitive local activity, "
+                "and investment-relevant development in the supplied text -- "
+                "not only its lead story. Compress these into up to 4 concise "
+                "sentences when needed.\n"
+            )
         prompt = (
             f"You are curating a daily {self.briefing_domain} briefing. From these "
             f"blog posts, select the TOP 5 most relevant for {self.briefing_audience}.\n\n"
             f"{self._priority_block()}"
+            f"{covered_note}"
             f"<interests>{', '.join(self._ranking_interests(topics))}</interests>\n\n"
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
-            "[original_number] SCORE:X/5 1-2 sentence summary.\n\n"
+            "[original_number] SCORE:X/5 concise summary.\n\n"
             "Return only the numbered picks in that exact format -- never "
             "explain, list, or justify which posts you left out.\n\n"
+            f"{newsletter_note}"
+            "Resolve relative dates using each issue's publication date. Preserve "
+            "the actual road, location, hours, closure, and deadline when supplied.\n"
             "In the summary, name the specific thing the post is about and state "
             "what it concretely claims, builds, or shows -- the actual takeaway a "
             "reader would quote. Lead with the subject (the product, method, or "
@@ -1226,6 +1297,8 @@ class BriefingIntelligence:
             "any sentence that would read the same for a dozen different posts. If "
             "the provided text is too thin to say anything specific, summarize the "
             "headline plainly rather than inflating it into a generic principle.\n"
+            "Use only facts in that item's supplied text. Do not invent dates, "
+            "locations or rules, and do not borrow facts from a different item. "
             "Specific, plainspoken, active voice.\n"
             "SCORE is a combined rating (1-5) of impact, complexity, and innovation. "
             "5 = groundbreaking, 1 = routine.\n"
@@ -1237,14 +1310,14 @@ class BriefingIntelligence:
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
-            return blogs[:5]
+            return self._fallback_items(blogs, topics)
 
         # Parse ranked results using shared parser
         parsed = self._parse_ranked_response(result)
         ranked_blogs = []
         for idx, text in parsed:
-            if 0 <= idx < len(blogs):
-                article = blogs[idx].copy()
+            if 0 <= idx < len(candidates):
+                article = candidates[idx].copy()
                 score, summary = self.extract_score(text)
                 article["brief_summary"] = _strip_trailing_rationale(summary)
                 if score:
@@ -1258,7 +1331,36 @@ class BriefingIntelligence:
             logger.info(f"Ranked and summarized {len(diversified)} blog articles")
             return diversified[:5]
 
-        return self._enforce_source_diversity(blogs, max_per_source=self.max_per_source)[:5]
+        return self._fallback_items(blogs, topics)
+
+    def _fallback_items(self, items: List[Dict[str, Any]], topics: List[str]) -> List[Dict[str, Any]]:
+        """Rank the whole pool deterministically and retain actual source excerpts."""
+        if not items:
+            return []
+        ranked = list(items)
+        interests = self._ranking_interests(topics)
+        if interests:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            documents = [
+                f"{item.get('title', '')} {item.get('title', '')} "
+                + str(item.get("summary") or item.get("description") or item.get("snippet") or "")
+                for item in items
+            ]
+            try:
+                matrix = TfidfVectorizer(stop_words="english").fit_transform(documents + [" ".join(interests)])
+                scores = (matrix[:-1] @ matrix[-1].T).toarray().ravel()
+                ranked = [items[i] for i in sorted(range(len(items)), key=lambda i: -scores[i])]
+            except ValueError:
+                pass  # empty vocabulary: retain source ordering
+        if len({a.get("source", "") for a in ranked}) > 1:
+            ranked = self._enforce_source_diversity(ranked, self.max_per_source)
+        result = []
+        for item in ranked[:5]:
+            article = item.copy()
+            excerpt = article.get("brief_summary") or article.get("summary") or article.get("description") or article.get("snippet") or ""
+            article["brief_summary"] = _sanitize_prompt_input(excerpt, max_length=2400)
+            result.append(article)
+        return result
 
     @staticmethod
     def _enforce_source_diversity(
@@ -1308,8 +1410,26 @@ class BriefingIntelligence:
         if not stock_lines:
             return stocks
 
+        def names_stock(stock: Dict[str, Any], headline: Dict[str, Any]) -> bool:
+            symbol = str(stock.get("symbol") or "")
+            name = str(stock.get("name") or symbol)
+            names = [n for n in (symbol, name) if n]
+            brand = name.split()[0] if name else ""
+            if len(brand) >= 3 and brand.lower() not in {"the", "global", "united"}:
+                names.append(brand)
+            title = str(headline.get("title", ""))
+            return any(re.search(r"(?<!\w)" + re.escape(n) + r"(?!\w)", title, re.IGNORECASE) for n in names)
+
+        candidates = [
+            n for n in news[:15]
+            if str(n.get("url") or n.get("link") or "").startswith(("https://", "http://"))
+            and any(names_stock(s, n) for s in stocks if "error" not in s)
+        ]
+        if not candidates:
+            return stocks
         news_lines = [
-            f"- {_sanitize_prompt_input(n.get('title', ''), max_length=300)}" for n in news[:15]
+            f"[{i+1}] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}"
+            for i, n in enumerate(candidates)
         ]
 
         stocks_block = "\n".join(stock_lines)
@@ -1319,12 +1439,12 @@ class BriefingIntelligence:
             f"<stocks>\n{stocks_block}\n</stocks>\n\n"
             "Today's headlines:\n"
             f"<headlines>\n{headlines_block}\n</headlines>\n\n"
-            "For EVERY stock, write a short driver (max 4 words). "
-            "Use the headlines if related, otherwise use general market context "
-            "(e.g. 'Broad tech selloff', 'Sector rotation').\n"
-            "Respond with one line per stock:\n"
-            "SYMBOL | short driver\n"
-            "Every stock MUST have a driver. Never leave blank."
+            "Only for stocks directly named in a headline, identify the related "
+            "development (max 4 words). This is context, NOT a proven cause of "
+            "the price move. Omit unrelated stocks; never invent market drivers.\n"
+            "Respond with one line per supported stock:\n"
+            "SYMBOL | headline_number | related development\n"
+            "Return no lines if none of these stocks has related reporting."
         )
 
         result = self.client.invoke(
@@ -1335,18 +1455,30 @@ class BriefingIntelligence:
 
         # Parse correlations
         correlations = {}
+        stocks_by_symbol = {s.get("symbol", "").upper(): s for s in stocks if "error" not in s}
         for line in result.strip().split("\n"):
-            if "|" in line:
-                parts = line.split("|", 1)
-                symbol = parts[0].strip().upper()
-                correlation = parts[1].strip()
-                if correlation and correlation.lower() != "no clear driver":
-                    correlations[symbol] = correlation
+            parts = [part.strip() for part in line.split("|", 2)]
+            if len(parts) != 3 or parts[0].upper() not in stocks_by_symbol:
+                continue
+            symbol = parts[0].upper()
+            try:
+                index = int(parts[1].strip("[]")) - 1
+            except ValueError:
+                continue
+            if not 0 <= index < len(candidates):
+                continue
+            headline = candidates[index]
+            supported = names_stock(stocks_by_symbol[symbol], headline)
+            url = headline.get("url") or headline.get("link") or ""
+            if supported and url.startswith(("https://", "http://")) and parts[2]:
+                correlations[symbol] = (parts[2], url)
 
         for stock in stocks:
             symbol = stock.get("symbol", "")
+            stock.pop("news_correlation", None)
+            stock.pop("news_correlation_source", None)
             if symbol in correlations:
-                stock["news_correlation"] = correlations[symbol]
+                stock["news_correlation"], stock["news_correlation_source"] = correlations[symbol]
 
         logger.info(f"Correlated {len(correlations)} stocks with news")
         return stocks
@@ -1417,6 +1549,7 @@ class BriefingIntelligence:
         top_papers: List[Dict[str, Any]],
         emerging_themes: Optional[List[str]] = None,
         previous_state: Optional[Dict[str, Any]] = None,
+        alerts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         """
         Synthesize cross-section connections and generate editorial content.
@@ -1442,6 +1575,22 @@ class BriefingIntelligence:
         # Build a compact summary of all data for the synthesis prompt
         sections = []
 
+        if alerts:
+            alert_lines = []
+            for alert in alerts[:10]:
+                details = " | ".join(
+                    f"{field}: {alert.get(field, '')}" for field in
+                    ("event", "severity", "onset", "expires", "area", "areaDesc", "instruction")
+                )
+                alert_lines.append(_sanitize_prompt_input(details, max_length=1600))
+            sections.append(
+                "CURRENT OFFICIAL NATIONAL WEATHER SERVICE ALERTS:\n"
+                + "\n".join(alert_lines)
+                + "\nThese current official alert windows take precedence over "
+                "older news snippets. Preserve their onset and expiry dates and "
+                "times; do not replace them with a conflicting article's window."
+            )
+
         if papers:
             paper_items = []
             for p in papers[:10]:
@@ -1461,9 +1610,16 @@ class BriefingIntelligence:
             for b in blogs[:8]:
                 source = b.get("source", "")
                 title = b.get("title", "")
-                summary = b.get("brief_summary", "")
+                published = _sanitize_prompt_input(b.get("published", ""), max_length=60)
+                summary = b.get("brief_summary") or b.get("summary", "")
+                summary = _sanitize_prompt_input(summary, max_length=2400)
+                if b.get("input_type") == "email_newsletter" and b.get("brief_summary"):
+                    summary += "\nSource excerpt: " + _sanitize_prompt_input(b.get("summary", ""), max_length=2400)
+                date_note = _newsletter_date_note(b)
+                if date_note:
+                    summary += "\n" + date_note
                 if summary:
-                    blog_items.append(f"- [{source}] {title}: {summary}")
+                    blog_items.append(f"- [{source}; published {published}] {title}: {summary}")
                 else:
                     blog_items.append(f"- [{source}] {title}")
             sections.append("BLOGS:\n" + "\n".join(blog_items))
@@ -1486,7 +1642,8 @@ class BriefingIntelligence:
             news_items = []
             for n in news[:10]:
                 title = n.get("title", "")
-                summary = n.get("brief_summary", "")
+                summary = n.get("brief_summary") or n.get("description") or n.get("snippet", "")
+                summary = _sanitize_prompt_input(summary, max_length=1200)
                 if summary:
                     news_items.append(f"- {title}: {summary}")
                 else:

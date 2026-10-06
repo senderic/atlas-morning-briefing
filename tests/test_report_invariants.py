@@ -315,6 +315,13 @@ class TestCheckOutOfArea:
 
 
 class TestCheckNearDuplicates:
+    def test_shared_outlet_suffix_does_not_make_distinct_stories_duplicates(self):
+        md = (
+            "**[Surfers in hazmat suits? San Diego Climate Week is back with 200 events | KPBS Public Media](https://kpbs.org/climate)**\nBody one.\n\n"
+            "**[Extreme heat to remain in San Diego County most of the week | KPBS Public Media](https://kpbs.org/heat)**\nBody two.\n"
+        )
+        assert check_near_duplicates(md) == []
+
     def test_fires_for_syndicated_retellings(self):
         md = (
             "**[Darth Vader Speaks At City Council Meeting](https://a.example/1)**\n"

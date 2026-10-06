@@ -3,7 +3,7 @@
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from scripts.openrouter_client import HAS_REQUESTS, OpenRouterClient
 
@@ -38,6 +38,34 @@ class NvidiaClient(OpenRouterClient):
         self.api_key = os.environ.get("NVIDIA_API_KEY", "") or str(
             (config or {}).get("api_key", "")
         )
+        self.reasoning_budget = max(0, int(values.get("reasoning_budget", 512)))
+
+    def _build_payload(
+        self, model: str, prompt: str, system_prompt: Optional[str],
+        reasoning_enabled: bool,
+    ) -> Tuple[Dict[str, Any], str, bool]:
+        payload, model, sent = super()._build_payload(
+            model, prompt, system_prompt, reasoning_enabled,
+        )
+        # NIM defaults to a reasoning budget larger than our entire output
+        # limit. Reserve most tokens for the ranked stories / JSON answer.
+        # https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3-super-120b-a12b-infer
+        if reasoning_enabled and payload["model"] == "nvidia/nemotron-3-super-120b-a12b":
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": True,
+                "low_effort": True,
+                "reasoning_budget": min(self.reasoning_budget, max(0, self.max_tokens - 1)),
+            }
+            sent = True
+        elif reasoning_enabled and payload["model"] == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning":
+            budget = min(self.reasoning_budget, max(0, self.max_tokens - 1))
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": True, "reasoning_budget": budget,
+            }
+            # Hosted NIM rejects the self-hosted thinking_token_budget field;
+            # send only the supported chat-template settings.
+            sent = True
+        return payload, model, sent
 
     @property
     def available(self) -> bool:

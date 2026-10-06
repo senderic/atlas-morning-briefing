@@ -23,6 +23,8 @@ _TRACKING_PARAMS = {
     "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid",
     "igshid", "ref", "ref_src", "s", "src", "source", "cmpid",
     "campaign_id", "spm", "at_medium", "at_campaign",
+    # Sailthru/SDUT recipient and campaign routing fields.
+    "active", "g2i_source", "lctg",
 }
 
 

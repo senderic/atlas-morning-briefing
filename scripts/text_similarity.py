@@ -28,8 +28,11 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.3
 
 def headline_terms(title: str) -> Set[str]:
     """Content words of a headline, for cross-outlet duplicate detection."""
+    # Search results append outlet names after a pipe. Shared branding must
+    # not turn two unrelated stories from the same newsroom into duplicates.
+    title = (title or "").split(" | ", 1)[0]
     return {
-        w for w in re.findall(r"[a-z0-9']+", (title or "").lower())
+        w for w in re.findall(r"[a-z0-9']+", title.lower())
         if len(w) > 2 and w not in DEDUP_STOPWORDS
     }
 

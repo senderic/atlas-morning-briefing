@@ -402,6 +402,10 @@ class OpenRouterClient(BaseLLMClient):
             )
             with self._lock:
                 self._tier_failures[tier] += 1
+                if resp.status_code == 401:
+                    self._available = False
+            if resp.status_code == 401:
+                logger.warning("%s account rejected; disabling this transport for this run", self.display_name)
             return None, action
 
         try:
@@ -425,6 +429,8 @@ class OpenRouterClient(BaseLLMClient):
             )
             with self._lock:
                 self._tier_failures[tier] += 1
+                if err.get("code") == 401:
+                    self._available = False
             return None, action
 
         content, finish_reason, reasoning_len = self._extract_content(data)

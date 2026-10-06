@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.arxiv_scanner import ArxivScanner, create_scanner
 from scripts.snapshot_manager import SnapshotManager
 from scripts.blog_scanner import BlogScanner
+from scripts.email_newsletter_scanner import EmailNewsletterScanner
 from scripts.stock_fetcher import StockFetcher
 from scripts.text_similarity import DEDUP_STOPWORDS, headline_terms
 from scripts.alerts_scanner import create_scanner as create_alerts_scanner
@@ -47,7 +48,7 @@ from scripts.paper_scorer import PaperScorer
 from scripts.pdf_generator import PDFGenerator
 from scripts.epub_generator import EPUBGenerator
 from scripts.email_distributor import EmailDistributor
-from scripts.event_dates import has_only_past_dates
+from scripts.event_dates import extract_dates, has_only_past_dates
 from scripts.url_utils import normalize_url
 from scripts.config_validator import validate_config, check_environment
 from scripts.gemini_client import GeminiCLIClient
@@ -190,6 +191,7 @@ class BriefingRunner:
             "synthesis_degraded": False,
             "geo_filtered_out": 0,
             "intelligence_enabled": False,
+            "intelligence_degraded": False,
             "writer_enabled": False,
             "writer_model": "",
             "writer_backend": "unavailable",
@@ -296,10 +298,14 @@ class BriefingRunner:
             return []
 
     def run_blog_scan(self) -> List[Dict[str, Any]]:
-        """Run blog feed scan."""
+        """Run RSS and configured read-only email newsletter scans."""
         try:
-            logger.info("=== Scanning Blog Feeds ===")
+            logger.info("=== Scanning Blog Feeds and Email Newsletters ===")
             feeds = self.config.get("blog_feeds", [])
+            newsletter_config = self.config.get("email_newsletters") or {}
+            newsletters_enabled = bool(
+                newsletter_config.get("enabled") and newsletter_config.get("sources")
+            )
             # Blogs get their own window. Reusing arxiv_days_back tied the blog
             # cutoff to a paper-freshness setting: at arxiv_days_back=3 a feed
             # posting weekly is invisible on most days, which showed up as
@@ -312,16 +318,47 @@ class BriefingRunner:
             )
             max_blogs = self.config.get("max_blogs", 10)
 
-            if not feeds:
-                logger.warning("No blog_feeds configured, skipping")
+            if not feeds and not newsletters_enabled:
+                logger.warning("No blog or email newsletter sources configured, skipping")
                 return []
 
-            scanner = BlogScanner(
-                feeds=feeds,
-                days_back=days_back,
-                max_items=max_blogs,
-            )
-            articles = scanner.scan_all_feeds()
+            rss_articles: List[Dict[str, Any]] = []
+            if feeds:
+                scanner = BlogScanner(
+                    feeds=feeds,
+                    days_back=days_back,
+                    max_items=max_blogs,
+                )
+                rss_articles = scanner.scan_all_feeds()
+
+            newsletter_articles: List[Dict[str, Any]] = []
+            if newsletters_enabled:
+                username_env = newsletter_config.get("username_env", "GMAIL_USER")
+                password_env = newsletter_config.get(
+                    "password_env", "GMAIL_APP_PASSWORD"
+                )
+                username = os.environ.get(username_env, "")
+                password = os.environ.get(password_env, "")
+                if username and password:
+                    newsletter_articles = EmailNewsletterScanner(
+                        newsletter_config,
+                        username=username,
+                        password=password,
+                    ).scan()
+                else:
+                    logger.warning(
+                        "Email newsletters enabled but IMAP credentials are missing"
+                    )
+
+            # Keep a newsletter at the front of the bounded ranker window, but
+            # alternate thereafter so several digest stories cannot crowd out
+            # every RSS source when the intelligence layer uses its fallback.
+            articles: List[Dict[str, Any]] = []
+            for index in range(max(len(newsletter_articles), len(rss_articles))):
+                if index < len(newsletter_articles):
+                    articles.append(newsletter_articles[index])
+                if index < len(rss_articles):
+                    articles.append(rss_articles[index])
             self.status["blogs_found"] = len(articles)
             logger.info(f"Found {len(articles)} articles")
             return articles
@@ -330,6 +367,29 @@ class BriefingRunner:
             logger.error(f"Blog scan failed: {e}")
             self.errors.append(f"Blog scan: {e}")
             return []
+
+    def _prepare_blog_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply newsletter structure and public URLs to live and saved inputs."""
+        sources = {
+            source.get("name"): source
+            for source in (self.config.get("email_newsletters") or {}).get("sources", [])
+        }
+        prepared = []
+        for article in articles:
+            source_config = sources.get(article.get("source"), {})
+            if article.get("input_type") != "email_newsletter":
+                prepared.append(article)
+                continue
+            item = article.copy()
+            if EmailNewsletterScanner._is_opaque_tracking_link(item.get("link", "")):
+                item["link"] = source_config.get("fallback_link", "")
+            if source_config.get("events") and has_only_past_dates(item.get("title", ""), datetime.now().date()):
+                continue
+            if source_config.get("mode") == "sections" and not item.get("newsletter_section"):
+                prepared.extend(EmailNewsletterScanner.split_sections(item, source_config))
+            else:
+                prepared.append(item)
+        return prepared
 
     def run_stock_fetch(self) -> List[Dict[str, Any]]:
         """Run stock data fetch."""
@@ -534,6 +594,7 @@ class BriefingRunner:
             fetched = self._drop_past_happenings(
                 self._dedupe_happenings_by_url(self.run_happenings_aggregation())
             )
+            fetched = self._filter_happenings_exclusions(fetched)
             if fetched:
                 self._happenings_cache = list(fetched)
                 self._happenings_cache_date = today.strftime("%Y-%m-%d")
@@ -548,6 +609,7 @@ class BriefingRunner:
                 previous_state.get("cached_happenings", [])
             )
         )
+        cached = self._filter_happenings_exclusions(cached)
         if cached:
             cache_date = previous_state.get("cached_happenings_date", "unknown")
             logger.info(
@@ -603,9 +665,9 @@ class BriefingRunner:
         results from the past week by design. So the dates are checked at use
         time rather than trusted to be fresh.
 
-        Undated items are kept: a venue's standing events calendar or a rule
-        change ("volleyball can now begin at 6 a.m.") is not stale for lacking
-        a day. Ranges are judged by when they end.
+        Undated items are kept unless happenings_require_dates is enabled.
+        Ranges are judged by when they end; an expired roundup title cannot
+        be rescued by a future date in an unrelated excerpt.
         """
         if not happenings:
             return happenings
@@ -614,15 +676,104 @@ class BriefingRunner:
         for item in happenings:
             text = " ".join(
                 str(item.get(field, ""))
-                for field in ("title", "description", "age")
+                for field in (
+                    "title", "description", "snippet", "brief_summary", "age"
+                )
             )
-            if has_only_past_dates(text, today):
+            undated = self.config.get("happenings_require_dates") and not extract_dates(text, today)
+            if undated or has_only_past_dates(str(item.get("title", "")), today) or has_only_past_dates(text, today):
                 dropped.append(item.get("title", "")[:80])
             else:
                 kept.append(item)
         if dropped:
             logger.info(
-                "Dropped %d happening(s) whose dates have passed: %s",
+                "Dropped %d happening(s) without a current event date: %s",
+                len(dropped), "; ".join(dropped),
+            )
+        return kept
+
+    @staticmethod
+    def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+        """Match a phrase case-insensitively across punctuation boundaries."""
+        normalized_text = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+        normalized_phrase = re.sub(
+            r"[^a-z0-9]+", " ", (phrase or "").lower()
+        ).strip()
+        if not normalized_phrase:
+            return False
+        return f" {normalized_phrase} " in f" {normalized_text} "
+
+    def _filter_happenings_exclusions(
+        self, happenings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Remove disliked event categories and individually named events.
+
+        Category terms are matched against all reader-facing event copy.
+        Individual-event title terms only inspect the title, while URLs use
+        the same canonicalization as the happenings deduplicator. This keeps
+        preferences deterministic when the intelligence layer is unavailable.
+        """
+        preferences = self.config.get("happenings_exclusions") or {}
+        category_rules = preferences.get("categories") or []
+        event_rules = preferences.get("events") or []
+        if not happenings or not (category_rules or event_rules):
+            return happenings
+
+        def as_list(value: Any) -> List[str]:
+            if not value:
+                return []
+            if isinstance(value, str):
+                return [value]
+            return [str(item) for item in value if item]
+
+        category_terms: List[str] = []
+        for rule in category_rules:
+            if isinstance(rule, str):
+                category_terms.append(rule)
+            elif isinstance(rule, dict):
+                category_terms.extend(as_list(rule.get("terms")))
+
+        event_title_terms: List[str] = []
+        event_urls = set()
+        for rule in event_rules:
+            if isinstance(rule, str):
+                event_title_terms.append(rule)
+                continue
+            if not isinstance(rule, dict):
+                continue
+            event_title_terms.extend(
+                as_list(rule.get("title_terms") or rule.get("title_contains"))
+            )
+            for url in as_list(rule.get("urls") or rule.get("url")):
+                normalized_url = normalize_url(url)
+                if normalized_url:
+                    event_urls.add(normalized_url)
+
+        kept, dropped = [], []
+        for item in happenings:
+            title = str(item.get("title", ""))
+            event_copy = " ".join(
+                str(item.get(field, ""))
+                for field in ("title", "description", "snippet", "brief_summary")
+            )
+            category_match = any(
+                self._contains_normalized_phrase(event_copy, term)
+                for term in category_terms
+            )
+            title_match = any(
+                self._contains_normalized_phrase(title, term)
+                for term in event_title_terms
+            )
+            item_url = normalize_url(item.get("url", ""))
+            url_match = bool(item_url and item_url in event_urls)
+            if category_match or title_match or url_match:
+                dropped.append(title[:80])
+            else:
+                kept.append(item)
+
+        if dropped:
+            logger.info(
+                "Excluded %d happening(s) using reader preferences: %s",
                 len(dropped), "; ".join(dropped),
             )
         return kept
@@ -981,6 +1132,13 @@ class BriefingRunner:
         section_order = self.section_order
 
         # Section renderers
+        # Re-check preferences and dates after enrichment. The generated
+        # summary can expose a date that was absent from the raw search item,
+        # and a preference edit must take effect even for snapshot-based runs.
+        happenings = self._drop_past_happenings(
+            self._filter_happenings_exclusions(happenings or [])
+        )
+
         section_data = {
             "stocks": stocks,
             "news": news,
@@ -1134,8 +1292,9 @@ class BriefingRunner:
         data_block = "\n".join(stock_lines)
         prompt = (
             "You are a financial analyst. Given today's stock movements, "
-            "write exactly 2 sentences summarizing the market trend and key drivers. "
-            "Be specific about which sectors/stocks moved and why.\n\n"
+            "write exactly 2 sentences summarizing the observed price movements. "
+            "Related news is context, not an established cause of a price move. "
+            "Do not invent explanations such as profit taking, rotation, or optimism.\n\n"
             f"<stock_data>\n{data_block}\n</stock_data>"
         )
         result = self.intelligence.client.invoke(
@@ -1147,10 +1306,7 @@ class BriefingRunner:
         """Render stock watchlist as compact overview table with trend analysis."""
         md = [f"## {self._headings.get('stocks', 'Financial Market Overview')}\n\n"]
 
-        if market_trend:
-            md.append(f"{market_trend}\n\n")
-
-        md.append("| Ticker | Price | Change | Driver |\n")
+        md.append("| Ticker | Price | Change | Related news |\n")
         md.append("|--------|-------|--------|--------|\n")
         for stock in stocks:
             if "error" in stock:
@@ -1164,9 +1320,16 @@ class BriefingRunner:
             driver = stock.get("news_correlation", "")
             if len(driver) > 30:
                 driver = driver[:27] + "..."
+            source_url = stock.get("news_correlation_source", "")
+            if driver and source_url:
+                driver = f"[{driver}]({source_url})"
+            if not driver:
+                driver = "—"
 
             md.append(f"| **{symbol}** | ${price:.2f} | {sign}{pct:.2f}% | {driver} |\n")
         md.append("\n")
+        if market_trend:
+            md.append(f"{market_trend}\n\n")
         return "".join(md)
 
     @staticmethod
@@ -1231,7 +1394,7 @@ class BriefingRunner:
         if not title:
             return s
         # Check if summary starts with title text
-        title_lower = title.lower()[:40]
+        title_lower = title.lower()
         if s.lower().startswith(title_lower):
             rest = s[len(title):].strip()
             if rest.startswith("(") and ")" in rest:
@@ -1316,7 +1479,7 @@ class BriefingRunner:
         items = happenings[:max_happenings]
         if not items:
             return ""
-        md = [f"## {self._headings.get('happenings', 'Pacific Beach Area — Upcoming Happenings')}\n\n"]
+        md = [f"## {self._headings.get('happenings', 'Things To Do In and Around Pacific Beach')}\n\n"]
         for article in items:
             article_title = article.get("title", "")
             url = article.get("url", "")
@@ -1657,6 +1820,13 @@ class BriefingRunner:
             output_dir: Directory to save status file.
         """
         self._refresh_writer_status()
+        health_fn = getattr(self.llm_client, "get_health", None)
+        health = health_fn() if callable(health_fn) else None
+        if isinstance(health, dict) and isinstance(health.get("calls"), int):
+            self.status["intelligence_calls"] = health
+            self.status["intelligence_degraded"] = health.get("failed", 0) > 0
+            if health["calls"]:
+                self.status["intelligence_enabled"] = health.get("successful", 0) > 0
         self.status["errors"] = self.errors
         self.status["pipeline"] = self.config.get("pipeline_name", "")
         status_filename = self.config.get("status_file_path", "status.json")
@@ -1831,6 +2001,13 @@ class BriefingRunner:
             self.snapshot_manager.save_papers(papers)
             self.snapshot_manager.save_manifest()
 
+        # Replay must apply the same current editorial rules as a live fetch.
+        news = self._apply_geo_filter(news, "news")
+        happenings = self._drop_past_happenings(
+            self._filter_happenings_exclusions(self._apply_geo_filter(happenings, "happenings"))
+        )
+        blogs = self._apply_geo_filter(self._prepare_blog_articles(blogs), "blogs")
+
         # --- Cross-section deduplication ---
         news, blogs = self.deduplicate_news_and_blogs(news, blogs)
         news = self.deduplicate_similar_news(news)
@@ -1861,12 +2038,17 @@ class BriefingRunner:
                 logger.info("=== Intelligence Layer: Stage 1 Relevance Filtering ===")
                 papers = self.intelligence.filter_papers_by_relevance(papers, interest_profile)
 
-            # --- Parallel batch 1: papers, news, blogs, happenings are independent ---
+            # Local blogs can complement the selected news instead of
+            # spending both sections' slots on the same weather headlines.
+            coordinate_blogs = self.config.get("blog_avoid_news_overlap", False)
             logger.info("=== Intelligence Layer: Parallel enrichment (papers/news/blogs/happenings) ===")
             with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 1)) as pool:
                 fut_papers = pool.submit(self._enrich_papers, papers, topics)
                 fut_news = pool.submit(self.intelligence.rank_and_summarize_news, news, topics)
-                fut_blogs = pool.submit(self.intelligence.rank_and_summarize_blogs, blogs, topics)
+                fut_blogs = (
+                    None if coordinate_blogs else
+                    pool.submit(self.intelligence.rank_and_summarize_blogs, blogs, topics)
+                )
                 if happenings:
                     fut_happenings = pool.submit(
                         self.intelligence.rank_and_summarize_happenings,
@@ -1876,7 +2058,10 @@ class BriefingRunner:
 
                 papers = fut_papers.result()
                 news = fut_news.result()
-                blogs = fut_blogs.result()
+                blogs = (
+                    self.intelligence.rank_and_summarize_blogs(blogs, topics, covered_news=news)
+                    if coordinate_blogs else fut_blogs.result()
+                )
                 if happenings:
                     happenings = fut_happenings.result()
 
@@ -1948,6 +2133,7 @@ class BriefingRunner:
                 papers, blogs[:5], stocks, news[:5], top_papers[:3],
                 emerging_themes=emerging_themes,
                 previous_state=previous_state,
+                alerts=alerts,
             )
             if entity_mentions:
                 synthesis["entity_mentions"] = entity_mentions

@@ -39,25 +39,27 @@ _MONTH_ALT = (
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember|t)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
 )
 _DAY = r"\d{1,2}(?:st|nd|rd|th)?"
+_YEAR1 = r"(?:,?\s+(?P<y1>20\d{2}))?"
+_YEAR2 = r"(?:,?\s+(?P<y2>20\d{2}))?"
 
 # "Tue Aug 25, 10:00 AM -> Fri Aug 28, 8:00 PM" -- an explicit arrow range.
-# Staleness is decided by the second (end) date; only that half is captured.
+# Staleness is decided by the second (end) date; the start resolves the year.
 _ARROW_RANGE_RE = re.compile(
-    rf"(?:{_MONTH_ALT})\.?\s+{_DAY}[^\n]{{0,60}}?->\s*(?:\w+\s+)?"
-    rf"(?P<m2>{_MONTH_ALT})\.?\s+(?P<d2>{_DAY})",
+    rf"(?P<m1>{_MONTH_ALT})\.?\s+(?P<d1>{_DAY}){_YEAR1}[^\n]{{0,60}}?->\s*(?:\w+\s+)?"
+    rf"(?P<m2>{_MONTH_ALT})\.?\s+(?P<d2>{_DAY}){_YEAR2}",
     re.IGNORECASE,
 )
 # "Aug. 21-23" (same month) or "Aug 30-Sep 2" (cross month). Staleness is
 # decided by the second (end) date.
 _DASH_RANGE_RE = re.compile(
-    rf"(?P<m1>{_MONTH_ALT})\.?\s+(?P<d1>{_DAY})\s*-\s*"
-    rf"(?:(?P<m2>{_MONTH_ALT})\.?\s+)?(?P<d2>{_DAY})",
+    rf"(?P<m1>{_MONTH_ALT})\.?\s+(?P<d1>{_DAY}){_YEAR1}\s*(?:-|to|through)\s*"
+    rf"(?:(?P<m2>{_MONTH_ALT})\.?\s+)?(?P<d2>{_DAY}){_YEAR2}",
     re.IGNORECASE,
 )
 # A single explicit date with no range: "Wed Aug 26". A bare month with no
 # day ("in September") never matches this -- the day group is mandatory.
 _SINGLE_DATE_RE = re.compile(
-    rf"(?P<m1>{_MONTH_ALT})\.?\s+(?P<d1>{_DAY})",
+    rf"(?P<m1>{_MONTH_ALT})\.?\s+(?P<d1>{_DAY}){_YEAR1}",
     re.IGNORECASE,
 )
 
@@ -83,36 +85,43 @@ def _mask(text: str, span: Tuple[int, int]) -> str:
     return text[:start] + (" " * (end - start)) + text[end:]
 
 
+def _resolve_date(today: date, month: int, day: str, year: Optional[str] = None) -> Optional[date]:
+    if year:
+        return _safe_date(int(year), month, day)
+    candidates = [
+        d for y in (today.year - 1, today.year, today.year + 1)
+        if (d := _safe_date(y, month, day)) is not None
+    ]
+    return min(candidates, key=lambda d: abs((d - today).days)) if candidates else None
+
+
 def _extract_dates_from_line(line: str, today: date) -> List[date]:
     """
-    Every explicit calendar date on this line, resolved to the current year,
-    within the +/-180 day sanity window. For a range, only the end date is
-    returned -- staleness is decided by when the range ends.
+    Preserve explicit years; resolve yearless dates to the nearest year.
+    Yearless single dates use a +/-180 day sanity window. For a range, only
+    its end is returned, including ranges crossing New Year's Day.
     """
     dates: List[date] = []
-    work = line
+    work = line.replace("→", "->").replace("–", "-").replace("—", "-")
 
-    for m in list(_ARROW_RANGE_RE.finditer(work)):
-        month = _month_num(m.group("m2"))
-        if month:
-            d = _safe_date(today.year, month, m.group("d2"))
-            if d is not None and abs((d - today).days) <= _STALE_WINDOW_DAYS:
+    for pattern in (_ARROW_RANGE_RE, _DASH_RANGE_RE):
+        for m in list(pattern.finditer(work)):
+            start_month = _month_num(m.group("m1"))
+            end_month = _month_num(m.group("m2") or m.group("m1"))
+            start = _resolve_date(today, start_month, m.group("d1"), m.group("y1"))
+            end_year = m.group("y2")
+            if start and not end_year:
+                end_year = str(start.year + (end_month < start_month))
+            d = _resolve_date(today, end_month, m.group("d2"), end_year)
+            if d is not None:
                 dates.append(d)
-        work = _mask(work, m.span())
-
-    for m in list(_DASH_RANGE_RE.finditer(work)):
-        month = _month_num(m.group("m2") or m.group("m1"))
-        if month:
-            d = _safe_date(today.year, month, m.group("d2"))
-            if d is not None and abs((d - today).days) <= _STALE_WINDOW_DAYS:
-                dates.append(d)
-        work = _mask(work, m.span())
+            work = _mask(work, m.span())
 
     for m in list(_SINGLE_DATE_RE.finditer(work)):
         month = _month_num(m.group("m1"))
         if month:
-            d = _safe_date(today.year, month, m.group("d1"))
-            if d is not None and abs((d - today).days) <= _STALE_WINDOW_DAYS:
+            d = _resolve_date(today, month, m.group("d1"), m.group("y1"))
+            if d is not None and (m.group("y1") or abs((d - today).days) <= _STALE_WINDOW_DAYS):
                 dates.append(d)
 
     return dates

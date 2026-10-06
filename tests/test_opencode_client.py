@@ -360,13 +360,13 @@ class TestDefaults:
     def test_default_models(self):
         client = OpencodeClient({})
         assert client.models["heavy"] == "opencode/muse-spark-1.3-contributor-free"
-        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
-        assert client.models["light"] == "opencode/deepseek-v4-flash-free"
+        assert client.models["medium"] == "opencode/nemotron-3.5-lightning-free"
+        assert client.models["light"] == "opencode/ling-3.1-flash-free"
 
     def test_custom_model_override(self):
         client = OpencodeClient({"models": {"heavy": "other/model"}})
         assert client.models["heavy"] == "other/model"
-        assert client.models["medium"] == "opencode/deepseek-v4-flash-free"
+        assert client.models["medium"] == "opencode/nemotron-3.5-lightning-free"
 
     def test_default_max_calls(self):
         client = OpencodeClient({})
