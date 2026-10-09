@@ -34,7 +34,7 @@ uv run pytest tests/test_briefing_runner.py -v --tb=short
 
 ## Critical Context
 
-- **Active analysis uses the model chains in `llm.chains`.** Heavy starts with free OpenCode Muse; medium/light start with direct NVIDIA NIM and have independent free OpenCode fallbacks. Gemini and Bedrock are disabled. Codex CLI writes the reader-facing report prose separately. NVIDIA reasoning budgets are bounded so reasoning cannot consume the entire answer allowance.
+- **Active analysis uses the model chains in `llm.chains`.** Every tier starts with a Codex CLI rung (heavy `codex/gpt-5.6-sol`, medium `codex/gpt-5.6-terra`, light `codex/gpt-5.6-luna`), with free NVIDIA NIM and OpenRouter rungs behind it as fallback. OpenCode, Gemini and Bedrock are disabled. Codex CLI also writes the reader-facing report prose, through a separate client with its own call budget (`codex.max_calls_per_run`; the chain's is `codex.chain.max_calls_per_run`). NVIDIA reasoning budgets are bounded so reasoning cannot consume the entire answer allowance.
 - **v0.1 runner is the active one** (`scripts/briefing_runner.py`). `briefing_runner_v2.py` is experimental.
 - **Two config files exist:** `config.yaml` (main config, 10KB) and `config.json` (small model override for opencode, 100B). The shell script references `config.yaml`.
 - **THREE configs for runs — blanket model/LLM changes must touch all of them:** `config.yaml` (Atlas), `config_local.yaml` (San Diego), and `config_finance.yaml` (finance). Also keep code defaults and `config/model_capabilities.yaml` aligned. `config.json` only overrides the OpenCode editor model.

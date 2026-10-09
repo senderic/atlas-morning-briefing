@@ -336,3 +336,118 @@ class TestCheckEnvironment:
         config = {}  # No stocks or news configured
         warnings = check_environment(config, dry_run=True)
         assert len(warnings) == 0
+
+
+class TestCodexChainTransport:
+    """`codex/` rungs in llm.chains, and the `codex.chain` block behind them."""
+
+    _CODEX = {
+        "enabled": True,
+        "binary": "/opt/codex",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "timeout_seconds": 300,
+        "max_calls_per_run": 5,
+    }
+    _CHAINS = {
+        "heavy": ["codex/gpt-5.6-sol"],
+        "medium": ["codex/gpt-5.6-terra"],
+        "light": ["codex/gpt-5.6-luna"],
+    }
+
+    def _validate(self, codex=None, llm=None):
+        return validate_config({
+            "arxiv_topics": ["test"],
+            "codex": dict(self._CODEX, **(codex or {})),
+            "llm": dict({"chains": self._CHAINS}, **(llm or {})),
+        })
+
+    def test_codex_prefix_is_a_known_route(self):
+        is_valid, messages = self._validate()
+        assert is_valid is True
+        assert messages == []
+
+    def test_codex_rung_with_the_transport_disabled_is_flagged(self):
+        is_valid, messages = self._validate(codex={"enabled": False})
+        assert is_valid is True
+        assert any("codex/gpt-5.6-terra needs the 'codex' backend" in m for m in messages)
+
+    def test_unknown_prefix_message_lists_codex(self):
+        _, messages = self._validate(llm={"chains": dict(self._CHAINS, heavy=["gpt-5.6-sol"])})
+        assert any("no known routing prefix" in m and "codex/" in m for m in messages)
+
+    @pytest.mark.parametrize("chain,needle", [
+        ({"max_calls_per_run": 0}, "codex.chain.max_calls_per_run"),
+        ({"max_calls_per_run": "40"}, "codex.chain.max_calls_per_run"),
+        ({"timeout_seconds": -5}, "codex.chain.timeout_seconds"),
+        ({"max_retries": -1}, "codex.chain.max_retries"),
+        ({"max_concurrent_requests": 0}, "codex.chain.max_concurrent_requests"),
+        ({"queue_timeout_seconds": -1}, "codex.chain.queue_timeout_seconds"),
+        ({"max_consecutive_failures": -1}, "codex.chain.max_consecutive_failures"),
+        ({"reasoning_effort": {"light": "tiny"}}, "codex.chain.reasoning_effort.light"),
+        ({"reasoning_effort": {"huge": "low"}}, "codex.chain.reasoning_effort.huge"),
+        ({"reasoning_effort": "low"}, "codex.chain.reasoning_effort"),
+    ])
+    def test_invalid_chain_setting_is_rejected(self, chain, needle):
+        is_valid, messages = self._validate(codex={"chain": chain})
+        assert is_valid is False
+        assert any(needle in m for m in messages)
+
+    def test_chain_block_must_be_a_mapping(self):
+        is_valid, messages = self._validate(codex={"chain": [1]})
+        assert is_valid is False
+        assert any("'codex.chain' must be a dictionary" in m for m in messages)
+
+    def test_rung_that_cannot_finish_in_its_window_is_flagged(self):
+        """queue wait + timeout x attempts must fit llm.rung_timeout_seconds."""
+        is_valid, messages = self._validate(
+            codex={"chain": {"timeout_seconds": 300, "max_retries": 1}},
+            llm={"rung_timeout_seconds": 500},
+        )
+        assert is_valid is True
+        assert any("codex.chain" in m and "rung_timeout_seconds" in m for m in messages)
+
+    def test_defaults_fit_the_shipped_window(self):
+        _, messages = self._validate(llm={"rung_timeout_seconds": 500})
+        assert messages == []
+
+    @pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
+    def test_shipped_configs_raise_nothing_about_codex_or_the_chain(self, config_name):
+        root = Path(__file__).resolve().parent.parent
+        config = yaml.safe_load((root / config_name).read_text())
+
+        is_valid, messages = validate_config(config)
+
+        assert is_valid is True
+        assert not [m for m in messages if "codex" in m.lower() or "llm.chains" in m]
+
+    @pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
+    def test_shipped_configs_share_one_chain_budget(self, config_name):
+        root = Path(__file__).resolve().parent.parent
+        chain = yaml.safe_load((root / config_name).read_text())["codex"]["chain"]
+
+        assert chain == {
+            "max_calls_per_run": 40,
+            "timeout_seconds": 180,
+            "max_retries": 1,
+            "max_concurrent_requests": 3,
+            "queue_timeout_seconds": 120,
+            "max_consecutive_failures": 3,
+            "reasoning_effort": {"heavy": "high", "medium": "medium", "light": "low"},
+        }
+
+    def test_each_pipeline_logs_llm_calls_to_its_own_files(self):
+        """Finance used to append to the local pipeline's call logs."""
+        root = Path(__file__).resolve().parent.parent
+        paths = {"codex": set(), "gemini": set()}
+        for name in ("config.yaml", "config_local.yaml", "config_finance.yaml"):
+            config = yaml.safe_load((root / name).read_text())
+            for block in paths:
+                paths[block].add(config[block]["call_log_path"])
+
+        assert paths["codex"] == {
+            "logs/codex-calls.jsonl",
+            "logs/local-codex-calls.jsonl",
+            "logs/finance-codex-calls.jsonl",
+        }
+        assert len(paths["gemini"]) == 3

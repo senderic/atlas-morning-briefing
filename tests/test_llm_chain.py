@@ -25,37 +25,201 @@ from scripts.llm_chain import (
 )
 
 
-@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
-def test_production_chains_have_no_opencode_go(config_name):
-    """Catches paid OpenCode Go returning to any production routing tier."""
-    config_path = Path(__file__).resolve().parents[1] / config_name
-    config = yaml.safe_load(config_path.read_text())
-    chains = build_model_chains(config)
+PRODUCTION_CONFIGS = ["config.yaml", "config_local.yaml", "config_finance.yaml"]
 
-    for tier in ("heavy", "medium", "light"):
-        assert chains[tier]
-        assert all(not rung.model.startswith("opencode-go/") for rung in chains[tier])
+# Codex first on every tier, sized by weight class; the free HTTP rungs keep
+# their previous relative order behind it.
+PRODUCTION_CHAINS = {
+    "heavy": [
+        "codex/gpt-5.6-sol",
+        "nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b",
+        "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        "openrouter/dots-studio/dots-3-note-preview:free",
+    ],
+    "medium": [
+        "codex/gpt-5.6-terra",
+        "nvidia-direct/nvidia/nemotron-3-super-120b-a12b",
+        "openrouter/dots-studio/dots-3-note-preview:free",
+        "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+        "openrouter/nex-agi/nex-n2.5-pro:free",
+    ],
+    "light": [
+        "codex/gpt-5.6-luna",
+        "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+        "openrouter/cohere/north-mini-code:free",
+        "openrouter/inclusionai/ling-3.0-flash-vl:free",
+    ],
+}
 
-    for tier in ("medium", "light"):
-        assert chains[tier][0].backend == "nvidia"
-        assert all(rung.backend in {"nvidia", "openrouter", "opencode"} for rung in chains[tier])
+
+def _load(config_name):
+    return yaml.safe_load((Path(__file__).resolve().parents[1] / config_name).read_text())
 
 
-@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
-def test_ranker_and_judge_can_run_without_http_provider_credentials(config_name):
-    """Missing NVIDIA and rejected OpenRouter must not strand medium/light."""
+@pytest.mark.parametrize("config_name", PRODUCTION_CONFIGS)
+def test_production_chains_are_codex_first_with_free_http_fallbacks(config_name):
+    """All three pipelines route identically; a blanket change must touch each."""
+    chains = build_model_chains(_load(config_name))
+
+    assert {tier: [r.model for r in rungs] for tier, rungs in chains.items()} == PRODUCTION_CHAINS
+    for tier in TIERS:
+        assert chains[tier][0].backend == "codex"
+        assert all(r.backend in {"nvidia", "openrouter"} for r in chains[tier][1:])
+
+
+@pytest.mark.parametrize("config_name", PRODUCTION_CONFIGS)
+def test_production_configs_route_nothing_to_opencode(config_name):
+    """Catches a free or paid opencode rung returning to any production tier.
+
+    The transport ran `opencode run --auto` over untrusted feed text; it stays
+    in the tree but must be disabled and unreachable.
+    """
+    config = _load(config_name)
+
+    for models in config["llm"]["chains"].values():
+        assert not any(model.startswith(("opencode/", "opencode-go/")) for model in models)
+    assert config["opencode"]["enabled"] is False
+    assert "opencode" not in build_clients(config)
+
+
+@pytest.mark.parametrize("config_name", PRODUCTION_CONFIGS)
+def test_production_configs_build_a_chain_role_codex_client(config_name):
+    config = _load(config_name)
+    client = build_clients(config)["codex"]
+
+    assert type(client).__name__ == "CodexClient"
+    assert client.role == "chain"
+    # Its own budget, well clear of the writer's `codex.max_calls_per_run`.
+    assert client.max_calls == 40 > config["codex"]["max_calls_per_run"]
+    assert client.max_concurrent == 3
+    # Probed like any other rung: subscription-authenticated, not per-token.
+    assert not any(
+        "codex/".startswith(prefix) for prefix in config["llm"].get("preflight_skip") or []
+    )
+
+
+@pytest.mark.parametrize("config_name", PRODUCTION_CONFIGS)
+def test_production_rungs_all_finish_inside_their_window(config_name, caplog, monkeypatch):
+    """CompositeClient's startup check must stay quiet for the shipped chain."""
+    import logging
+
     from scripts.composite_client import CompositeClient
 
-    class FreeCLI:
-        available = True
-        def invoke(self, prompt, model=None, **kwargs):
-            assert model.endswith("-free")
-            return "ranked or judged"
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    config = _load(config_name)
+    with caplog.at_level(logging.WARNING, logger="scripts.composite_client"):
+        client = CompositeClient(
+            build_clients(config), build_model_chains(config), timeout=chain_timeout(config)
+        )
 
-    config = yaml.safe_load((Path(__file__).resolve().parents[1] / config_name).read_text())
-    client = CompositeClient({"opencode": FreeCLI()}, build_model_chains(config))
-    assert client.invoke("rank newsletters", tier="medium") == "ranked or judged"
-    assert client.invoke("summarize papers", tier="light") == "ranked or judged"
+    assert not [r.getMessage() for r in caplog.records if r.name == "scripts.composite_client"]
+    codex = client.clients["codex"]
+    worst = codex.queue_timeout + CompositeClient._worst_case_seconds(codex)
+    assert worst < chain_timeout(config)
+
+
+def test_default_chains_never_route_to_opencode():
+    """A config with no `llm.chains` must not fall back to the free CLI models."""
+    chains = build_model_chains({})
+
+    assert [chains[tier][0].model for tier in TIERS] == [
+        "codex/gpt-5.6-sol", "codex/gpt-5.6-terra", "codex/gpt-5.6-luna",
+    ]
+    for tier in TIERS:
+        assert all(r.backend != "opencode" for r in chains[tier])
+
+
+class TestCodexFallsThrough:
+    """A failing Codex rung must hand the call to the next rung, as any other."""
+
+    class _Next:
+        available = True
+
+        def __init__(self):
+            self.models = []
+
+        def invoke(self, prompt, model=None, **kwargs):
+            self.models.append(model)
+            return "from the fallback rung"
+
+        def get_usage_summary(self, **kwargs):
+            return ""
+
+    def _composite(self, config=None):
+        from scripts.codex_client import CodexClient
+        from scripts.composite_client import CompositeClient
+
+        values = {"enabled": True, "binary": "/opt/codex"}
+        values.update(config or {})
+        nxt = self._Next()
+        composite = CompositeClient(
+            {"codex": CodexClient(values, role="chain"), "nvidia": nxt, "openrouter": nxt},
+            build_model_chains({"llm": {"chains": PRODUCTION_CHAINS}}),
+            timeout=5,
+        )
+        return composite, nxt
+
+    def _failed(self, returncode=1):
+        from unittest.mock import MagicMock
+
+        result = MagicMock()
+        result.stdout, result.stderr, result.returncode = "", "", returncode
+        return result
+
+    def test_nonzero_exit_falls_through_to_the_next_rung(self):
+        from unittest.mock import patch
+
+        composite, nxt = self._composite()
+        with (
+            patch("scripts.codex_client.shutil.which", return_value="/opt/codex"),
+            patch("scripts.codex_client.subprocess.run", return_value=self._failed()),
+        ):
+            assert composite.invoke("rank", tier="medium") == "from the fallback rung"
+
+        assert nxt.models == ["nvidia-direct/nvidia/nemotron-3-super-120b-a12b"]
+        assert "codex/gpt-5.6-terra` did not answer" in composite._render_fallback_note()
+
+    def test_missing_binary_falls_through_without_starting_a_process(self):
+        from unittest.mock import patch
+
+        composite, nxt = self._composite()
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=None),
+            patch("scripts.codex_client.subprocess.run") as run,
+        ):
+            assert composite.invoke("summarize", tier="light") == "from the fallback rung"
+        run.assert_not_called()
+
+    def test_exhausted_budget_falls_through(self):
+        from unittest.mock import MagicMock, patch
+
+        ok = MagicMock()
+        ok.returncode, ok.stderr = 0, ""
+        ok.stdout = (
+            '{"type":"item.completed","item":{"type":"agent_message","text":"from codex"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+        )
+        composite, nxt = self._composite({"chain": {"max_calls_per_run": 1}})
+        with (
+            patch("scripts.codex_client.shutil.which", return_value="/opt/codex"),
+            patch("scripts.codex_client.subprocess.run", return_value=ok) as run,
+        ):
+            assert composite.invoke("a", tier="heavy") == "from codex"
+            assert composite.invoke("b", tier="heavy") == "from the fallback rung"
+        run.assert_called_once()
+
+    def test_every_rung_failing_returns_none_for_the_deterministic_path(self):
+        from unittest.mock import patch
+
+        composite, nxt = self._composite()
+        nxt.invoke = lambda *args, **kwargs: None
+        with (
+            patch("scripts.codex_client.shutil.which", return_value="/opt/codex"),
+            patch("scripts.codex_client.subprocess.run", return_value=self._failed()),
+        ):
+            assert composite.invoke("rank", tier="medium") is None
 
 
 class TestResolveBackend:
@@ -65,6 +229,9 @@ class TestResolveBackend:
         ("opencode/muse-spark-1.3-contributor-free", "opencode"),
         ("opencode-go/deepseek-v4-pro", "opencode"),
         ("gemini/pro", "gemini"),
+        ("codex/gpt-5.6-sol", "codex"),
+        ("codex/gpt-5.6-terra", "codex"),
+        ("codex/gpt-5.6-luna", "codex"),
     ])
     def test_known_prefixes(self, model, backend):
         assert resolve_backend(model) == backend
@@ -77,6 +244,8 @@ class TestResolveBackend:
     def test_unknown_prefix_is_not_guessed(self):
         """Guessing wrong on a paid prefix spends money."""
         assert resolve_backend("mystery/model") is None
+        # A bare Codex model id carries no routing prefix and is not routable.
+        assert resolve_backend("gpt-5.6-sol") is None
         assert resolve_backend("nvidia/nemotron:free") is None
 
 
@@ -137,6 +306,20 @@ class TestBuildClients:
 
         assert set(clients) == {"nvidia"}
         assert type(clients["nvidia"]).__name__ == "NvidiaClient"
+
+    def test_codex_is_built_as_a_chain_transport_when_enabled(self):
+        cfg = {"codex": {"enabled": True, "binary": "/opt/codex", "max_calls_per_run": 5}}
+        clients = build_clients(cfg)
+
+        assert set(clients) == {"codex"}
+        assert type(clients["codex"]).__name__ == "CodexClient"
+        assert clients["codex"].role == "chain"
+        assert clients["codex"].max_calls == 40
+
+    def test_codex_is_not_built_unless_explicitly_enabled(self):
+        assert "codex" not in build_clients({"codex": {"enabled": False}})
+        assert "codex" not in build_clients({"codex": {"binary": "/opt/codex"}})
+        assert "codex" not in build_clients({})
 
     def test_clients_are_keyed_by_backend_name(self):
         cfg = {"openrouter": {"enabled": True, "api_key": "k"},

@@ -1442,3 +1442,52 @@ class TestSourceHealthRulesReachDetectRot:
             **_no_op_layer2(),
         )
         assert seen["rules"]["feed_overrides"]["Karpathy"]["stale_after_days"] == 400
+
+
+@pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml"])
+def test_judge_lands_on_codex_through_the_shared_chain(config_name):
+    """The judge calls tier=medium; with no special-casing that is Codex terra.
+
+    build_llm_client must reach it through scripts.llm_chain like the runner
+    does, as a chain-role client with the chain's own budget.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    from scripts.quality_check import build_llm_client
+
+    root = Path(__file__).resolve().parent.parent
+    config = yaml.safe_load((root / config_name).read_text())
+
+    client = build_llm_client(config)
+
+    assert client.chains["medium"][0].model == "codex/gpt-5.6-terra"
+    assert client.chains["medium"][0].backend == "codex"
+    assert client.clients["codex"].role == "chain"
+    assert "opencode" not in client.clients
+
+
+def test_judge_call_reaches_the_codex_cli_at_medium_effort(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    from scripts.quality_check import build_llm_client
+
+    ok = MagicMock()
+    ok.returncode, ok.stderr = 0, ""
+    ok.stdout = (
+        '{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+    )
+    config = {
+        "codex": {"enabled": True, "binary": "/opt/codex"},
+        "llm": {"chains": {"medium": ["codex/gpt-5.6-terra"]}},
+    }
+    with patch("scripts.codex_client.shutil.which", return_value="/opt/codex"), \
+         patch("scripts.codex_client.subprocess.run", return_value=ok) as run:
+        client = build_llm_client(config)
+        assert client.invoke("judge this", tier="medium", system_prompt="rubric") == "{}"
+
+    cmd = run.call_args.args[0]
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
+    assert 'model_reasoning_effort="medium"' in cmd

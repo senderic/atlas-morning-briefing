@@ -295,3 +295,124 @@ class TestReasoningProbeIsTriState:
         r = self._run(None)
         assert r["reasoning_disabled_ok"] is True
         assert r["reasoning_probe_inconclusive"] is False
+
+
+class TestCodexRungsAreProbed:
+    """Codex is subscription-authenticated: probing it bills nothing, so it is
+    probed like any other rung rather than listed in llm.preflight_skip."""
+
+    _CODEX = {"enabled": True, "binary": "/opt/codex", "call_log_path": None}
+
+    @staticmethod
+    def _completed(stdout, returncode=0):
+        from unittest.mock import MagicMock
+
+        result = MagicMock()
+        result.stdout, result.stderr, result.returncode = stdout, "", returncode
+        return result
+
+    _OK = (
+        '{"type":"item.completed","item":{"type":"agent_message","text":"A briefing."}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":19000,"output_tokens":24}}\n'
+    )
+
+    def test_codex_rungs_are_in_the_matrix_when_enabled(self):
+        config = {
+            "codex": {"enabled": True},
+            "llm": {"chains": {"medium": ["codex/gpt-5.6-terra"]}, "preflight_skip": []},
+        }
+        by_tier = dict(pf.build_test_matrix(config))
+        assert [(r.model, r.backend) for r in by_tier["medium"]] == [
+            ("codex/gpt-5.6-terra", "codex")
+        ]
+
+    def test_codex_rungs_are_dropped_when_the_transport_is_disabled(self):
+        config = {
+            "codex": {"enabled": False},
+            "openrouter": {"enabled": True},
+            "llm": {"chains": {"medium": ["codex/gpt-5.6-terra", "openrouter/m:free"]}},
+        }
+        by_tier = dict(pf.build_test_matrix(config))
+        assert [r.model for r in by_tier["medium"]] == ["openrouter/m:free"]
+
+    @pytest.mark.parametrize("config_name", ["config.yaml", "config_local.yaml", "config_finance.yaml"])
+    def test_shipped_configs_probe_codex_first_on_every_tier(self, config_name):
+        config = pf.load_config(pf.PROJECT_ROOT / config_name)
+        matrix = dict(pf.build_test_matrix(config))
+
+        assert {tier: rungs[0].model for tier, rungs in matrix.items()} == {
+            "heavy": "codex/gpt-5.6-sol",
+            "medium": "codex/gpt-5.6-terra",
+            "light": "codex/gpt-5.6-luna",
+        }
+        assert not any(r.backend == "opencode" for rungs in matrix.values() for r in rungs)
+
+    def test_codex_rung_uses_the_codex_probe_with_its_tier_and_config(self):
+        from scripts.llm_chain import Rung
+
+        seen = {}
+
+        def fake(model, tier="medium", codex_config=None, timeout=None):
+            seen.update(model=model, tier=tier, codex_config=codex_config)
+            return pf._probe_result(True, 1.0)
+
+        rungs = [Rung(model="codex/gpt-5.6-luna", backend="codex")]
+        with patch.object(pf, "test_codex_model", side_effect=fake):
+            result = pf.probe_chain("light", rungs, {"codex": self._CODEX})
+
+        assert result["available"] is True
+        assert result["backend"] == "codex"
+        assert result["model"] == "codex/gpt-5.6-luna"
+        assert seen == {
+            "model": "codex/gpt-5.6-luna", "tier": "light", "codex_config": self._CODEX,
+        }
+
+    def test_probe_runs_the_cli_as_the_chain_would(self):
+        with patch("scripts.codex_client.shutil.which", return_value="/opt/codex"), \
+             patch("scripts.codex_client.subprocess.run",
+                   return_value=self._completed(self._OK)) as run:
+            result = pf.test_codex_model(
+                "codex/gpt-5.6-terra", tier="medium", codex_config=self._CODEX
+            )
+
+        assert result["available"] is True
+        cmd = run.call_args.args[0]
+        assert cmd[0] == "/opt/codex"
+        assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
+        assert 'model_reasoning_effort="medium"' in cmd
+        assert run.call_args.kwargs["timeout"] == pf.CODEX_TEST_TIMEOUT
+        run.assert_called_once()
+
+    def test_failed_probe_is_unavailable_and_not_retried(self):
+        with patch("scripts.codex_client.shutil.which", return_value="/opt/codex"), \
+             patch("scripts.codex_client.subprocess.run",
+                   return_value=self._completed("", returncode=1)) as run:
+            result = pf.test_codex_model("codex/gpt-5.6-sol", tier="heavy",
+                                         codex_config=self._CODEX)
+
+        assert result["available"] is False
+        assert "nonzero_exit" in result["error"]
+        run.assert_called_once()
+
+    def test_missing_binary_is_reported_without_starting_a_process(self):
+        with patch("scripts.codex_client.shutil.which", return_value=None), \
+             patch("scripts.codex_client.subprocess.run") as run:
+            result = pf.test_codex_model("codex/gpt-5.6-sol", codex_config=self._CODEX)
+
+        assert result["available"] is False
+        assert "not found" in result["error"]
+        run.assert_not_called()
+
+    def test_probe_records_are_labelled_in_the_call_log(self, tmp_path):
+        import json
+
+        log_path = tmp_path / "codex-calls.jsonl"
+        config = dict(self._CODEX, call_log_path=str(log_path))
+        with patch("scripts.codex_client.shutil.which", return_value="/opt/codex"), \
+             patch("scripts.codex_client.subprocess.run",
+                   return_value=self._completed(self._OK)):
+            pf.test_codex_model("codex/gpt-5.6-luna", tier="light", codex_config=config)
+
+        record = json.loads(log_path.read_text().strip())
+        assert record["caller"] == "preflight"
+        assert record["tier"] == "light"

@@ -21,11 +21,14 @@ Design rules learned the hard way:
   paid rungs, whose probe would be the only call that ever bills them. Free
   rungs on the same transport are still probed — skipping a whole backend is
   how a free model on a mostly-paid transport went unprobed and unused.
+  Codex rungs are subscription-authenticated, not billed per call, so they
+  are probed like any other.
 * **Report what actually happened.** If the first rung works, say so; only
   claim the chain is dead when every rung failed.
 """
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -45,6 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
+from scripts.codex_client import CodexClient  # noqa: E402
 from scripts.llm_chain import Rung, build_model_chains  # noqa: E402
 from scripts.llm_client import get_model_capabilities  # noqa: E402
 from scripts.openrouter_client import (  # noqa: E402
@@ -63,6 +67,9 @@ TEST_PROMPT = (
     "Reply with the sentence only."
 )
 TEST_TIMEOUT = 45          # seconds per probe
+# Every `codex exec` carries ~20k tokens of CLI harness, so even this trivial
+# prompt takes 12-25s; 45s would mark a merely slow start as dead.
+CODEX_TEST_TIMEOUT = 90
 # Must comfortably exceed the reasoning trace these models emit before content.
 TEST_MAX_TOKENS = 1024
 MAX_WORKERS = 6            # matches the runtime concurrency cap
@@ -119,6 +126,44 @@ def test_opencode_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, An
     if not text.strip():
         err = (result.stderr or "")[:200] or "Empty response"
         return _probe_result(False, elapsed, err)
+    return _probe_result(True, elapsed)
+
+
+def test_codex_model(
+    model: str,
+    tier: str = "medium",
+    codex_config: Optional[Dict[str, Any]] = None,
+    timeout: int = CODEX_TEST_TIMEOUT,
+) -> Dict[str, Any]:
+    """Probe one Codex rung through the CLI, exactly as the chain would call it.
+
+    The executable comes from the pipeline's `codex` block (cron's PATH does
+    not include it), and the probe runs at the tier's own reasoning effort.
+    One attempt, logged to the pipeline's Codex call log as `caller: preflight`.
+    """
+    start = time.monotonic()
+    values = dict(codex_config or {})
+    chain = values.get("chain")
+    values["chain"] = dict(
+        chain if isinstance(chain, dict) else {},
+        timeout_seconds=timeout,
+        max_retries=0,
+        max_calls_per_run=1,
+    )
+    try:
+        client = CodexClient(values, role="chain", caller="preflight")
+        if not client.available:
+            return _probe_result(False, 0, f"Codex CLI not found: {client.executable}")
+        content = client.invoke(TEST_PROMPT, tier=tier, model=model)
+    except Exception as exc:
+        return _probe_result(
+            False,
+            (time.monotonic() - start) * 1000,
+            f"{type(exc).__name__}: {str(exc)[:150]}",
+        )
+    elapsed = (time.monotonic() - start) * 1000
+    if not content or not content.strip():
+        return _probe_result(False, elapsed, f"Codex probe failed: {client.last_error}")
     return _probe_result(True, elapsed)
 
 
@@ -258,16 +303,22 @@ def test_openrouter_model(model: str, timeout: int = TEST_TIMEOUT) -> Dict[str, 
     return result
 
 
-def probe_chain(tier: str, rungs: List[Rung]) -> Dict[str, Any]:
+def probe_chain(
+    tier: str, rungs: List[Rung], config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Probe a tier's chain in order, returning the first rung that answers.
 
     The returned record always names a rung drawn from THIS tier's chain, so a
     preflight result can never move a model between tiers.
     """
     attempts = []
+    codex_config = (config or {}).get("codex")
 
     for idx, rung in enumerate(rungs):
         test_func = {
+            "codex": functools.partial(
+                test_codex_model, tier=tier, codex_config=codex_config
+            ),
             "opencode": test_opencode_model,
             "nvidia": test_nvidia_model,
             "openrouter": test_openrouter_model,
@@ -323,8 +374,8 @@ def build_test_matrix(config: Dict[str, Any]) -> List[Tuple[str, List[Rung]]]:
     skip_prefixes = tuple(llm_config.get("preflight_skip") or ())
     enabled = {
         name
-        for name in ("openrouter", "nvidia", "opencode")
-        if (config.get(name, {}) or {}).get("enabled")
+        for name in ("codex", "openrouter", "nvidia", "opencode")
+        if isinstance(config.get(name), dict) and config[name].get("enabled")
     }
 
     matrix: List[Tuple[str, List[Rung]]] = []
@@ -380,7 +431,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(probe_chain, tier, rungs): tier for tier, rungs in matrix
+            executor.submit(probe_chain, tier, rungs, config): tier
+            for tier, rungs in matrix
         }
         for future in as_completed(futures):
             tier = futures[future]

@@ -65,6 +65,74 @@ def _validate_interest_graph(
         _validate_node(root, f"interest_graph.roots[{i}]")
 
 
+def _validate_codex_chain(
+    chain: Any,
+    llm: Any,
+    supported_reasoning: set,
+    errors: List[str],
+    warnings: List[str],
+) -> None:
+    """Validate `codex.chain`, the settings behind `codex/` rungs in llm.chains.
+
+    Every key is optional; the defaults mirror CodexClient's.
+    """
+    if chain is None:
+        chain = {}
+    if not isinstance(chain, dict):
+        errors.append("'codex.chain' must be a dictionary")
+        return
+
+    def _number(key: str, default: float, positive: bool, integer: bool) -> float:
+        value = chain.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int if integer else (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (positive and value == 0)
+        ):
+            errors.append(
+                f"'codex.chain.{key}' must be a "
+                f"{'positive' if positive else 'non-negative'} "
+                f"{'integer' if integer else 'finite number'}"
+            )
+            return default
+        return value
+
+    _number("max_calls_per_run", 40, positive=True, integer=True)
+    _number("max_concurrent_requests", 3, positive=True, integer=True)
+    _number("max_consecutive_failures", 3, positive=False, integer=True)
+    timeout = _number("timeout_seconds", 180, positive=True, integer=False)
+    retries = _number("max_retries", 1, positive=False, integer=True)
+    queue = _number("queue_timeout_seconds", 120, positive=False, integer=False)
+
+    efforts = chain.get("reasoning_effort")
+    if efforts is not None:
+        if not isinstance(efforts, dict):
+            errors.append(
+                "'codex.chain.reasoning_effort' must map a tier "
+                "(heavy, medium, light) to an effort"
+            )
+        else:
+            for tier, effort in efforts.items():
+                if tier not in ("heavy", "medium", "light") or effort not in supported_reasoning:
+                    errors.append(
+                        f"'codex.chain.reasoning_effort.{tier}' must set a tier "
+                        "(heavy, medium, light) to one of "
+                        f"{sorted(supported_reasoning)}"
+                    )
+
+    # A rung that overruns its window is cut off on every slow call.
+    window = llm.get("rung_timeout_seconds") if isinstance(llm, dict) else None
+    worst = queue + timeout * (1 + retries)
+    if isinstance(window, (int, float)) and not isinstance(window, bool) and worst > window:
+        warnings.append(
+            f"codex.chain needs up to {worst:.0f}s per rung (queue_timeout_seconds "
+            "+ timeout_seconds x (1 + max_retries)) but llm.rung_timeout_seconds "
+            f"is {window:.0f}s — a slow Codex call will be cut off mid-retry"
+        )
+
+
 def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
     Validate configuration dictionary.
@@ -211,7 +279,7 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     "on PATH — install opencode or set 'opencode.enabled: false'"
                 )
 
-    # --- Codex report-writer config ---
+    # --- Codex config (report writer + `codex/` chain rungs) ---
     codex = config.get("codex")
     if codex is not None:
         if not isinstance(codex, dict):
@@ -255,6 +323,11 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     "'codex.reasoning_effort' must be one of "
                     f"{sorted(supported_reasoning)}"
                 )
+
+            _validate_codex_chain(
+                codex.get("chain"), config.get("llm"), supported_reasoning,
+                errors, warnings,
+            )
     # --- LLM model chains ---
     # The chain is the roster now: a typo here is not a tier that falls back,
     # it is a rung that silently never runs.
@@ -271,8 +344,8 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
                 enabled_backends = {
                     name
-                    for name in ("openrouter", "nvidia", "opencode", "gemini")
-                    if (config.get(name, {}) or {}).get("enabled")
+                    for name in ("codex", "openrouter", "nvidia", "opencode", "gemini")
+                    if isinstance(config.get(name), dict) and config[name].get("enabled")
                 }
                 for tier, models in chains.items():
                     if tier not in TIERS:
@@ -289,8 +362,8 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                         if backend is None:
                             errors.append(
                                 f"llm.chains.{tier}: {model!r} has no known routing "
-                                "prefix (expected openrouter/, nvidia-direct/, "
-                                "opencode/, opencode-go/ or gemini/)"
+                                "prefix (expected codex/, openrouter/, "
+                                "nvidia-direct/, opencode/, opencode-go/ or gemini/)"
                             )
                         elif backend not in enabled_backends:
                             warnings.append(

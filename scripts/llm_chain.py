@@ -8,9 +8,9 @@ that can reach a given model, inferred from the model's routing prefix, so a
 tier's order is free to interleave them:
 
     heavy:
-      - opencode/muse-spark-1.3-contributor-free          # free, via the CLI
+      - codex/gpt-5.6-sol                                 # subscription CLI
+      - nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b   # free, via HTTP
       - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free # free, via HTTP
-      - opencode-go/deepseek-v4-pro                       # paid, last
 
 This replaces the older backend-ordered scheme (`llm.backend_priority` plus a
 per-backend `models:`/`fallback_models:` roster). That shape made a model's rung
@@ -20,8 +20,11 @@ model on the free backend's transport had failed. `opencode/muse-spark-*` was
 configured as a free heavy primary and served zero calls for exactly that
 reason.
 
-Order is still cost — free rungs first, paid ones last — but that is now a
-property of how the chain is written, not of which backend a model lives on.
+Order is a property of how the chain is written, not of which backend a model
+lives on. Today that order is Codex first on every tier (subscription-
+authenticated, sized by weight class: sol > terra > luna), with the free HTTP
+rungs behind it as fallback. The opencode transport is disabled and no chain
+routes to it.
 """
 
 import logging
@@ -36,9 +39,10 @@ TIERS = ("heavy", "medium", "light")
 
 # Routing prefix -> backend name. Longest prefix wins, so `opencode-go/` is
 # matched before `opencode/`. The prefix is part of the slug the backend
-# receives (`opencode run -m opencode-go/deepseek-v4-pro`); only OpenRouter
-# strips its own, in OpenRouterClient._to_api_model.
+# receives (`opencode run -m opencode-go/deepseek-v4-pro`); OpenRouter, NVIDIA
+# and Codex strip their own (`_to_api_model` / `_to_cli_model`).
 BACKEND_PREFIXES = {
+    "codex/": "codex",
     "openrouter/": "openrouter",
     "nvidia-direct/": "nvidia",
     "opencode-go/": "opencode",
@@ -46,17 +50,20 @@ BACKEND_PREFIXES = {
     "gemini/": "gemini",
 }
 
+# Used for any tier a config leaves out of `llm.chains`. No opencode rung: a
+# config with no chain must not quietly route to the free CLI models.
 DEFAULT_CHAINS: Dict[str, List[str]] = {
     "heavy": [
+        "codex/gpt-5.6-sol",
         "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
         "openrouter/dots-studio/dots-3-note-preview:free",
     ],
     "medium": [
-        "opencode/nemotron-3.5-lightning-free",
+        "codex/gpt-5.6-terra",
         "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     ],
     "light": [
-        "opencode/ling-3.1-flash-free",
+        "codex/gpt-5.6-luna",
         "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     ],
 }
@@ -132,6 +139,14 @@ def build_clients(
     openrouter_config = config.get("openrouter", {}) or {}
     nvidia_config = config.get("nvidia", {}) or {}
     opencode_config = config.get("opencode", {}) or {}
+    codex_config = config.get("codex", {})
+    codex_config = codex_config if isinstance(codex_config, dict) else {}
+
+    def _codex():
+        # The chain's own instance: its budget, timeout and concurrency cap
+        # come from `codex.chain`, separate from the report writer's client.
+        from scripts.codex_client import CodexClient
+        return CodexClient(codex_config, role="chain")
 
     def _openrouter():
         from scripts.openrouter_client import OpenRouterClient
@@ -150,12 +165,14 @@ def build_clients(
         return OpencodeClient(opencode_config)
 
     builders = {
+        "codex": _codex,
         "openrouter": _openrouter,
         "nvidia": _nvidia,
         "gemini": _gemini,
         "opencode": _opencode,
     }
     enabled = {
+        "codex": bool(codex_config.get("enabled")),
         "openrouter": bool(openrouter_config.get("enabled")),
         "nvidia": bool(nvidia_config.get("enabled")),
         "gemini": bool(gemini_config.get("enabled")),

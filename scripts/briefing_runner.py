@@ -208,9 +208,9 @@ class BriefingRunner:
         gemini_config = config.get("gemini", config.get("bedrock", {}))
 
         # Chain construction lives in scripts.llm_chain so the briefing runner
-        # and the quality checker cannot drift on model ordering. Order is
-        # cost: free rungs first, any paid one last — a property of how
-        # llm.chains is written, not of which backend hosts a model.
+        # and the quality checker cannot drift on model ordering. Order is a
+        # property of how llm.chains is written, not of which backend hosts a
+        # model: Codex first on every tier, free HTTP rungs as fallback.
         from scripts.composite_client import CompositeClient
         from scripts.llm_chain import (
             apply_pins,
@@ -230,6 +230,9 @@ class BriefingRunner:
             self.llm_client = CompositeClient(
                 clients, chains, timeout=chain_timeout(config)
             )
+        # The writer's own Codex client. The chain's `codex/` rungs are served
+        # by a separate chain-role instance from build_clients(), so analysis
+        # calls and report prose never draw on the same budget.
         codex_config = config.get("codex", {})
         self.codex_client = CodexClient(
             codex_config if isinstance(codex_config, dict) else {}

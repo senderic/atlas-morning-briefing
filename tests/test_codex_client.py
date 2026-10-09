@@ -315,3 +315,460 @@ def test_usage_summary_uses_singular_call_label():
     client.usage_stats["calls"] = 1
 
     assert "**1 call**," in client.get_usage_summary()
+
+
+# ---------------------------------------------------------------------------
+# Chain role: Codex as a rung of llm.chains
+# ---------------------------------------------------------------------------
+
+
+def make_chain_client(**config):
+    values = {"enabled": True, "executable": CODEX}
+    values.update(config)
+    return CodexClient(values, role="chain")
+
+
+def failed_jsonl(message):
+    """The stream `codex exec` writes (to stdout, exit 1) when the API refuses."""
+    return "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t1"}),
+            json.dumps({"type": "error", "message": message}),
+            json.dumps({"type": "turn.failed", "error": {"message": message}}),
+        ]
+    ) + "\n"
+
+
+UNSUPPORTED_MODEL = json.dumps(
+    {
+        "type": "error",
+        "status": 400,
+        "error": {"type": "invalid_request_error", "message": "model is not supported"},
+    }
+)
+
+
+def model_and_effort(run_call):
+    cmd = run_call.args[0]
+    return cmd[cmd.index("-m") + 1], cmd[cmd.index("-c") + 1]
+
+
+class TestChainModelSelection:
+    def test_routing_prefix_is_stripped_before_the_cli(self):
+        """`-m codex/gpt-5.6-terra` is not a model the CLI knows."""
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())) as run,
+        ):
+            client = make_chain_client()
+            assert client.invoke("p", tier="medium", model="codex/gpt-5.6-terra") == "A useful report."
+
+        cmd = run.call_args.args[0]
+        assert cmd[cmd.index("-m") + 1] == "gpt-5.6-terra"
+        assert not any("codex/" in part for part in cmd[1:])
+
+    def test_serves_exactly_the_model_it_is_handed(self):
+        """A backend that substituted its own model would jump the chain's queue."""
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())) as run,
+        ):
+            client = make_chain_client(model="gpt-5.6-sol")
+            client.invoke("p", tier="light", model="codex/gpt-5.6-luna")
+            client.invoke("p", tier="heavy", model="codex/gpt-5.6-luna")
+
+        assert [model_and_effort(c)[0] for c in run.call_args_list] == [
+            "gpt-5.6-luna", "gpt-5.6-luna",
+        ]
+
+    def test_a_failed_model_is_not_replaced_by_another(self):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(failed_jsonl(UNSUPPORTED_MODEL), returncode=1),
+            ) as run,
+        ):
+            client = make_chain_client()
+            assert client.invoke("p", tier="medium", model="codex/gpt-5.6-terra") is None
+
+        assert {model_and_effort(c)[0] for c in run.call_args_list} == {"gpt-5.6-terra"}
+
+
+class TestChainReasoningEffort:
+    def _efforts(self, client, tiers, **kwargs):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())) as run,
+        ):
+            for tier in tiers:
+                client.invoke("p", tier=tier, model="codex/gpt-5.6-sol", **kwargs)
+        return [model_and_effort(c)[1] for c in run.call_args_list]
+
+    def test_effort_scales_with_the_tier_by_default(self):
+        assert self._efforts(make_chain_client(), ["light", "medium", "heavy"]) == [
+            'model_reasoning_effort="low"',
+            'model_reasoning_effort="medium"',
+            'model_reasoning_effort="high"',
+        ]
+
+    def test_writer_effort_does_not_leak_into_the_chain(self):
+        """codex.reasoning_effort is the writer's; the chain has its own map."""
+        client = make_chain_client(reasoning_effort="xhigh")
+        assert self._efforts(client, ["light"]) == ['model_reasoning_effort="low"']
+
+    def test_per_tier_effort_is_configurable(self):
+        client = make_chain_client(chain={"reasoning_effort": {"light": "medium"}})
+        assert self._efforts(client, ["light", "heavy"]) == [
+            'model_reasoning_effort="medium"',
+            'model_reasoning_effort="high"',
+        ]
+
+    def test_reasoning_disabled_drops_to_the_registered_floor(self):
+        """Codex cannot switch reasoning off; the registry names the lowest effort."""
+        efforts = self._efforts(make_chain_client(), ["heavy"], reasoning_enabled=False)
+        assert efforts == ['model_reasoning_effort="low"']
+
+    def test_writer_keeps_its_single_effort_whatever_the_tier(self):
+        client = make_client(reasoning_effort="high")
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())) as run,
+        ):
+            client.invoke("p", tier="light")
+            client.invoke("p", tier="medium", reasoning_enabled=False)
+        assert [model_and_effort(c) for c in run.call_args_list] == [
+            ("gpt-5.6-sol", 'model_reasoning_effort="high"'),
+            ("gpt-5.6-sol", 'model_reasoning_effort="high"'),
+        ]
+
+
+class TestChainBudget:
+    def test_chain_budget_is_separate_from_the_writer_budget(self):
+        """The writer's 5 calls must not be the chain's ceiling, or vice versa."""
+        config = {
+            "enabled": True,
+            "executable": CODEX,
+            "max_calls_per_run": 1,
+            "chain": {"max_calls_per_run": 3},
+        }
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())) as run,
+        ):
+            writer = CodexClient(config)
+            chain = CodexClient(config, role="chain")
+            results = [chain.invoke("p", model="codex/gpt-5.6-luna") for _ in range(4)]
+            assert results == ["A useful report."] * 3 + [None]
+            # Draining the chain budget leaves the writer's untouched.
+            assert writer.invoke("prose") == "A useful report."
+            assert writer.invoke("prose") is None
+        assert run.call_count == 4
+
+    def test_defaults(self):
+        chain = make_chain_client()
+        assert chain.max_calls == 40
+        assert make_client().max_calls == 5
+
+    def test_writer_settings_are_untouched_by_a_chain_block(self):
+        writer = make_client(
+            timeout_seconds=300,
+            max_calls_per_run=5,
+            chain={"timeout_seconds": 60, "max_calls_per_run": 9, "max_retries": 4},
+        )
+        assert (writer.timeout, writer.max_calls, writer.max_retries) == (300, 5, 0)
+
+
+class TestChainRetries:
+    def test_transient_failure_is_retried_on_the_same_model(self):
+        responses = [subprocess.TimeoutExpired([CODEX], 3), completed(success_jsonl())]
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", side_effect=responses) as run,
+            patch("scripts.codex_client.time.sleep"),
+        ):
+            client = make_chain_client()
+            assert client.invoke("p", model="codex/gpt-5.6-terra") == "A useful report."
+        assert run.call_count == 2
+        assert client.usage_stats["calls"] == 2
+        assert client.usage_stats["failures"] == 1
+
+    def test_retries_are_bounded(self):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                side_effect=subprocess.TimeoutExpired([CODEX], 3),
+            ) as run,
+            patch("scripts.codex_client.time.sleep"),
+        ):
+            client = make_chain_client(chain={"max_retries": 1})
+            assert client.invoke("p", model="codex/gpt-5.6-terra") is None
+        assert run.call_count == 2
+
+    def test_non_recoverable_error_fails_the_rung_without_a_retry(self):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(failed_jsonl(UNSUPPORTED_MODEL), returncode=1),
+            ) as run,
+            patch("scripts.codex_client.time.sleep") as sleep,
+        ):
+            assert make_chain_client().invoke("p", model="codex/nope") is None
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_writer_never_retries(self):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                side_effect=subprocess.TimeoutExpired([CODEX], 3),
+            ) as run,
+        ):
+            assert make_client().invoke("p") is None
+        run.assert_called_once()
+
+    def test_worst_case_fits_the_rung_window(self):
+        """CompositeClient reads `_timeout` and `max_retries` for its startup check."""
+        from scripts.composite_client import CompositeClient
+
+        client = make_chain_client()
+        assert CompositeClient._worst_case_seconds(client) == 360
+        assert client.queue_timeout + 360 < 500
+
+
+class TestChainOutage:
+    def test_repeated_failures_take_the_transport_out_of_the_run(self):
+        """A dead Codex must cost a few timeouts, not one per remaining call."""
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed("", returncode=1, stderr="boom"),
+            ) as run,
+        ):
+            client = make_chain_client(chain={"max_consecutive_failures": 2})
+            assert client.available is True
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+            assert client.available is True
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+            assert client.available is False
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+        assert run.call_count == 2
+
+    def test_a_success_resets_the_failure_streak(self):
+        responses = [
+            completed("", returncode=1),
+            completed(success_jsonl()),
+            completed("", returncode=1),
+        ]
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", side_effect=responses),
+        ):
+            client = make_chain_client(chain={"max_consecutive_failures": 2})
+            for _ in responses:
+                client.invoke("p", model="codex/gpt-5.6-luna")
+            assert client.available is True
+
+    def test_missing_binary_and_exhausted_budget_fail_quietly(self):
+        with patch("scripts.codex_client.shutil.which", return_value=None):
+            assert make_chain_client().invoke("p", model="codex/gpt-5.6-luna") is None
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())),
+        ):
+            client = make_chain_client(chain={"max_calls_per_run": 1})
+            client.invoke("p", model="codex/gpt-5.6-luna")
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+            # Running out of budget is not an outage.
+            assert client.available is True
+
+
+class TestChainConcurrency:
+    def test_parallel_calls_are_capped_and_counted_exactly(self, tmp_path):
+        import threading
+        import time as real_time
+
+        log_path = tmp_path / "calls.jsonl"
+        state = {"now": 0, "peak": 0}
+        guard = threading.Lock()
+
+        def fake_run(*args, **kwargs):
+            with guard:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            real_time.sleep(0.05)
+            with guard:
+                state["now"] -= 1
+            return completed(success_jsonl())
+
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", side_effect=fake_run),
+        ):
+            client = make_chain_client(
+                call_log_path=str(log_path),
+                chain={"max_concurrent_requests": 3, "max_calls_per_run": 12},
+            )
+            assert client.available
+            threads = [
+                threading.Thread(
+                    target=client.invoke, args=("p",),
+                    kwargs={"tier": "light", "model": "codex/gpt-5.6-luna"},
+                )
+                for _ in range(12)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            # The budget was 12 and 12 ran: a 13th must be refused.
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+
+        assert state["peak"] <= 3
+        assert client.usage_stats["calls"] == 12
+        assert client.usage_stats["input_tokens"] == 12 * 101
+        records = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert len(records) == 12
+
+    def test_default_cap_is_three(self):
+        assert make_chain_client().max_concurrent == 3
+
+    def test_a_call_that_cannot_get_a_slot_gives_up_without_spending_budget(self):
+        import threading
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocking_run(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return completed(success_jsonl())
+
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", side_effect=blocking_run) as run,
+        ):
+            client = make_chain_client(
+                chain={"max_concurrent_requests": 1, "queue_timeout_seconds": 0.05}
+            )
+            holder = threading.Thread(
+                target=client.invoke, args=("p",), kwargs={"model": "codex/gpt-5.6-luna"}
+            )
+            holder.start()
+            assert started.wait(5)
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+            release.set()
+            holder.join()
+
+        assert run.call_count == 1
+        assert client.usage_stats["calls"] == 1
+
+
+class TestChainCallLog:
+    def test_chain_and_writer_records_are_distinguishable(self, tmp_path):
+        log_path = tmp_path / "calls.jsonl"
+        config = {"enabled": True, "executable": CODEX, "call_log_path": str(log_path)}
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())),
+        ):
+            CodexClient(config).invoke("prose", tier="heavy")
+            CodexClient(config, role="chain").invoke(
+                "rank", tier="medium", model="codex/gpt-5.6-terra"
+            )
+
+        writer, chain = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert writer["caller"] == "writer"
+        assert writer["model"] == "gpt-5.6-sol"
+        assert chain["caller"] == "chain"
+        assert chain["tier"] == "medium"
+        assert chain["model"] == "gpt-5.6-terra"
+        assert chain["reasoning_effort"] == "medium"
+
+    def test_error_text_from_the_cli_is_never_logged(self, tmp_path):
+        log_path = tmp_path / "calls.jsonl"
+        hostile = json.dumps({"status": 400, "error": {"message": "secret-feed-text"}})
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(failed_jsonl(hostile), returncode=1),
+            ),
+        ):
+            client = make_chain_client(call_log_path=str(log_path))
+            assert client.invoke("p", model="codex/gpt-5.6-luna") is None
+
+        record = json.loads(log_path.read_text().strip())
+        assert record["error_category"] == "nonzero_exit"
+        assert record["http_status"] == 400
+        assert "secret-feed-text" not in log_path.read_text()
+
+
+class TestPerModelPricing:
+    def _served(self, client, *models):
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(success_jsonl(**usage)),
+            ),
+        ):
+            for model in models:
+                client.invoke("p", model=model)
+        return client.get_usage_summary()
+
+    def test_unpriced_model_is_reported_as_unknown_not_at_sol_rates(self):
+        summary = self._served(make_chain_client(), "codex/gpt-5.6-sol", "codex/gpt-5.6-terra")
+        rows = {line.split("|")[1].strip(): line for line in summary.splitlines() if line.startswith("| `")}
+        assert "$2.000000" in rows["`gpt-5.6-sol`"]
+        assert "unknown" in rows["`gpt-5.6-terra`"]
+        assert "$" not in rows["`gpt-5.6-terra`"]
+
+    def test_rates_come_from_config_per_model(self):
+        client = make_chain_client(
+            pricing={"gpt-5.6-terra": {"input_per_million": 0.5, "output_per_million": 3.0}}
+        )
+        assert "$0.500000" in self._served(client, "codex/gpt-5.6-terra")
+
+    def test_legacy_flat_rates_apply_to_the_configured_model_only(self):
+        client = make_chain_client(
+            model="gpt-5.6-sol",
+            pricing={"input_per_million": 4.0, "cached_input_per_million": 0.4, "output_per_million": 9.0},
+        )
+        summary = self._served(client, "codex/gpt-5.6-sol", "codex/gpt-5.6-luna")
+        assert "$4.000000" in summary
+        assert summary.count("unknown") >= 1
+
+    def test_a_model_can_be_explicitly_unpriced(self):
+        client = make_chain_client(pricing={"gpt-5.6-sol": None})
+        assert "$" not in self._served(client, "codex/gpt-5.6-sol").split("|\n")[-2]
+
+
+class TestChainUsageSummary:
+    def test_silent_when_the_chain_made_no_codex_calls(self):
+        assert make_chain_client().get_usage_summary() == ""
+
+    def test_is_not_presented_as_a_charge(self):
+        client = make_chain_client()
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(success_jsonl())),
+        ):
+            client.invoke("p", tier="light", model="codex/gpt-5.6-luna")
+        summary = client.get_usage_summary()
+        assert "## Codex Chain Usage Summary" in summary
+        assert "subscription" in summary
+        assert "API-equivalent" in summary
+        assert "billed" not in summary.lower().replace("not billed", "")
+        assert "⚠" not in summary
+
+    def test_heading_is_recognised_as_a_usage_appendix(self):
+        """report_invariants skips degraded-content checks under these headings."""
+        from scripts.report_invariants import _is_usage_appendix_heading
+
+        assert _is_usage_appendix_heading("Codex Chain Usage Summary")

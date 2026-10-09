@@ -1,7 +1,7 @@
 # Model Capability Registry
 # Defines reasoning control capabilities for each model.
-# Used by OpencodeClient and OpenRouterClient to apply reasoning control
-# without hardcoding model-specific logic.
+# Used by OpencodeClient, OpenRouterClient and CodexClient to apply reasoning
+# control without hardcoding model-specific logic.
 #
 # OpenRouter note: the only parameter that ACTUALLY suppresses reasoning tokens
 # is `reasoning: {enabled: false}`. `reasoning_effort: minimal` is accepted but
@@ -13,7 +13,36 @@
 # supports_reasoning_control: false so the client never sends the parameter.
 
 model_capabilities:
-  # ===== opencode models =====
+  # ===== Codex CLI models (first rung of every tier) =====
+  # Reasoning is governed by one setting, `-c model_reasoning_effort=<effort>`,
+  # which CodexClient sets per call from `codex.chain.reasoning_effort`
+  # (light=low, medium=medium, heavy=high). It cannot be switched off, so a
+  # reasoning-disabled call uses `reasoning_disabled_effort`, the lowest effort
+  # this pipeline uses. The CLI returns only the final agent message, so there
+  # is no chain-of-thought to leak into the response.
+  # All three answered under `codex exec` with these flags on 2026-10-08.
+  codex/gpt-5.6-sol:
+    supports_reasoning_control: true
+    reasoning_control_method: "effort_flag"
+    reasoning_disabled_effort: "low"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  codex/gpt-5.6-terra:
+    supports_reasoning_control: true
+    reasoning_control_method: "effort_flag"
+    reasoning_disabled_effort: "low"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  codex/gpt-5.6-luna:
+    supports_reasoning_control: true
+    reasoning_control_method: "effort_flag"
+    reasoning_disabled_effort: "low"
+    known_cot_leakage: false
+    non_reasoning_variant: null
+
+  # ===== opencode models (transport disabled; kept for reference) =====
   opencode/nemotron-3-ultra-free:
     supports_reasoning_control: true
     reasoning_control_method: "cli_flag"

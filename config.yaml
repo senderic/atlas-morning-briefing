@@ -485,29 +485,62 @@ gemini:
     medium: "flash"
     light: "flash-lite"
 
-# Codex writes only reader-facing report prose; analysis remains on the LLM chain.
+# Codex CLI — a TRANSPORT with two roles, each with its own client and budget:
+#   * the report writer (reader-facing prose): the top-level keys below;
+#   * the first rung of every tier in llm.chains (`codex/<model>`): `chain:`.
+# Authenticated by the CLI's own subscription login, not an API key.
 codex:
   enabled: true
   binary: "/home/eric/.local/bin/codex"
+  # --- report writer ---
   model: "gpt-5.6-sol"
   reasoning_effort: "high"
   timeout_seconds: 300
   max_calls_per_run: 5
+  # --- chain rungs (analysis: ranking, filtering, summaries, the judge) ---
+  chain:
+    # Separate from the writer's 5 so analysis cannot starve the prose. A main
+    # run makes ~14 chain calls and each attempt spends one unit; 40 covers a
+    # run in which every call needed its retry.
+    max_calls_per_run: 40
+    # TIMEOUT BUDGET — one model, not a chain. Worst case for a rung is
+    # queue_timeout + timeout x (1 + max_retries) + backoff = 120 + 360 + 2
+    # = 482s, inside llm.rung_timeout_seconds (500). Every call carries ~20k
+    # tokens of CLI harness; trivial prompts return in 12-25s, prose in 13-54s.
+    timeout_seconds: 180
+    max_retries: 1
+    # Simultaneous `codex exec` processes. The runner fans out up to 4 calls
+    # at once; a call that cannot get a slot within queue_timeout_seconds
+    # fails its rung without spending budget.
+    max_concurrent_requests: 3
+    queue_timeout_seconds: 120
+    # After this many failed calls in a row the chain stops trying Codex for
+    # the rest of the run, so an outage costs a few timeouts, not one per call.
+    max_consecutive_failures: 3
+    # Reasoning effort per tier (the writer keeps `reasoning_effort` above).
+    reasoning_effort:
+      heavy: "high"
+      medium: "medium"
+      light: "low"
+  # One JSONL line per attempt, writer and chain alike; `caller` ("writer" /
+  # "chain" / "preflight") and `tier` tell them apart.
   call_log_path: "logs/codex-calls.jsonl"
-  # API-equivalent estimate shown in the footer. Codex CLI uses subscription
-  # authentication, so this is informational rather than a billed API charge.
+  # API-equivalent estimate shown in the footer, PER MODEL. Codex CLI uses
+  # subscription authentication, so this is informational rather than a billed
+  # API charge. A model with no entry is reported as "unknown" — terra and
+  # luna rates are not known; add them here rather than borrowing sol's.
   pricing:
-    input_per_million: 2.0
-    cached_input_per_million: 0.2
-    output_per_million: 10.0
+    gpt-5.6-sol:
+      input_per_million: 2.0
+      cached_input_per_million: 0.2
+      output_per_million: 10.0
 
-# OpenCode CLI backend. Requires the `opencode` binary on PATH.
-# A TRANSPORT, not a tier: inference runs as `opencode run -m <model>`, and
-# which of its models serve which tier is decided by llm.chains below. Both
-# Only free `opencode/*` Zen contributor models are used by this pipeline;
-# OpenCode Go subscription models are intentionally excluded from all chains.
+# OpenCode CLI backend — DISABLED, and no rung in llm.chains routes to it.
+# Its free models were slow and unreliable (the medium one timed out on ~80%
+# of calls), and the transport runs `opencode run --auto` over untrusted feed
+# text. The client code stays; do not re-enable without revisiting both.
 opencode:
-  enabled: true
+  enabled: false
   # A call cap prevents a failed transport from consuming the entire run.
   max_calls_per_run: 20
   # TIMEOUT BUDGET — one model, not a chain. Worst case is
@@ -523,13 +556,13 @@ opencode:
 
 # THE fallback chain. Each tier is an ordered list of MODELS, tried front to
 # back; the backend that serves a rung is inferred from its routing prefix
-# (`openrouter/`, `opencode/`, `gemini/`).
+# (`codex/`, `nvidia-direct/`, `openrouter/`, `gemini/`).
 #
-# Every configured rung is free. Because the chain orders models rather than
-# backends, a free model on the opencode transport can sit
-# ahead of a free model on OpenRouter's — which the old backend_priority shape
-# could not express, and which is why `opencode/muse-spark-*` sat configured as
-# a heavy primary while serving zero calls.
+# Codex first on every tier, sized by weight class (sol > terra > luna); the
+# free HTTP rungs behind it are fallbacks, in their previous relative order.
+# Because the chain orders models rather than backends, that is expressed by
+# position alone. Identical in config.yaml, config_local.yaml and
+# config_finance.yaml — a routing change must touch all three.
 #
 # Two rules to keep: tiers stay distinct and monotonic (heavy > medium > light
 # in size and context window), and within a tier a rung may only degrade DOWN a
@@ -537,28 +570,30 @@ opencode:
 llm:
   chains:
     heavy:
-      - "opencode/muse-spark-1.3-contributor-free"          # free (Zen contributor)
+      - "codex/gpt-5.6-sol"                                 # Codex CLI (subscription)
       - "nvidia-direct/nvidia/nemotron-3-ultra-550b-a55b"   # free NVIDIA NIM
       - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # free, 550B / 1M ctx
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
     medium:
+      - "codex/gpt-5.6-terra"                               # Codex CLI (subscription)
       - "nvidia-direct/nvidia/nemotron-3-super-120b-a12b"   # free NVIDIA NIM
-      - "opencode/nemotron-3.5-lightning-free"             # free CLI; independent of HTTP credentials
       - "openrouter/dots-studio/dots-3-note-preview:free"   # free, 512k ctx
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, degrade to light
       - "openrouter/nex-agi/nex-n2.5-pro:free"              # free, 262k ctx
     light:
+      - "codex/gpt-5.6-luna"                                # Codex CLI (subscription)
       - "nvidia-direct/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" # free NVIDIA NIM
-      - "opencode/ling-3.1-flash-free"                     # free CLI
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free" # free, 120B-A12B / 262k
       - "openrouter/cohere/north-mini-code:free"            # free, 256k ctx
       - "openrouter/inclusionai/ling-3.0-flash-vl:free"     # free, 262k ctx
   # Per-RUNG window. Each rung is one model, so this only has to cover that
-  # model's own timeout x (1 + retries) — 150s for both transports today.
+  # model's own worst case: 482s for Codex (see codex.chain), 150s for the
+  # two HTTP transports (timeout x (1 + retries)).
   # The old per-backend window had to cover a whole internal chain, and a
   # backend that overran it was cut off mid-chain on every call.
   rung_timeout_seconds: 500
-  # Every configured rung is free, so preflight may probe any of them.
+  # No rung is billed per call (Codex is subscription-authenticated, the HTTP
+  # rungs are free), so preflight may probe any of them.
   preflight_skip: []
 
 # NVIDIA-hosted NIM API, used directly so medium/light calls do not depend on
@@ -577,7 +612,7 @@ nvidia:
     input_per_million: 0.0
     output_per_million: 0.0
 
-# OpenRouter configuration (OpenAI-compatible API) — the PRIMARY backend.
+# OpenRouter configuration (OpenAI-compatible API) — free fallback rungs behind Codex.
 # Requires an API key: OPENROUTER_API_KEY or OPENAI_API_KEY (pointing at
 # OpenRouter) in the environment.
 openrouter:

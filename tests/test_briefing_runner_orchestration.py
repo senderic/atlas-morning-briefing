@@ -80,6 +80,57 @@ class TestRunOrchestration:
 
         subprocess_run.assert_not_called()
 
+    def test_chain_and_writer_get_separate_codex_clients(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Catches analysis traffic and report prose sharing one call budget."""
+        monkeypatch.chdir(tmp_path)
+        base_config["codex"] = {
+            "enabled": True,
+            "binary": "/opt/codex",
+            "max_calls_per_run": 5,
+            "chain": {"max_calls_per_run": 40},
+        }
+        base_config["llm"] = {"chains": {
+            "heavy": ["codex/gpt-5.6-sol"],
+            "medium": ["codex/gpt-5.6-terra"],
+            "light": ["codex/gpt-5.6-luna"],
+        }}
+        runner = BriefingRunner(base_config, dry_run=True)
+
+        chain_client = runner.llm_client.clients["codex"]
+        assert chain_client is not runner.codex_client
+        assert (chain_client.role, chain_client.max_calls) == ("chain", 40)
+        assert (runner.codex_client.role, runner.codex_client.max_calls) == ("writer", 5)
+        assert runner.report_writer.codex is runner.codex_client
+        assert [r.model for r in runner.llm_client.chains["medium"]] == ["codex/gpt-5.6-terra"]
+
+    def test_unavailable_codex_leaves_the_deterministic_pipeline_intact(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Codex first on every tier must not cost a run that has no Codex."""
+        monkeypatch.chdir(tmp_path)
+        base_config["codex"] = {"enabled": True, "binary": "/opt/missing-codex"}
+        base_config["llm"] = {"chains": {
+            "heavy": ["codex/gpt-5.6-sol"],
+            "medium": ["codex/gpt-5.6-terra"],
+            "light": ["codex/gpt-5.6-luna"],
+        }}
+        runner = BriefingRunner(base_config, dry_run=True)
+        assert runner.intelligence.available is False
+
+        papers = [{"title": "P1", "summary": "abs", "published": "", "arxiv_url": ""}]
+        with patch("scripts.codex_client.subprocess.run") as subprocess_run, \
+             patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            rc = runner.run()
+
+        assert rc in (0, 1)
+        subprocess_run.assert_not_called()
+        assert len(list((tmp_path / "briefings").glob("Test-*.md"))) == 1
+
     def test_writer_generates_executive_and_extension_from_raw_inputs(self, base_config, tmp_path, monkeypatch):
         """Catches report writing being nested inside unavailable analysis work."""
         monkeypatch.chdir(tmp_path)

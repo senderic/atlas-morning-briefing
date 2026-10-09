@@ -277,9 +277,50 @@ pdf:
   include_toc: true
   include_emoji: false
 
-# OpenCode CLI backend — a TRANSPORT, not a tier.
-# Inference runs as `opencode run -m <model>`. Which of its models serve which
-# tier is decided by llm.chains below, not here. Both free (`opencode/*` Zen
+# Codex CLI — a TRANSPORT with two roles, each with its own client and budget:
+#   * the report writer (reader-facing prose): the top-level keys below;
+#   * the first rung of every tier in llm.chains (`codex/<model>`): `chain:`.
+# Authenticated by the CLI's own subscription login (`codex login`), not an API
+# key. Requires the `codex` binary; give an absolute path if cron's PATH does
+# not include it. Set enabled: true to use it.
+codex:
+  enabled: false
+  binary: "codex"
+  # --- report writer ---
+  model: "gpt-5.6-sol"
+  reasoning_effort: "high"
+  timeout_seconds: 300
+  max_calls_per_run: 5
+  # --- chain rungs ---
+  chain:
+    max_calls_per_run: 40        # separate from the writer's budget
+    # Worst case for a rung is queue_timeout + timeout x (1 + max_retries),
+    # which must fit inside llm.rung_timeout_seconds.
+    timeout_seconds: 180
+    max_retries: 1
+    max_concurrent_requests: 3   # simultaneous `codex exec` processes
+    queue_timeout_seconds: 120
+    # Failed calls in a row before the chain skips Codex for the rest of a run.
+    max_consecutive_failures: 3
+    reasoning_effort:            # per tier; the writer keeps its own above
+      heavy: "high"
+      medium: "medium"
+      light: "low"
+  # One JSONL line per attempt; `caller` separates writer, chain and preflight.
+  call_log_path: "logs/codex-calls.jsonl"
+  # API-equivalent estimate for the usage footer, PER MODEL — informational,
+  # since the CLI is not billed per token. A model with no entry is reported
+  # as "unknown".
+  pricing:
+    gpt-5.6-sol:
+      input_per_million: 2.0
+      cached_input_per_million: 0.2
+      output_per_million: 10.0
+
+# OpenCode CLI backend — a TRANSPORT, not a tier. Disabled, and no rung in
+# llm.chains routes to it: it runs `opencode run --auto`, which is not a safe
+# way to process untrusted feed text.
+# Inference runs as `opencode run -m <model>`. Both free (`opencode/*` Zen
 # contributor tier) and paid (`opencode-go/*`) models are reachable through it,
 # so cost is a property of the rung, never of the backend.
 # Requires `opencode` binary on PATH and a valid OpenCode Zen session.
@@ -296,11 +337,13 @@ opencode:
 
 # THE fallback chain. Each tier is an ordered list of MODELS, tried front to
 # back; the backend that serves a rung is inferred from its routing prefix
-# (`openrouter/`, `opencode/`, `opencode-go/`, `gemini/`).
+# (`codex/`, `openrouter/`, `nvidia-direct/`, `opencode/`, `opencode-go/`,
+# `gemini/`).
 #
-# Order is cost: free rungs first, paid ones last. Because the chain orders
-# models rather than backends, a free model on one transport can sit ahead of a
-# free model on another — which a backend-ordered list cannot express.
+# Codex first on every tier, sized by weight class (sol > terra > luna), with
+# free HTTP rungs behind it as fallback; any per-call-billed rung goes last.
+# Because the chain orders models rather than backends, that is expressed by
+# position alone. A rung whose backend is not enabled is skipped.
 #
 # Two rules to keep: tiers stay distinct and monotonic (heavy > medium > light
 # in size and context window), and within a tier a rung may only degrade DOWN a
@@ -308,20 +351,24 @@ opencode:
 llm:
   chains:
     heavy:
+      - "codex/gpt-5.6-sol"
       - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
       - "openrouter/dots-studio/dots-3-note-preview:free"
     medium:
+      - "codex/gpt-5.6-terra"
       - "openrouter/dots-studio/dots-3-note-preview:free"
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
     light:
+      - "codex/gpt-5.6-luna"
       - "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
       - "openrouter/cohere/north-mini-code:free"
   # Per-RUNG window. Each rung is one model, so this only has to cover that
-  # model's own timeout x (1 + max_retries_per_model).
+  # model's own timeout x (1 + retries) — plus, for Codex, its queue wait.
   rung_timeout_seconds: 500
   # Rungs the preflight check must not probe — the paid ones, where the probe
   # would be the only call that ever bills them. Free rungs on the same
-  # transport are still probed.
+  # transport are still probed, and so are Codex rungs (subscription login,
+  # not billed per call).
   preflight_skip:
     - "opencode-go/"
 
