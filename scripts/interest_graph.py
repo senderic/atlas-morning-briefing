@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from scripts.prompt_safety import sanitize_prompt_input
+
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -199,7 +201,11 @@ def _llm_select(
     state = previous_state or {}
     headlines: List[str] = []
     for key in ("top_news_titles", "top_blog_titles", "top_paper_titles"):
-        headlines.extend(state.get(key, []) or [])
+        # Yesterday's titles are feed text read back out of the state file.
+        headlines.extend(
+            sanitize_prompt_input(str(title), max_length=300)
+            for title in (state.get(key, []) or [])
+        )
     candidate_lines = "\n".join(f"- {n.query}" for n in candidates)
     prompt = (
         "You select which specific news queries are most relevant today.\n\n"

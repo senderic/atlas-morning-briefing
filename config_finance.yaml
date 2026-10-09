@@ -150,6 +150,37 @@ features:
   weekly_deep_dive: false
 
 
+# --- Daily quality check (scripts/quality_check.py) ---
+# Chained at the end of run_finance_briefing.sh rather than riding along with
+# the main+local check: that one finishes around 07:10, before this pipeline
+# has written anything, and would report the briefing missing every morning.
+quality_check:
+  # This briefing is written to disk for ~/sender-finances and emailed to
+  # nobody (email_recipients: [] below is deliberate). A fault in it still
+  # needs to reach someone, so alerts have their own recipient.
+  alert_email:
+    recipients:
+      - "${RECIPIENT_EMAIL:-your-email@example.com}"
+    daily_digest: false
+  # Same thresholds as the other two pipelines; see config.yaml.
+  status_health:
+    failed_ratio_warn: 0.25
+    failed_ratio_critical: 0.5
+  # Keyed by section; the heading is resolved through section_headings above.
+  section_floors:
+    blogs: 3
+  judge:
+    skip_warn_days: 2
+    skip_critical_days: 3
+    # The generic dimensions only. tier_1_share and locality are goals of the
+    # neighbourhood briefing; this one has no events and no locality, and
+    # scoring it on them would report a permanent, meaningless red.
+    dimensions:
+      - "lead_alignment"
+      - "actionability"
+      - "specificity"
+      - "freshness"
+
 # --- EPUB metadata ---
 epub:
   title_format: "Local Briefing - {date}"
@@ -279,6 +310,9 @@ codex:
     # After this many failed calls in a row the chain stops trying Codex for
     # the rest of the run, so an outage costs a few timeouts, not one per call.
     max_consecutive_failures: 3
+    # Every Codex call runs with no tools; a call site may opt in to web search
+    # alone (none does in this pipeline). See config.yaml and codex_client.py.
+    allow_web_search: true
     # Reasoning effort per tier (the writer keeps `reasoning_effort` above).
     reasoning_effort:
       heavy: "high"

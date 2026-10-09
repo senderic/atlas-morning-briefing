@@ -9,6 +9,26 @@ from scripts.codex_client import CodexClient
 
 CODEX = "/opt/codex/bin/codex"
 
+# What every call runs with unless it opts in to web search: nothing local,
+# no connectors, no skills, no sub-agents, no web, and the code-mode host that
+# every remaining nested tool would have to run through switched off.
+NO_TOOLS = [
+    "--strict-config",
+    "--disable", "shell_tool",
+    "--disable", "unified_exec",
+    "--disable", "view_image",
+    "--disable", "apps",
+    "--disable", "plugins",
+    "--disable", "goals",
+    "--disable", "image_generation",
+    "-c", "agents.max_depth=0",
+    "-c", "skills.include_instructions=false",
+    "-c", "skills.bundled.enabled=false",
+    "-c", "project_doc_max_bytes=0",
+    "-c", 'web_search="disabled"',
+    "--disable", "code_mode_host",
+]
+
 
 def completed(stdout, returncode=0, stderr=""):
     result = MagicMock()
@@ -101,6 +121,7 @@ class TestInvocation:
             "--skip-git-repo-check",
             "-C",
             "/tmp",
+            *NO_TOOLS,
             "-m",
             "my-model",
             "-c",
@@ -350,7 +371,9 @@ UNSUPPORTED_MODEL = json.dumps(
 
 def model_and_effort(run_call):
     cmd = run_call.args[0]
-    return cmd[cmd.index("-m") + 1], cmd[cmd.index("-c") + 1]
+    # The effort override is the one that follows the model.
+    model_at = cmd.index("-m")
+    return cmd[model_at + 1], cmd[cmd.index("-c", model_at) + 1]
 
 
 class TestChainModelSelection:
@@ -772,3 +795,131 @@ class TestChainUsageSummary:
         from scripts.report_invariants import _is_usage_appendix_heading
 
         assert _is_usage_appendix_heading("Codex Chain Usage Summary")
+
+
+class TestToolHardening:
+    """Chain and writer prompts embed untrusted feed text, so the CLI must not
+    be able to act on an instruction hidden in it."""
+
+    def _argv(self, client, **invoke_kwargs):
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch(
+                "scripts.codex_client.subprocess.run",
+                return_value=completed(success_jsonl()),
+            ) as run,
+        ):
+            assert client.invoke("p", **invoke_kwargs) == "A useful report."
+        return run.call_args.args[0]
+
+    @staticmethod
+    def _disabled(argv):
+        return {argv[i + 1] for i, arg in enumerate(argv) if arg == "--disable"}
+
+    @staticmethod
+    def _overrides(argv):
+        return {argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"}
+
+    def test_chain_calls_run_with_no_tools_by_default(self):
+        argv = self._argv(
+            CodexClient({"executable": CODEX}, role="chain"),
+            tier="light", model="codex/gpt-5.6-luna",
+        )
+        assert {
+            "shell_tool", "unified_exec", "view_image", "apps", "plugins",
+            "goals", "image_generation", "code_mode_host",
+        } <= self._disabled(argv)
+        assert {
+            "agents.max_depth=0",
+            "skills.include_instructions=false",
+            "skills.bundled.enabled=false",
+            "project_doc_max_bytes=0",
+            'web_search="disabled"',
+        } <= self._overrides(argv)
+        # An override the CLI stops recognising must fail the call, not be
+        # dropped silently along with the protection it carried.
+        assert "--strict-config" in argv
+
+    def test_writer_runs_with_no_tools_too(self):
+        argv = self._argv(make_client())
+        assert argv[: argv.index("-m")][-len(NO_TOOLS):] == NO_TOOLS
+
+    def test_a_chain_call_can_opt_in_to_web_search(self):
+        argv = self._argv(
+            CodexClient({"executable": CODEX}, role="chain"),
+            tier="light", model="codex/gpt-5.6-luna", web_search=True,
+        )
+        assert 'web_search="live"' in self._overrides(argv)
+        assert 'web_search="disabled"' not in self._overrides(argv)
+        # Search is itself a nested tool, so the host stays on for this call
+        # only -- with every local capability still off.
+        assert "code_mode_host" not in self._disabled(argv)
+        assert {
+            "shell_tool", "unified_exec", "view_image", "apps", "plugins",
+            "goals", "image_generation",
+        } <= self._disabled(argv)
+        assert "agents.max_depth=0" in self._overrides(argv)
+
+    def test_web_search_opt_in_can_be_switched_off_in_config(self):
+        client = CodexClient(
+            {"executable": CODEX, "chain": {"allow_web_search": False}}, role="chain"
+        )
+        argv = self._argv(client, model="codex/gpt-5.6-luna", web_search=True)
+        assert 'web_search="disabled"' in self._overrides(argv)
+        assert "code_mode_host" in self._disabled(argv)
+
+    def test_writer_ignores_a_web_search_request_unless_configured(self):
+        argv = self._argv(make_client(), web_search=True)
+        assert 'web_search="disabled"' in self._overrides(argv)
+        argv = self._argv(make_client(allow_web_search=True), web_search=True)
+        assert 'web_search="live"' in self._overrides(argv)
+
+    def test_sandbox_and_isolation_flags_are_kept(self):
+        argv = self._argv(CodexClient({"executable": CODEX}, role="chain"), model="codex/x")
+        for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules"):
+            assert flag in argv
+        assert argv[argv.index("--sandbox") + 1] == "read-only"
+
+    def test_call_log_records_web_search_use(self, tmp_path):
+        log = tmp_path / "calls.jsonl"
+        stream = "\n".join(
+            [
+                json.dumps({"type": "item.started", "item": {"type": "web_search"}}),
+                json.dumps({"type": "item.completed", "item": {"type": "web_search", "query": "q"}}),
+                json.dumps({"type": "item.completed", "item": {"type": "web_search", "query": "r"}}),
+                success_jsonl(),
+            ]
+        )
+        client = CodexClient(
+            {"executable": CODEX, "call_log_path": str(log)}, role="chain"
+        )
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(stream)),
+        ):
+            assert client.invoke("p", model="codex/gpt-5.6-luna", web_search=True)
+            assert client.invoke("p", model="codex/gpt-5.6-luna")
+        first, second = [json.loads(line) for line in log.read_text().splitlines()]
+        assert first["web_search"] is True and first["web_searches"] == 2
+        # A call that did not ask for search but shows search activity is the
+        # thing worth noticing, so the count is logged either way.
+        assert "web_search" not in second and second["web_searches"] == 2
+
+    def test_cli_warning_items_do_not_fail_a_completed_turn(self):
+        # With the code-mode host off the CLI emits an `error`-typed notice
+        # item on every turn; it is not a failed turn.
+        stream = (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "error", "message": "Code Mode is unavailable"},
+                }
+            )
+            + "\n"
+            + success_jsonl()
+        )
+        with (
+            patch("scripts.codex_client.shutil.which", return_value=CODEX),
+            patch("scripts.codex_client.subprocess.run", return_value=completed(stream)),
+        ):
+            assert make_client().invoke("p") == "A useful report."

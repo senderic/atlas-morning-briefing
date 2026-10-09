@@ -138,3 +138,22 @@ def test_blurb_cache_reuses_one_answer_per_source(intelligence, mock_client):
 
     assert result[0]["author_blurb"] == "About NBC 7."
     assert result[1]["author_blurb"] == "About NBC 7."
+
+
+def test_blurbs_do_not_request_web_search_by_default(intelligence, mock_client):
+    mock_client.invoke.return_value = "[1] Blurb."
+    intelligence.generate_author_blurbs([{"title": "P", "authors": ["A"]}], "papers")
+    assert "web_search" not in mock_client.invoke.call_args.kwargs
+
+
+def test_blurbs_request_web_search_when_the_feature_is_on(mock_client):
+    config = {"arxiv_topics": ["AI"], "features": {"author_blurb_web_search": True}}
+    intelligence = BriefingIntelligence(mock_client, config)
+    mock_client.invoke.side_effect = ["[1] Extracted Author", "[1] Blurb."]
+
+    intelligence.generate_author_blurbs([{"title": "P", "summary": "body"}], "papers")
+
+    extract_call, blurb_call = mock_client.invoke.call_args_list
+    # Author extraction reads article text, so it never gets the opt-in.
+    assert "web_search" not in extract_call.kwargs
+    assert blurb_call.kwargs["web_search"] is True

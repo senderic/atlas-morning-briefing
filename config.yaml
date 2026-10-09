@@ -196,6 +196,16 @@ briefing_profile:
   domain: "AI research, tech, defense, and space infrastructure"
   audience: "an AI researcher, engineer, or defense analyst"
   landscape: "the AI, defense-tech, and space exploration landscape"
+  # What a paper would have to run on, for the reproduction-feasibility score
+  # under each Top Paper. Checked against the machine on 2026-10-08 (lscpu,
+  # free, lspci; nvidia-smi is not installed) -- edit this when the hardware or
+  # the model access changes, because the prompt repeats it verbatim.
+  reproduction:
+    setup:
+      - "One home Linux server: an Intel NUC with a dual-core Core i7-7567U (4 threads) and 8 GB of RAM"
+      - "No discrete GPU -- integrated Intel Iris Plus Graphics 650 only, so no CUDA and no local model training or large-model inference"
+      - "Hosted LLMs reached through the Codex CLI subscription (GPT-5.6 models, prompt in and text out); no self-hosted model serving"
+      - "Python and standard open-source libraries"
 
 # --- Fork-local briefing sections (scripts/briefing_extensions.py) ---
 # Upstream deleted these sections outright, so they exist only in this fork.
@@ -451,6 +461,11 @@ max_workers: 6
 
 features:
   source_blurbs: false  # keep feed attribution; omit unverified reputation claims
+  # Paper author blurbs may search the web (Codex rungs only; other backends
+  # ignore it). The blurb prompt carries titles and author names, never article
+  # text, and the call still runs with no shell, file, connector or skill
+  # access -- see the tool-hardening note in scripts/codex_client.py.
+  author_blurb_web_search: true
 
 # Legacy alias for llm.rung_timeout_seconds, read only when that is absent.
 composite:
@@ -505,8 +520,8 @@ codex:
     max_calls_per_run: 40
     # TIMEOUT BUDGET — one model, not a chain. Worst case for a rung is
     # queue_timeout + timeout x (1 + max_retries) + backoff = 120 + 360 + 2
-    # = 482s, inside llm.rung_timeout_seconds (500). Every call carries ~20k
-    # tokens of CLI harness; trivial prompts return in 12-25s, prose in 13-54s.
+    # = 482s, inside llm.rung_timeout_seconds (500). Trivial prompts return in
+    # 5-15s with tools off; prose and web-search calls take longer.
     timeout_seconds: 180
     max_retries: 1
     # Simultaneous `codex exec` processes. The runner fans out up to 4 calls
@@ -517,6 +532,13 @@ codex:
     # After this many failed calls in a row the chain stops trying Codex for
     # the rest of the run, so an outage costs a few timeouts, not one per call.
     max_consecutive_failures: 3
+    # Every Codex call (writer and chain) runs with NO tools: no shell, no file
+    # or image reads, no ChatGPT connectors, no skills, no sub-agents, no web.
+    # A call site may ask for web search alone (`invoke(..., web_search=True)`,
+    # today only features.author_blurb_web_search); false here refuses even
+    # that. The writer's equivalent is a top-level `allow_web_search`, default
+    # false.
+    allow_web_search: true
     # Reasoning effort per tier (the writer keeps `reasoning_effort` above).
     reasoning_effort:
       heavy: "high"
@@ -705,11 +727,23 @@ quality_check:
     recipients:
       - "${RECIPIENT_EMAIL:-your-email@example.com}"
     daily_digest: false
+  # What the run said about itself in its status file (status_file_path).
+  # Share of LLM calls that failed on every rung of the chain: WARN at 25%,
+  # CRITICAL at 50% or when every call failed. synthesis_degraded is CRITICAL
+  # and a report-writer fallback a WARN; a status file that is missing, or
+  # older than the run being checked, is a WARN.
+  status_health:
+    failed_ratio_warn: 0.25
+    failed_ratio_critical: 0.5
   section_floors:
     news: 3
     blogs: 3
     top_papers: 1
   judge:
+    # An unjudged morning is INFO; it becomes WARN after this many consecutive
+    # days without a score and CRITICAL (which mails) after skip_critical_days.
+    skip_warn_days: 2
+    skip_critical_days: 3
     # tier_1_share and locality are local-briefing goals; this pipeline is
     # deliberately national/global, so scoring it on them would report a
     # permanent, meaningless red every morning.

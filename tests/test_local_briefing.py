@@ -156,13 +156,15 @@ MAIN_CONFIG = {
 @pytest.fixture
 def local_runner(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(config=LOCAL_NEWS_CONFIG, dry_run=True)
+    # A real run (conftest makes delivery impossible): these tests check the
+    # state, snapshots and briefing a run writes, which a dry run does not.
+    return BriefingRunner(config=LOCAL_NEWS_CONFIG, dry_run=False)
 
 
 @pytest.fixture
 def main_runner(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(config=MAIN_CONFIG, dry_run=True)
+    return BriefingRunner(config=MAIN_CONFIG, dry_run=False)
 
 
 def _sample_news(n: int = 5):
@@ -521,7 +523,7 @@ class TestLocalRunOrchestration:
         base_config_local = dict(LOCAL_NEWS_CONFIG)
         base_config_local["interest_profile"] = [{"topic": "A", "weight": 1.0}]
         monkeypatch.chdir(tmp_path)
-        runner = BriefingRunner(config=base_config_local, dry_run=True)
+        runner = BriefingRunner(config=base_config_local, dry_run=False)
 
         runner.intelligence = MagicMock()
         runner.intelligence.available = True

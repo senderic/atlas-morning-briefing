@@ -433,6 +433,7 @@ class TestCodexChainTransport:
             "max_concurrent_requests": 3,
             "queue_timeout_seconds": 120,
             "max_consecutive_failures": 3,
+            "allow_web_search": True,
             "reasoning_effort": {"heavy": "high", "medium": "medium", "light": "low"},
         }
 

@@ -37,7 +37,9 @@ def base_config():
 def runner_with_data(base_config, tmp_path, monkeypatch):
     """Builds a runner with no real scanners — methods are patched per test."""
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(base_config, dry_run=True)
+    # A real run (conftest makes delivery impossible): these tests check what
+    # a run writes, which a dry run no longer does.
+    return BriefingRunner(base_config, dry_run=False)
 
 
 class TestRunOrchestration:
@@ -129,13 +131,14 @@ class TestRunOrchestration:
 
         assert rc in (0, 1)
         subprocess_run.assert_not_called()
-        assert len(list((tmp_path / "briefings").glob("Test-*.md"))) == 1
+        # A dry run renders into its own directory, beside the real output.
+        assert len(list((tmp_path / "briefings" / "dry-run").glob("Test-*.md"))) == 1
 
     def test_writer_generates_executive_and_extension_from_raw_inputs(self, base_config, tmp_path, monkeypatch):
         """Catches report writing being nested inside unavailable analysis work."""
         monkeypatch.chdir(tmp_path)
         base_config["extension_sections"] = [{"key": "reader_angle", "heading": "Reader Angle"}]
-        runner = BriefingRunner(base_config, dry_run=True)
+        runner = BriefingRunner(base_config, dry_run=False)
         writer = MagicMock()
         writer.available = True
         writer.invoke.side_effect = ["Writer lede.", "Writer extension."]
@@ -169,7 +172,7 @@ class TestRunOrchestration:
              patch.object(runner, "run_stock_fetch", return_value=[]), \
              patch.object(runner, "run_news_aggregation", return_value=[]):
             runner.run()
-        assert list((tmp_path / "briefings").glob("Test-*.pdf"))
+        assert list((tmp_path / "briefings" / "dry-run").glob("Test-*.pdf"))
         assert runner.status["pdf_generated"] is True
 
     def test_run_records_errors_returns_1(self, runner_with_data):
@@ -400,7 +403,7 @@ class TestStatusFilePerPipeline:
         monkeypatch.chdir(tmp_path)
         config = dict(base_config)
         config.update(overrides)
-        return BriefingRunner(config, dry_run=True)
+        return BriefingRunner(config, dry_run=False)
 
     def test_defaults_to_status_json(self, base_config, tmp_path, monkeypatch):
         runner = self._runner(base_config, tmp_path, monkeypatch)
@@ -451,7 +454,7 @@ class TestDegradedSynthesisIsRecorded:
 
     def _runner(self, base_config, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        return BriefingRunner(base_config, dry_run=True)
+        return BriefingRunner(base_config, dry_run=False)
 
     def test_placeholder_summary_records_an_error(self, base_config, tmp_path, monkeypatch):
         runner = self._runner(base_config, tmp_path, monkeypatch)

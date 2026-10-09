@@ -44,6 +44,48 @@ _RATE_KEYS = ("input_per_million", "cached_input_per_million", "output_per_milli
 
 RETRY_BACKOFF_SECONDS = 2.0
 
+# --- Tool hardening -------------------------------------------------------
+# Every prompt this client sends embeds untrusted text (feed items, search
+# snippets, newsletter bodies), and `codex exec` is an agent, not a completion
+# endpoint. Probed on codex-cli 0.159.2, a default `exec` session registers
+# ~240 tools: a shell (`exec_command`), `apply_patch`, `view_image`, sub-agent
+# spawning, image generation, web search, and every connector linked to the
+# ChatGPT account (GitHub, Gmail, Google Drive ... as `mcp__codex_apps__*`).
+# `--sandbox read-only` does not stop a shell from READING files, and
+# `--ignore-user-config` does not stop skills or connectors from loading.
+#
+# These switches remove each of those. They are a denylist, so a CLI upgrade
+# that adds a tool is not covered by them -- which is why a call that does not
+# need web search also turns off the code-mode host: the models this client
+# uses are `code_mode_only`, every nested tool runs through that host, and
+# without it any tool call fails closed whatever the registry holds.
+#
+# An unknown `--disable` name is a hard CLI error and `--strict-config` makes
+# an unrecognised `-c` key one too. That is deliberate: if an upgrade renames
+# one of these, the rung fails and the chain moves on, rather than running
+# with the protection silently dropped. Re-probe after upgrading the CLI.
+_NO_LOCAL_TOOLS: Tuple[str, ...] = (
+    "--strict-config",
+    "--disable", "shell_tool",        # exec_command
+    "--disable", "unified_exec",      # exec_command / write_stdin
+    "--disable", "view_image",        # reads a local file outside the sandbox
+    "--disable", "apps",              # ChatGPT connectors + MCP resource tools
+    "--disable", "plugins",
+    "--disable", "goals",
+    "--disable", "image_generation",
+    "-c", "agents.max_depth=0",       # no sub-agents (multi_agent_v1 tools)
+    "-c", "skills.include_instructions=false",
+    "-c", "skills.bundled.enabled=false",
+    "-c", "project_doc_max_bytes=0",  # no AGENTS.md from the working directory
+)
+_WEB_SEARCH_OFF: Tuple[str, ...] = (
+    "-c", 'web_search="disabled"',
+    "--disable", "code_mode_host",
+)
+# Search is a nested tool, so the host has to stay on for these calls. What is
+# left beside it is `apply_patch`, which the read-only sandbox rejects.
+_WEB_SEARCH_ON: Tuple[str, ...] = ("-c", 'web_search="live"')
+
 
 class CodexClient(BaseLLMClient):
     """Invoke one Codex CLI process per request, as the writer or a chain rung."""
@@ -114,11 +156,16 @@ class CodexClient(BaseLLMClient):
         self.queue_timeout = 0.0
         self.max_consecutive_failures = 0
         self._tier_reasoning: Dict[str, str] = {}
+        # Whether a call's `web_search=True` is honoured. The writer composes
+        # from the signals it is handed, so it stays off unless configured; a
+        # chain call may opt in unless `codex.chain.allow_web_search` forbids.
+        self.allow_web_search = bool(config.get("allow_web_search", False))
 
         self.role = "chain" if role == "chain" else "writer"
         if self.role == "chain":
             chain = config.get("chain")
             chain = chain if isinstance(chain, dict) else {}
+            self.allow_web_search = bool(chain.get("allow_web_search", True))
             self.timeout = float(
                 chain.get("timeout_seconds", chain.get("timeout", self.DEFAULT_CHAIN_TIMEOUT))
             )
@@ -276,7 +323,9 @@ class CodexClient(BaseLLMClient):
                 return str(floor)
         return self._tier_reasoning.get(tier, self.reasoning)
 
-    def _command(self, model: str, effort: Optional[str] = None) -> list[str]:
+    def _command(
+        self, model: str, effort: Optional[str] = None, web_search: bool = False
+    ) -> list[str]:
         return [
             self.executable,
             "exec",
@@ -288,6 +337,8 @@ class CodexClient(BaseLLMClient):
             "--skip-git-repo-check",
             "-C",
             "/tmp",
+            *_NO_LOCAL_TOOLS,
+            *(_WEB_SEARCH_ON if web_search else _WEB_SEARCH_OFF),
             "-m",
             model,
             "-c",
@@ -361,6 +412,27 @@ class CodexClient(BaseLLMClient):
     _parse_response = _parse_jsonl
 
     @staticmethod
+    def _count_web_searches(stdout: str) -> int:
+        """Completed web searches in a JSONL stream.
+
+        Search is the one tool call the event stream reports as an item.
+        Nested code-mode calls (shell, patch) are NOT surfaced there, so this
+        is a usage figure, not an audit of what a turn did.
+        """
+        count = 0
+        for line in (stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "item.completed":
+                continue
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "web_search":
+                count += 1
+        return count
+
+    @staticmethod
     def _failure_detail(stdout: str, stderr: str = "") -> Tuple[Optional[int], str]:
         """Return (HTTP status, text) describing why a CLI turn failed.
 
@@ -427,6 +499,8 @@ class CodexClient(BaseLLMClient):
         tier: Optional[str] = None,
         effort: Optional[str] = None,
         http_status: Optional[int] = None,
+        web_search: bool = False,
+        web_searches: int = 0,
     ) -> None:
         latency = time.monotonic() - started
         with self._lock:
@@ -450,6 +524,10 @@ class CodexClient(BaseLLMClient):
             record["tier"] = tier
         if effort:
             record["reasoning_effort"] = effort
+        if web_search:
+            record["web_search"] = True
+        if web_searches:
+            record["web_searches"] = web_searches
         if error_category:
             record["error_category"] = error_category
         if exit_status is not None:
@@ -537,7 +615,12 @@ class CodexClient(BaseLLMClient):
         `model` names the rung CompositeClient picked and is served as given,
         minus the routing prefix. Without it the configured `codex.model` is
         used, which is how the report writer drives this client.
+
+        `web_search=True` lets this one call search the web; it is honoured
+        only where `allow_web_search` permits and never restores a local tool.
+        Other backends ignore the keyword.
         """
+        web_search = bool(kwargs.pop("web_search", False)) and self.allow_web_search
         del kwargs
         if not self.available:
             return None
@@ -555,7 +638,7 @@ class CodexClient(BaseLLMClient):
             return None
         try:
             return self._invoke_with_retries(
-                prompt, system_prompt, effective_model, tier, effort
+                prompt, system_prompt, effective_model, tier, effort, web_search
             )
         finally:
             if self._slots is not None:
@@ -568,6 +651,7 @@ class CodexClient(BaseLLMClient):
         model: str,
         tier: str,
         effort: str,
+        web_search: bool = False,
     ) -> Optional[str]:
         attempts = 0
         while True:
@@ -577,7 +661,9 @@ class CodexClient(BaseLLMClient):
                     self.caller, self._call_count, self.max_calls,
                 )
                 return None
-            result, action = self._single_call(prompt, system_prompt, model, tier, effort)
+            result, action = self._single_call(
+                prompt, system_prompt, model, tier, effort, web_search
+            )
             if result:
                 self._note_outcome(True)
                 return result
@@ -603,6 +689,7 @@ class CodexClient(BaseLLMClient):
         model: str,
         tier: str,
         effort: str,
+        web_search: bool = False,
     ) -> Tuple[Optional[str], str]:
         """Run one CLI process. Returns (text, "ok" | "retry" | "fallback")."""
         with self._lock:
@@ -610,11 +697,14 @@ class CodexClient(BaseLLMClient):
             self.usage_stats["calls"] += 1
             self._stats_for(model)["calls"] += 1
         started = time.monotonic()
-        attempt = {"started": started, "model": model, "tier": tier, "effort": effort}
+        attempt = {
+            "started": started, "model": model, "tier": tier, "effort": effort,
+            "web_search": web_search,
+        }
         usage: Optional[Dict[str, Any]] = None
         try:
             result = subprocess.run(
-                self._command(model, effort),
+                self._command(model, effort, web_search),
                 input=self._prompt_payload(prompt, system_prompt),
                 capture_output=True,
                 text=True,
@@ -639,6 +729,7 @@ class CodexClient(BaseLLMClient):
             return None, classify_error(status_code=http_status, text=detail)
 
         message, usage, completed, failed = self._parse_jsonl(result.stdout)
+        attempt["web_searches"] = self._count_web_searches(result.stdout)
         self._accumulate_usage(usage, model)
         if failed or not completed or not usage or not message or not message.strip():
             self._finish_attempt(

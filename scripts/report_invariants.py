@@ -163,6 +163,23 @@ def _url_host(url: str) -> str:
         return ""
 
 
+def _heading_for(config: Dict[str, Any], section: str) -> str:
+    """The heading a section key renders under, as the runner decides it.
+
+    ``section_headings`` in config wins; otherwise the runner's own default
+    for that key (``news`` -> "AI & Tech News"). A pipeline that configures no
+    headings at all -- the main one -- used to have every section key looked
+    up literally, which matched nothing, so a check keyed by section quietly
+    did nothing for it. Imported lazily: the runner is a heavy import, and a
+    failure there must not take this module down.
+    """
+    try:
+        from scripts.briefing_runner import section_heading
+    except Exception:  # pragma: no cover - defensive
+        return (config.get("section_headings") or {}).get(section) or section
+    return section_heading(config, section)
+
+
 # ---------------------------------------------------------------------------
 # Check 1 -- section presence
 # ---------------------------------------------------------------------------
@@ -682,6 +699,9 @@ def check_degraded_content(
 # ---------------------------------------------------------------------------
 
 
+_NUMBERED_ENTRY_RE = re.compile(r"^###[ \t]+\d+\.[ \t]+\S", re.MULTILINE)
+
+
 def check_thin_sections(
     markdown: str, config: Dict[str, Any], pipeline: str = ""
 ) -> List[Finding]:
@@ -698,14 +718,17 @@ def check_thin_sections(
     if not floors:
         return []
 
-    headings_cfg = config.get("section_headings") or {}
     findings = []
     for section, floor in floors.items():
-        heading = headings_cfg.get(section, section)
+        heading = _heading_for(config, section)
         body = _section_body(markdown, heading)
         if body is None:
             continue
-        count = len(list(_iter_rendered_items(body)))
+        # News and blog items render as a bold link; papers render as a
+        # numbered `### 1. [Title](url)` entry. Both are items here.
+        count = len(list(_iter_rendered_items(body))) + len(
+            _NUMBERED_ENTRY_RE.findall(body)
+        )
         if count < int(floor):
             findings.append(
                 Finding(

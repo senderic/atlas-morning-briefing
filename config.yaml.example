@@ -100,6 +100,16 @@ briefing_profile:
   domain: "AI and technology"
   audience: "an AI researcher or engineer"
   landscape: "the AI and technology landscape"
+  # What a paper would have to run on, for the reproduction-feasibility score
+  # (0-25) shown under each Top Paper. One line per fact, repeated verbatim in
+  # the prompt -- describe your own machine and model access. `limits` is an
+  # optional sentence on budget or time.
+  reproduction:
+    setup:
+      - "A single workstation or small server, no GPU cluster"
+      - "Hosted LLM APIs for model access"
+      - "Python and standard open-source ML libraries"
+    # limits: "under $50 and one week per paper"
   # actionable: false
   # priorities:
   #   - "What changes the reader's day: outages, closures, deadlines, events."
@@ -181,8 +191,14 @@ status_file_path: "status.json"
 #   alert_email:
 #     recipients: ["you@example.com"]
 #     daily_digest: false
+#   status_health:             # read from the run's own status file
+#     failed_ratio_warn: 0.25  # share of LLM calls that failed outright
+#     failed_ratio_critical: 0.5
 #   judge:
 #     dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
+#     skip_warn_days: 2        # consecutive unjudged days before WARN
+#     skip_critical_days: 3    # ... before CRITICAL (which mails)
+#     max_chars: 40000         # how much of the briefing the judge reads
 #   source_health:
 #     dead_url_runs: 3
 #     stale_after_days: 90
@@ -219,7 +235,8 @@ paper_scoring:
   citation_count: 1
 
 # Reproduction feasibility gate (applied by intelligence layer)
-# Papers scoring below repro_min_score/25 are dropped from top picks
+# Papers scoring below repro_min_score/25 are dropped from top picks. The
+# setup they are scored against is briefing_profile.reproduction above.
 repro_min_score: 12
 
 # Delivery settings
@@ -302,6 +319,12 @@ codex:
     queue_timeout_seconds: 120
     # Failed calls in a row before the chain skips Codex for the rest of a run.
     max_consecutive_failures: 3
+    # Every Codex call runs with no tools (shell, files, connectors, skills,
+    # sub-agents, web). A call site may opt in to web search alone -- today
+    # only `features.author_blurb_web_search: true` does -- and false here
+    # refuses even that. The writer's equivalent is a top-level
+    # `allow_web_search`, default false.
+    allow_web_search: true
     reasoning_effort:            # per tier; the writer keeps its own above
       heavy: "high"
       medium: "medium"

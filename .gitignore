@@ -54,6 +54,9 @@ logs/gemini-audit-*.txt
 logs/source-health.jsonl
 logs/quality-scores.jsonl
 logs/quality-alerts.json
+logs/quality-streaks.json
+logs/judge-raw-*.txt
+logs/.quality-check.lock
 logs/quality-digest-*.md
 logs/local-gemini-calls.jsonl
 

@@ -546,8 +546,8 @@ class TestAssessReproductionFeasibility:
             {"title": "P2", "summary": "abs", "score_breakdown": {"has_code": False}},
         ]
         mock_client.invoke.return_value = (
-            "[1] code:5 data:4 infra:5 bedrock:5 effort:4 | Easy weekend repro\n"
-            "[2] code:1 data:1 infra:1 bedrock:2 effort:1 | Skip"
+            "[1] code:5 data:4 infra:5 api:5 effort:4 | Easy weekend repro\n"
+            "[2] code:1 data:1 infra:1 api:2 effort:1 | Skip"
         )
         result = intel.assess_reproduction_feasibility(papers)
         # Sorted by repro_total desc, only papers >= 12 kept
@@ -562,7 +562,7 @@ class TestAssessReproductionFeasibility:
         papers = [
             {"title": "P", "summary": "x", "score_breakdown": {"has_code": True}}
         ]
-        mock_client.invoke.return_value = "[1] code:5 data:5 infra:5 bedrock:5 effort:5"
+        mock_client.invoke.return_value = "[1] code:5 data:5 infra:5 api:5 effort:5"
         result = intel.assess_reproduction_feasibility(papers)
         assert result[0]["repro_total"] == 25
 
@@ -578,6 +578,103 @@ class TestAssessReproductionFeasibility:
         result = intel.assess_reproduction_feasibility(papers)
         # No scores parsed → repro_total not set; unscored papers retained
         assert "repro_total" not in result[0]
+
+    # --- an incomplete line is "not assessed", not a low score ---
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[1] code:4 | Only one dimension came back",
+            "[1] code:5 data:5 infra:5 effort:5 | hosted-API dimension missing",
+            "[1] code:5 data:5 infra:5 api:high effort:5 | non-numeric dimension",
+            "[1] code:5 data:5 infra:5 api:0 effort:5 | zero is not on the 1-5 scale",
+            "[1] code:5 data:5 infra:5 api:9 effort:5 | nine is not on the scale",
+            "[1] code:5 data:5 infra:5 bedrock:5 effort:5 | the retired dimension name",
+        ],
+    )
+    def test_incomplete_line_keeps_the_paper_unassessed(self, intel, mock_client, line):
+        """Summing whichever dimensions parsed made a one-dimension line total
+        4/25, and the gate then dropped a paper nobody had actually scored."""
+        papers = [{"title": "P", "summary": "x"}]
+        mock_client.invoke.return_value = line
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [p["title"] for p in result] == ["P"]
+        for key in ("repro_total", "repro_scores", "repro_verdict", "reproduction_assessment"):
+            assert key not in result[0]
+
+    def test_unassessed_papers_follow_the_ones_that_passed(self, intel, mock_client):
+        papers = [
+            {"title": "Unassessed", "summary": "x"},
+            {"title": "Weak", "summary": "x"},
+            {"title": "Strong", "summary": "x"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] code:4 | truncated\n"
+            "[2] code:1 data:1 infra:1 api:1 effort:1 | Skip\n"
+            "[3] code:5 data:4 infra:4 api:5 effort:4 | Doable"
+        )
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [p["title"] for p in result] == ["Strong", "Unassessed"]
+
+    def test_gate_threshold_and_total_are_unchanged(self, mock_client):
+        intel = BriefingIntelligence(mock_client, {"repro_min_score": 15})
+        papers = [{"title": "A", "summary": "x"}, {"title": "B", "summary": "x"}]
+        mock_client.invoke.return_value = (
+            "[1] code:3 data:3 infra:3 api:3 effort:3 | exactly at the gate\n"
+            "[2] code:3 data:3 infra:3 api:3 effort:2 | one under"
+        )
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [(p["title"], p["repro_total"]) for p in result] == [("A", 15)]
+        assert result[0]["repro_scores"] == {
+            "code": 3, "data": 3, "infra": 3, "api": 3, "effort": 3,
+        }
+        assert "15/25" in result[0]["reproduction_assessment"]
+
+    def test_tolerates_spacing_and_markdown_around_scores(self, intel, mock_client):
+        papers = [{"title": "P", "summary": "x"}]
+        mock_client.invoke.return_value = "[1] code: 5 data: 4 infra:5  api:5 effort: 4 | ok"
+        assert intel.assess_reproduction_feasibility(papers)[0]["repro_total"] == 23
+
+    # --- the reader's setup comes from config, not from the prompt ---
+
+    def _prompt(self, mock_client, config):
+        mock_client.invoke.return_value = None
+        BriefingIntelligence(mock_client, config).assess_reproduction_feasibility(
+            [{"title": "P", "summary": "x"}]
+        )
+        return mock_client.invoke.call_args.args[0]
+
+    def test_default_prompt_names_no_vendor_stack(self, mock_client):
+        prompt = self._prompt(mock_client, {})
+        for word in ("Bedrock", "bedrock", "EC2", "A10G", "Trainium", "Titan", "Claude", "AWS", "Amazon"):
+            assert word not in prompt
+        assert "code:X data:X infra:X api:X effort:X" in prompt
+        assert "25 max" in prompt
+
+    def test_configured_setup_reaches_the_prompt(self, mock_client):
+        config = {"briefing_profile": {"reproduction": {
+            "setup": ["One home server, no GPU", "Hosted models via a CLI subscription"],
+            "limits": "a weekend, no new spend",
+        }}}
+        prompt = self._prompt(mock_client, config)
+        assert "- One home server, no GPU\n" in prompt
+        assert "- Hosted models via a CLI subscription\n" in prompt
+        assert "a weekend, no new spend" in prompt
+        assert "single workstation" not in prompt  # the generic default is replaced
+
+    def test_shipped_config_describes_the_setup_without_inventing_hardware(self, mock_client):
+        import yaml
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        config = yaml.safe_load((root / "config.yaml").read_text())
+        setup = " ".join(config["briefing_profile"]["reproduction"]["setup"])
+        assert "Codex CLI" in setup
+        assert "no discrete GPU" in setup or "No discrete GPU" in setup
+        for word in ("EC2", "A10G", "Bedrock", "Trainium", "CUDA available"):
+            assert word not in setup
+        example = yaml.safe_load((root / "config.yaml.example").read_text())
+        assert example["briefing_profile"]["reproduction"]["setup"]
 
 
 # ---------- rank_and_summarize_news ----------

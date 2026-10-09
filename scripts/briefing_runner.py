@@ -58,6 +58,7 @@ from scripts.briefing_extensions import generate_section, load_extension_section
 from scripts.intelligence import SYSTEM_PROMPT as INTELLIGENCE_SYSTEM_PROMPT
 from scripts.intelligence import BriefingIntelligence
 from scripts.leak_detection import is_cot_leak
+from scripts.prompt_safety import sanitize_prompt_input
 from scripts.llm_client import BaseLLMClient
 
 
@@ -70,6 +71,35 @@ SYNTHESIS_UNAVAILABLE_TEXT = (
 )
 
 DEFAULT_FILE_NAMING = "Atlas-Briefing-{yyyy}.{mm}.{dd}"
+
+# The heading each section renders under when `section_headings` in config
+# does not name one. Module-level because the quality check resolves section
+# keys (`quality_check.section_floors: {news: 3}`) to rendered headings and
+# has to agree with the renderer: with the defaults written inline at each
+# render site, the checker looked for "## news" in a briefing that says
+# "## AI & Tech News" and silently checked nothing.
+DEFAULT_SECTION_HEADINGS: Dict[str, str] = {
+    "executive_summary": "Executive Summary",
+    "weekly_deep_dive": "This Week in AI",
+    "errors": "Errors",
+    "stocks": "Financial Market Overview",
+    "news": "AI & Tech News",
+    "alerts": "Active Alerts",
+    "happenings": "Things To Do In and Around Pacific Beach",
+    "blogs": "Blog Updates",
+    "top_papers": "Top Papers",
+    "recent_papers": "Recent Papers",
+}
+
+
+
+def section_heading(config: Dict[str, Any], section: str) -> str:
+    """The `## ` heading a section key renders under for this config.
+
+    `section_headings` wins; a key with no default here is returned as is.
+    """
+    configured = (config.get("section_headings") or {}).get(section)
+    return configured or DEFAULT_SECTION_HEADINGS.get(section, section)
 
 
 class _SummaryHTMLTextExtractor(HTMLParser):
@@ -159,13 +189,18 @@ class BriefingRunner:
 
         Args:
             config: Configuration dictionary.
-            dry_run: If True, don't send email.
+            dry_run: If True, send nothing and leave every real artifact
+                alone: no email, no state file, no snapshots, and the
+                rendered briefing, status file and call logs go to a
+                `dry-run/` directory under `output_dir`.
             use_snapshots: If set to a date string (e.g. "2026-07-27"),
                            load raw data from snapshots/{date}/ instead of
                            making live API calls.
         """
-        self.config = config
         self.dry_run = dry_run
+        if dry_run:
+            config = self._dry_run_config(config)
+        self.config = config
         self.use_snapshots = use_snapshots
         self.user_name = os.getenv("USER_NAME", "")
         self.errors = []
@@ -247,7 +282,8 @@ class BriefingRunner:
         snapshot_cfg = config.get("snapshot", {})
         self.snapshot_manager = SnapshotManager(
             snapshot_dir=snapshot_cfg.get("dir", "snapshots"),
-            enabled=snapshot_cfg.get("enabled", True),
+            # Snapshots are what other projects import as "today's raw data".
+            enabled=snapshot_cfg.get("enabled", True) and not self.dry_run,
         )
         logger.debug(
             "Initialized BriefingRunner: state_file=%s section_order=%s "
@@ -256,6 +292,35 @@ class BriefingRunner:
             [x.key for x in self.extension_sections],
             self.feature_weekly_deep_dive, self.dry_run, self.use_snapshots,
         )
+
+    DRY_RUN_SUBDIR = "dry-run"
+
+    @classmethod
+    def _dry_run_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Copy of ``config`` with every output path moved under a dry-run dir.
+
+        Seeing the rendered briefing is the point of a dry run, so it is still
+        written -- to ``<output_dir>/dry-run/``, where it cannot replace the
+        briefing a real run produced that day. Per-call LLM logs follow it:
+        a dry run makes real calls, and the record of them belongs with its
+        output rather than in the ledger cron-facing tools read. The caller's
+        dict is left as it was.
+        """
+        redirected = dict(config)
+        dry_dir = Path(config.get("output_dir", "briefings")) / cls.DRY_RUN_SUBDIR
+        redirected["output_dir"] = str(dry_dir)
+        for backend in ("codex", "gemini", "bedrock"):
+            block = config.get(backend)
+            if isinstance(block, dict) and block.get("call_log_path"):
+                block = dict(block)
+                # Absolute, because the clients resolve a relative log path
+                # against the repo root rather than the working directory.
+                block["call_log_path"] = str(
+                    dry_dir.resolve() / Path(str(block["call_log_path"])).name
+                )
+                redirected[backend] = block
+        return redirected
 
     @staticmethod
     def _load_snapshot(path: str) -> List[Dict[str, Any]]:
@@ -1110,14 +1175,14 @@ class BriefingRunner:
                 intro = ""
 
             if intro:
-                md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
+                md.append(f"## {self._headings.get('executive_summary', DEFAULT_SECTION_HEADINGS['executive_summary'])}\n\n")
                 md.append(f"{intro}\n\n")
             else:
-                md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
+                md.append(f"## {self._headings.get('executive_summary', DEFAULT_SECTION_HEADINGS['executive_summary'])}\n\n")
                 md.append(SYNTHESIS_UNAVAILABLE_TEXT)
                 self._record_degraded_synthesis()
         else:
-            md.append(f"## {self._headings.get('executive_summary', 'Executive Summary')}\n\n")
+            md.append(f"## {self._headings.get('executive_summary', DEFAULT_SECTION_HEADINGS['executive_summary'])}\n\n")
             md.append(SYNTHESIS_UNAVAILABLE_TEXT)
             self._record_degraded_synthesis()
 
@@ -1189,12 +1254,12 @@ class BriefingRunner:
                 )
                 weekly_deep_dive = ""
             if weekly_deep_dive:
-                md.append(f"## {self._headings.get('weekly_deep_dive', 'This Week in AI')}\n\n")
+                md.append(f"## {self._headings.get('weekly_deep_dive', DEFAULT_SECTION_HEADINGS['weekly_deep_dive'])}\n\n")
                 md.append(f"{weekly_deep_dive}\n\n")
 
         # Errors section
         if self.errors:
-            md.append(f"## {self._headings.get('errors', 'Errors')}\n\n")
+            md.append(f"## {self._headings.get('errors', DEFAULT_SECTION_HEADINGS['errors'])}\n\n")
             for error in self.errors:
                 md.append(f"- {error}\n")
             md.append("\n")
@@ -1307,7 +1372,7 @@ class BriefingRunner:
 
     def _render_stocks(self, stocks: List[Dict[str, Any]], market_trend: str = "") -> str:
         """Render stock watchlist as compact overview table with trend analysis."""
-        md = [f"## {self._headings.get('stocks', 'Financial Market Overview')}\n\n"]
+        md = [f"## {self._headings.get('stocks', DEFAULT_SECTION_HEADINGS['stocks'])}\n\n"]
 
         md.append("| Ticker | Price | Change | Related news |\n")
         md.append("|--------|-------|--------|--------|\n")
@@ -1409,7 +1474,7 @@ class BriefingRunner:
 
     def _render_news(self, news: List[Dict[str, Any]]) -> str:
         """Render news section (top 5, with summaries)."""
-        md = [f"## {self._headings.get('news', 'AI & Tech News')}\n\n"]
+        md = [f"## {self._headings.get('news', DEFAULT_SECTION_HEADINGS['news'])}\n\n"]
         for article in news[:5]:
             article_title = article.get("title", "")
             url = article.get("url", "")
@@ -1454,7 +1519,7 @@ class BriefingRunner:
         if not items:
             return ""
 
-        md = [f"## {self._headings.get('alerts', 'Active Alerts')}\n\n"]
+        md = [f"## {self._headings.get('alerts', DEFAULT_SECTION_HEADINGS['alerts'])}\n\n"]
         for alert in items:
             event = alert.get("event", "Alert")
             severity = alert.get("severity", "")
@@ -1482,7 +1547,7 @@ class BriefingRunner:
         items = happenings[:max_happenings]
         if not items:
             return ""
-        md = [f"## {self._headings.get('happenings', 'Things To Do In and Around Pacific Beach')}\n\n"]
+        md = [f"## {self._headings.get('happenings', DEFAULT_SECTION_HEADINGS['happenings'])}\n\n"]
         for article in items:
             article_title = article.get("title", "")
             url = article.get("url", "")
@@ -1501,7 +1566,7 @@ class BriefingRunner:
 
     def _render_blogs(self, blogs: List[Dict[str, Any]]) -> str:
         """Render blog updates section (top 5, with summaries, sorted by score)."""
-        md = [f"## {self._headings.get('blogs', 'Blog Updates')}\n\n"]
+        md = [f"## {self._headings.get('blogs', DEFAULT_SECTION_HEADINGS['blogs'])}\n\n"]
         
         # Rank over the whole ranked list, then take the display slice. The
         # upstream ranker has already picked and capped its top posts, so
@@ -1554,8 +1619,8 @@ class BriefingRunner:
         paper_texts = []
         indices = []
         for i, paper in missing:
-            title = paper.get("title", "")
-            abstract = paper.get("summary", "")[:600]
+            title = sanitize_prompt_input(paper.get("title", ""), max_length=500)
+            abstract = sanitize_prompt_input(paper.get("summary", "")[:600], max_length=700)
             if not abstract:
                 continue
             paper_texts.append(f"[{len(paper_texts)+1}] {title}\n{abstract}")
@@ -1596,7 +1661,7 @@ class BriefingRunner:
 
     def _render_top_papers(self, top_papers: List[Dict[str, Any]]) -> str:
         """Render top papers section (top N per config.num_paper_picks, with summaries, scores, and repro assessment)."""
-        md = [f"## {self._headings.get('top_papers', 'Top Papers')}\n\n"]
+        md = [f"## {self._headings.get('top_papers', DEFAULT_SECTION_HEADINGS['top_papers'])}\n\n"]
         num_picks = self.config.get("num_paper_picks", 5)
         sorted_papers = self._select_by_score(
             top_papers, num_picks, self.MIN_DISPLAY_SCORE
@@ -1659,7 +1724,7 @@ class BriefingRunner:
 
     def _render_papers(self, papers: List[Dict[str, Any]]) -> str:
         """Render recent papers section (top 5, compact)."""
-        md = [f"## {self._headings.get('recent_papers', 'Recent Papers')}\n\n"]
+        md = [f"## {self._headings.get('recent_papers', DEFAULT_SECTION_HEADINGS['recent_papers'])}\n\n"]
         for paper in papers[:5]:
             paper_title = paper.get("title", "")
             authors = paper.get("authors", [])
@@ -1806,7 +1871,7 @@ class BriefingRunner:
         self.status["synthesis_degraded"] = True
         logger.warning(message)
 
-    def save_status(self, output_dir: str = ".") -> None:
+    def save_status(self, output_dir: Optional[str] = None) -> None:
         """
         Save run status to JSON file for monitoring.
 
@@ -1820,8 +1885,13 @@ class BriefingRunner:
         the main run had in fact collected 172.
 
         Args:
-            output_dir: Directory to save status file.
+            output_dir: Directory to save status file. Defaults to the working
+                directory, or to the dry-run output directory on a dry run --
+                the real status file describes the last real run, and the
+                quality check reads it as such.
         """
+        if output_dir is None:
+            output_dir = self.config.get("output_dir", "briefings") if self.dry_run else "."
         self._refresh_writer_status()
         health_fn = getattr(self.llm_client, "get_health", None)
         health = health_fn() if callable(health_fn) else None
@@ -1833,8 +1903,14 @@ class BriefingRunner:
         self.status["errors"] = self.errors
         self.status["pipeline"] = self.config.get("pipeline_name", "")
         status_filename = self.config.get("status_file_path", "status.json")
+        if self.dry_run:
+            # An absolute status_file_path would otherwise win the join below
+            # and land on the real file.
+            status_filename = Path(str(status_filename)).name
         status_path = Path(output_dir) / status_filename
         try:
+            if self.dry_run:
+                status_path.parent.mkdir(parents=True, exist_ok=True)
             with open(status_path, "w") as f:
                 json.dump(self.status, f, indent=2)
             logger.info(f"Status saved: {status_path}")
@@ -1883,6 +1959,11 @@ class BriefingRunner:
         cached_happenings_date: Optional[str] = None,
     ) -> None:
         """Save current briefing state for next run's trend tracking and dedup."""
+        if self.dry_run:
+            # The state file is tomorrow's dedup list and the week's
+            # accumulated items; a dry run must not advance either.
+            logger.info("Dry run: not writing state file %s", self.state_file_path)
+            return
         state = {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "top_paper_titles": [p.get("title", "") for p in papers[:10]],
@@ -1995,7 +2076,10 @@ class BriefingRunner:
             happenings = self._apply_geo_filter(happenings, "happenings")
 
             # --- Save raw data snapshots ---
-            logger.info("=== Saving raw data snapshots ===")
+            if self.dry_run:
+                logger.info("Dry run: not saving raw data snapshots")
+            else:
+                logger.info("=== Saving raw data snapshots ===")
             self.snapshot_manager.save_stocks(stocks)
             self.snapshot_manager.save_news(news)
             self.snapshot_manager.save_happenings(happenings)
@@ -2268,6 +2352,11 @@ class BriefingRunner:
         self.save_status()
 
         logger.info(f"=== Briefing Complete in {elapsed:.1f}s ===")
+        if self.dry_run:
+            logger.info(
+                "Dry run: nothing was sent and no state, status or snapshot "
+                "file was changed. Output is in %s/", output_dir
+            )
 
         if self.errors:
             logger.warning(f"Completed with {len(self.errors)} errors")
@@ -2332,7 +2421,10 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Generate briefing but don't send email",
+        help=(
+            "Send nothing and change no state, status or snapshot file; "
+            "the rendered briefing goes to <output_dir>/dry-run/"
+        ),
     )
     parser.add_argument(
         "--use-snapshots",

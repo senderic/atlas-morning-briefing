@@ -590,6 +590,72 @@ class TestCheckThinSections:
         md = "## News\n\n**[Item](https://a.example/1)**\nBody.\n"
         assert check_thin_sections(md, {}) == []
 
+    def test_floor_resolves_through_the_runners_default_heading(self):
+        """config.yaml defines no section_headings, so its floor key `news`
+        has to find the heading the runner actually renders for it. Looked up
+        literally it matched nothing and the check never ran for that pipeline.
+        """
+        config = {"quality_check": {"section_floors": {"news": 3, "top_papers": 2}}}
+        md = (
+            "## AI & Tech News\n\n"
+            "**[Item One](https://a.example/1)**\nBody.\n\n"
+            "## Top Papers\n\n"
+            "**[Paper](https://arxiv.org/abs/1)**\nBody.\n"
+        )
+        findings = check_thin_sections(md, config)
+        assert sorted((f.source, f.detail["count"]) for f in findings) == [
+            ("news", 1), ("top_papers", 1),
+        ]
+
+    def test_default_headings_are_the_ones_the_runner_renders(self):
+        from scripts.briefing_runner import DEFAULT_SECTION_HEADINGS, BriefingRunner
+
+        runner = BriefingRunner(
+            {"arxiv_topics": [], "gemini": {"enabled": False}}, dry_run=True
+        )
+        md = runner.generate_markdown_briefing(
+            papers=[], blogs=[{"title": "B", "link": "https://b.example/1", "source": "S"}],
+            stocks=[], news=[{"title": "N", "url": "https://n.example/1"}],
+            top_papers=[], synthesis={"editorial_intro": "Intro."},
+        )
+        for key in ("executive_summary", "news", "blogs"):
+            assert f"## {DEFAULT_SECTION_HEADINGS[key]}\n" in md
+
+    def test_numbered_paper_entries_count_as_items(self):
+        """Top Papers renders `### 1. [Title](url)`, not the bold-link form
+        news and blogs use. Once its floor resolved to a real heading, every
+        healthy briefing would otherwise have reported "0 item(s)"."""
+        config = {"quality_check": {"section_floors": {"top_papers": 2}}}
+        paper = (
+            "### {n}. [A Paper Title](http://arxiv.org/abs/2610.0000{n}v1) \u2605\u2605\u2605\u2606\u2606\n"
+            "*A. Author, B. Author*\n\n"
+            "\U0001f517 [abs](http://arxiv.org/abs/2610.0000{n}v1)\n\n"
+            "Summary.\n\n**Repro: \U0001f7e1 12/25** (S) \u2014 fine\n\n\n"
+        )
+        two = "## Top Papers\n\n" + paper.format(n=1) + paper.format(n=2)
+        assert check_thin_sections(two, config) == []
+        one = "## Top Papers\n\n" + paper.format(n=1) + "## Blog Updates\n\nx\n"
+        findings = check_thin_sections(one, config)
+        assert [(f.source, f.detail["count"]) for f in findings] == [("top_papers", 1)]
+
+    def test_a_configured_heading_still_wins(self):
+        config = {
+            "section_headings": {"news": "Around You"},
+            "quality_check": {"section_floors": {"news": 2}},
+        }
+        md = (
+            "## Around You\n\n**[One](https://a.example/1)**\nBody.\n\n"
+            "## AI & Tech News\n\n**[X](https://a.example/2)**\nBody.\n\n"
+            "**[Y](https://a.example/3)**\nBody.\n"
+        )
+        findings = check_thin_sections(md, config)
+        assert [(f.source, f.detail["count"]) for f in findings] == [("news", 1)]
+
+    def test_an_unknown_section_key_is_still_matched_literally(self):
+        config = {"quality_check": {"section_floors": {"Custom Section": 2}}}
+        md = "## Custom Section\n\n**[One](https://a.example/1)**\nBody.\n"
+        assert len(check_thin_sections(md, config)) == 1
+
 
 # ---------------------------------------------------------------------------
 # Blog item shape -- **[Title](url)** *(Source)* ★-rating, and the link-less

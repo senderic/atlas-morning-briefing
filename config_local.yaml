@@ -571,6 +571,9 @@ codex:
     # After this many failed calls in a row the chain stops trying Codex for
     # the rest of the run, so an outage costs a few timeouts, not one per call.
     max_consecutive_failures: 3
+    # Every Codex call runs with no tools; a call site may opt in to web search
+    # alone (none does in this pipeline). See config.yaml and codex_client.py.
+    allow_web_search: true
     # Reasoning effort per tier (the writer keeps `reasoning_effort` above).
     reasoning_effort:
       heavy: "high"
@@ -723,11 +726,23 @@ quality_check:
     recipients:
       - "${RECIPIENT_EMAIL:-your-email@example.com}"
     daily_digest: false
+  # What the run said about itself in its status file (status_file_path).
+  # Share of LLM calls that failed on every rung of the chain: WARN at 25%,
+  # CRITICAL at 50% or when every call failed. synthesis_degraded is CRITICAL
+  # and a report-writer fallback a WARN; a status file that is missing, or
+  # older than the run being checked, is a WARN.
+  status_health:
+    failed_ratio_warn: 0.25
+    failed_ratio_critical: 0.5
   section_floors:
     news: 3
     happenings: 2
     blogs: 3
   judge:
+    # An unjudged morning is INFO; it becomes WARN after this many consecutive
+    # days without a score and CRITICAL (which mails) after skip_critical_days.
+    skip_warn_days: 2
+    skip_critical_days: 3
     # The full rubric: this briefing is judged on being life-first and local.
     dimensions:
       - "tier_1_share"

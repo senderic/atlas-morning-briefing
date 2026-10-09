@@ -66,6 +66,28 @@ RUBRIC_DIMENSIONS = (
 DEFAULT_HISTORY_PATH = "logs/source-health.jsonl"
 DEFAULT_SCORES_PATH = "logs/quality-scores.jsonl"
 DEFAULT_ALERTS_PATH = "logs/quality-alerts.json"
+# Consecutive-day counters (today: how long a pipeline has gone unjudged).
+DEFAULT_STREAKS_PATH = "logs/quality-streaks.json"
+# Where a judge response that could not be parsed is kept for diagnosis.
+DEFAULT_JUDGE_RAW_DIR = "logs"
+JUDGE_RAW_MAX_BYTES = 8000
+
+# How much of a briefing the judge reads. The main briefing runs 14-26k
+# characters before its usage footers; the old 12,000 cut it mid-line and
+# dropped its tail.
+JUDGE_MAX_CHARS = 40000
+
+# quality_check.status_health defaults: the share of a run's LLM calls that
+# failed outright (every rung of the chain) before it is worth a finding.
+DEFAULT_STATUS_RULES: Dict[str, Any] = {
+    "enabled": True,
+    "failed_ratio_warn": 0.25,
+    "failed_ratio_critical": 0.5,
+}
+# quality_check.judge defaults: consecutive unjudged days before judge-skipped
+# stops being an INFO line nobody reads.
+DEFAULT_JUDGE_SKIP_WARN_DAYS = 2
+DEFAULT_JUDGE_SKIP_CRITICAL_DAYS = 3
 
 _JUDGE_SYSTEM_PROMPT = (
     "You are a strict quality auditor for a daily briefing. You score, you do "
@@ -323,20 +345,55 @@ def _build_judge_prompt(sanitized_markdown: str, domain: str, dimensions: Sequen
     )
 
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+def _top_level_objects(text: str) -> List[str]:
+    """Every complete, brace-balanced top-level `{...}` span in ``text``.
+
+    Braces inside JSON strings are not structure, and a `}` with nothing open
+    is prose, not the end of anything.
+    """
+    spans: List[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"' and depth:
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                spans.append(text[start : index + 1])
+    return spans
 
 
 def _extract_json_object(text: str) -> Optional[str]:
-    """Pull a JSON object out of text that may wrap it in prose or fences."""
+    """Pull the judge's JSON object out of text that may wrap it in prose.
+
+    Returns the LAST complete top-level object that is valid JSON. First-`{`
+    to last-`}` was wrong whenever the model said anything else in braces:
+    a restated example before the answer, or a stray `}` after it, produced
+    a span that was not JSON at all and the whole response was thrown away.
+    """
     if not text:
         return None
-    m = _JSON_FENCE_RE.search(text)
-    if m:
-        return m.group(1)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start : end + 1]
+    for candidate in reversed(_top_level_objects(text)):
+        try:
+            if isinstance(json.loads(candidate), dict):
+                return candidate
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
     return None
 
 
@@ -387,6 +444,61 @@ def parse_judge_response(
     return parsed
 
 
+def judge_excerpt(markdown: str, max_chars: int = JUDGE_MAX_CHARS) -> str:
+    """The part of a rendered briefing the judge should read.
+
+    The LLM usage footers ("Codex Chain Usage Summary", "OpenRouter Usage
+    Summary", the key-rotation table ...) are pipeline telemetry, not briefing
+    content: they are dropped, by the same heading test the degraded-content
+    check uses, so a new backend's footer is skipped without a list to
+    maintain. What remains is cut at a line boundary if it is still too long,
+    never mid-line.
+    """
+    from scripts.report_invariants import _is_usage_appendix_heading
+
+    kept: List[str] = []
+    skipping = False
+    for line in (markdown or "").splitlines():
+        heading = re.match(r"^##[ \t]+(.+?)[ \t]*$", line)
+        if heading:
+            skipping = _is_usage_appendix_heading(heading.group(1))
+            if skipping:
+                # The horizontal rule that introduces a footer goes with it.
+                while kept and kept[-1].strip() in ("", "---"):
+                    kept.pop()
+                continue
+        if not skipping:
+            kept.append(line)
+    while kept and kept[-1].strip() in ("", "---"):
+        kept.pop()
+    text = "\n".join(kept)
+    if len(text) <= max_chars:
+        return text
+    cut = text.rfind("\n", 0, max_chars + 1)
+    return text[:cut] if cut > 0 else text[:max_chars]
+
+
+def save_judge_raw(
+    raw: str, pipeline: str, today: date, directory: Optional[str] = None
+) -> Optional[Path]:
+    """Keep a judge response that could not be parsed, truncated to a few KB.
+
+    It used to be discarded, which left weeks of "Could not parse judge output"
+    with nothing to look at. One file per pipeline per day; a rerun overwrites.
+    Never raises.
+    """
+    try:
+        target = Path(directory or DEFAULT_JUDGE_RAW_DIR)
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"judge-raw-{pipeline or 'unknown'}-{today.isoformat()}.txt"
+        data = (raw or "").encode("utf-8")[:JUDGE_RAW_MAX_BYTES]
+        path.write_text(data.decode("utf-8", errors="ignore"), encoding="utf-8")
+        return path
+    except OSError as e:
+        logger.warning("Could not save raw judge output for '%s': %s", pipeline, e)
+        return None
+
+
 def judge_briefing(
     markdown: str,
     config: Dict[str, Any],
@@ -411,7 +523,15 @@ def judge_briefing(
     profile = config.get("briefing_profile", {}) or {}
     domain = profile.get("domain", "AI and technology")
 
-    sanitized = _sanitize_prompt_input(markdown, max_length=12000)
+    judge_cfg = (config.get("quality_check") or {}).get("judge") or {}
+    try:
+        max_chars = int(judge_cfg.get("max_chars", JUDGE_MAX_CHARS))
+    except (TypeError, ValueError):
+        max_chars = JUDGE_MAX_CHARS
+    excerpt = judge_excerpt(markdown, max_chars=max_chars)
+    # Sanitizing strips the fence characters from the briefing itself, so the
+    # only `>>>` in the prompt is the one that closes it.
+    sanitized = _sanitize_prompt_input(excerpt, max_length=max_chars, multiline=True)
     prompt = _build_judge_prompt(sanitized, domain, dimensions)
 
     try:
@@ -428,8 +548,19 @@ def judge_briefing(
 
     parsed = parse_judge_response(raw, dimensions)
     if parsed is None:
+        # The raw text rides along in `detail` so the orchestrator can save
+        # it (it owns the dry-run decision) -- it is removed from the finding
+        # before anything is rendered.
         return (
-            [Finding(INFO, "judge-skipped", "Could not parse judge output as valid JSON", pipeline=pipeline)],
+            [
+                Finding(
+                    INFO,
+                    "judge-skipped",
+                    "Could not parse judge output as valid JSON",
+                    pipeline=pipeline,
+                    detail={"raw": str(raw)},
+                )
+            ],
             None,
         )
 
@@ -528,6 +659,198 @@ def detect_quality_regression(
 
 
 # ---------------------------------------------------------------------------
+# Status files -- what each pipeline said about its own run
+# ---------------------------------------------------------------------------
+
+
+def status_health_rules(config: Dict[str, Any]) -> Dict[str, Any]:
+    """``quality_check.status_health`` merged over DEFAULT_STATUS_RULES."""
+    rules = dict(DEFAULT_STATUS_RULES)
+    block = (config.get("quality_check") or {}).get("status_health") or {}
+    if isinstance(block, dict):
+        rules.update(block)
+    return rules
+
+
+def check_status_health(
+    config: Dict[str, Any],
+    pipeline: str,
+    today: date,
+    status_dir: str = ".",
+) -> List[Finding]:
+    """Findings from a pipeline's own status file (``status_file_path``).
+
+    The runner records how many of its LLM calls failed, whether the lead
+    section fell back to a placeholder, and whether the report writer had to
+    leave its first choice -- and for three weeks nothing read it: every
+    medium- and light-tier call failed in every run while the rendered
+    briefing, built from deterministic fallbacks, passed every other check.
+
+    A status file from an earlier day describes an earlier run, so it is
+    reported as stale and its contents are not judged. One from a LATER day
+    (replaying a past date with ``--date``) is ignored for the same reason.
+    Delivery is deliberately not looked at: a pipeline that emails nobody
+    (finance) is configured that way.
+    """
+    rules = status_health_rules(config)
+    if not rules.get("enabled", True):
+        return []
+
+    name = str(config.get("status_file_path", "status.json"))
+    path = Path(status_dir) / name
+
+    def finding(severity: str, code: str, message: str, **detail: Any) -> Finding:
+        return Finding(severity, code, message, source=name, pipeline=pipeline, detail=detail)
+
+    try:
+        status = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(status, dict):
+            raise ValueError("not a JSON object")
+    except FileNotFoundError:
+        return [finding(WARN, "status-missing", f"No status file at {path}")]
+    except (OSError, ValueError) as e:
+        return [finding(WARN, "status-missing", f"Status file {path} is unreadable: {e}")]
+
+    try:
+        written = datetime.fromisoformat(str(status.get("timestamp"))).date()
+    except ValueError:
+        written = None
+    if written is None or written < today:
+        when = written.isoformat() if written else "an unknown date"
+        return [
+            finding(
+                WARN,
+                "status-stale",
+                f"Status file {path} is from {when}, not the {today.isoformat()} run",
+                status_date=when,
+            )
+        ]
+    if written > today:
+        return []
+
+    findings: List[Finding] = []
+
+    calls = status.get("intelligence_calls")
+    if isinstance(calls, dict):
+        try:
+            total = int(calls.get("calls") or 0)
+            failed = int(calls.get("failed") or 0)
+        except (TypeError, ValueError):
+            total = failed = 0
+        if total > 0 and failed > 0:
+            ratio = failed / total
+            severity = None
+            if failed >= total or ratio >= float(rules["failed_ratio_critical"]):
+                severity = CRITICAL
+            elif ratio >= float(rules["failed_ratio_warn"]):
+                severity = WARN
+            if severity:
+                findings.append(
+                    finding(
+                        severity,
+                        "llm-calls-failing",
+                        f"{failed} of {total} LLM calls failed ({ratio:.0%}) -- "
+                        "those steps shipped their deterministic fallback",
+                        calls=total,
+                        failed=failed,
+                    )
+                )
+
+    if status.get("synthesis_degraded") is True:
+        findings.append(
+            finding(
+                CRITICAL,
+                "synthesis-degraded",
+                "The run recorded synthesis_degraded: its Executive Summary is a placeholder",
+            )
+        )
+
+    try:
+        fallbacks = int(status.get("writer_fallback_count") or 0)
+    except (TypeError, ValueError):
+        fallbacks = 0
+    if fallbacks > 0:
+        findings.append(
+            finding(
+                WARN,
+                "writer-fallback",
+                f"The report writer fell back from its first-choice model {fallbacks} time(s)",
+                count=fallbacks,
+            )
+        )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Streaks -- how many days in a row something has been true
+# ---------------------------------------------------------------------------
+
+
+def load_streaks(path: Optional[str] = None) -> Dict[str, Any]:
+    p = Path(path or DEFAULT_STREAKS_PATH)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_streaks(state: Dict[str, Any], path: Optional[str] = None) -> None:
+    p = Path(path or DEFAULT_STREAKS_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def escalate_judge_skip(
+    finding: Finding,
+    config: Dict[str, Any],
+    today: date,
+    streaks: Dict[str, Any],
+) -> None:
+    """Raise a ``judge-skipped`` finding's severity with its age, in place.
+
+    One unjudged morning is noise (INFO). The judge then went a month without
+    scoring the main briefing and said so as an INFO line every day; nobody
+    reads the same INFO line thirty times. So it becomes WARN on the second
+    consecutive day and CRITICAL -- which mails -- on the third.
+
+    The count is per pipeline and lives in ``streaks``, which starts empty:
+    it is never backfilled from the score log, so the first run after this
+    was introduced reports day 1 however long the judge had already been
+    silent. A second run on the same date does not count twice.
+    """
+    judge_cfg = (config.get("quality_check") or {}).get("judge") or {}
+
+    def threshold(key: str, default: int) -> int:
+        try:
+            return max(1, int(judge_cfg.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    warn_days = threshold("skip_warn_days", DEFAULT_JUDGE_SKIP_WARN_DAYS)
+    critical_days = threshold("skip_critical_days", DEFAULT_JUDGE_SKIP_CRITICAL_DAYS)
+
+    key = f"judge-skipped:{finding.pipeline}"
+    entry = streaks.get(key) if isinstance(streaks.get(key), dict) else {}
+    count = int(entry.get("count", 0) or 0)
+    if entry.get("last_date") != today.isoformat():
+        count += 1
+    streaks[key] = {
+        "count": count,
+        "first_date": entry.get("first_date") or today.isoformat(),
+        "last_date": today.isoformat(),
+    }
+
+    if count >= critical_days:
+        finding.severity = CRITICAL
+    elif count >= warn_days:
+        finding.severity = WARN
+    if count > 1:
+        finding.message += f" ({count} consecutive days without a judge score)"
+    finding.detail["consecutive_days"] = count
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -544,6 +867,9 @@ def run_checks(
     scores_path: str = DEFAULT_SCORES_PATH,
     journal_timeout: int = 180,
     probe_timeout: int = 20,
+    status_dir: Optional[str] = None,
+    streaks_path: Optional[str] = None,
+    judge_raw_dir: Optional[str] = None,
     harvest_journal: Optional[Callable[..., List[Dict[str, Any]]]] = None,
     append_history: Optional[Callable[..., int]] = None,
     load_history: Optional[Callable[..., List[Dict[str, Any]]]] = None,
@@ -560,6 +886,10 @@ def run_checks(
     implementation is imported lazily so an ImportError in one sibling
     module can't take the others down. Nothing here touches disk when
     ``dry_run`` is True except reading what's already there.
+
+    ``status_dir`` is where the pipelines' status files live (the runner
+    writes them to its working directory); None skips that layer, which is
+    what a caller that only has rendered markdown wants.
     """
     today = today or date.today()
     findings: List[Finding] = []
@@ -571,13 +901,23 @@ def run_checks(
         _load_hist = load_history or _lazy_import("scripts.source_health", "load_history")
         _detect_rot = detect_rot or _lazy_import("scripts.source_health", "detect_rot")
 
-        records = _harvest(since=since, timeout=journal_timeout)
+        # One journald tag per pipeline being checked (`atlas-briefing`,
+        # `finance-briefing`, ...), so a run over a subset neither harvests
+        # nor reports on the others.
+        units = [f"{pipeline}-briefing" for pipeline in configs]
+        records = _harvest(since=since, timeout=journal_timeout, units=units)
 
         if dry_run:
             history = records
         else:
             _append_hist(records, path=history_path)
             history = _load_hist(path=history_path)
+        # The history file is shared; another pipeline's records belong to
+        # the run that checks that pipeline.
+        history = [
+            r for r in history
+            if not isinstance(r, dict) or r.get("pipeline", "") in configs or not r.get("pipeline")
+        ]
 
         probes = None
         if deep:
@@ -669,6 +1009,31 @@ def run_checks(
                     Finding(WARN, "report-invariants-unavailable", f"check_report failed for '{pipeline}': {e}", pipeline=pipeline)
                 )
 
+    # ---- Status files: what each run said about itself -----------------
+    if status_dir is not None:
+        for pipeline, config in configs.items():
+            try:
+                status_findings = check_status_health(config, pipeline, today, status_dir=status_dir)
+            except Exception as e:
+                findings.append(
+                    Finding(WARN, "status-missing", f"Status check failed for '{pipeline}': {e}", pipeline=pipeline)
+                )
+                continue
+            reported = {(f.pipeline, f.code) for f in findings}
+            for f in status_findings:
+                # A run that never happened is one fact, already reported.
+                if f.code in ("status-stale", "status-missing") and (pipeline, "briefing-missing") in reported:
+                    continue
+                # So is a placeholder lead section, which Layer 2 found in the
+                # rendered text; the status flag is the backstop for the day
+                # the placeholder's wording changes.
+                if f.code == "synthesis-degraded" and any(
+                    g.pipeline == pipeline and g.code == "degraded-content" and g.severity == CRITICAL
+                    for g in findings
+                ):
+                    continue
+                findings.append(f)
+
     # ---- Layer 3: LLM judge --------------------------------------------
     judge_records: Dict[str, Dict[str, Any]] = {}
     if not no_judge:
@@ -687,20 +1052,47 @@ def run_checks(
             logger.warning("Building the LLM client for the quality judge raised: %s", e)
             client = None
 
-        if client is None:
+        streaks = load_streaks(streaks_path)
+        judgeable = [p for p in configs if markdowns.get(p)]
+        if client is None and not judgeable:
             findings.append(Finding(INFO, "judge-skipped", "No LLM client available for the quality judge", source="layer3"))
         else:
             for pipeline, config in configs.items():
                 text = markdowns.get(pipeline)
                 if not text:
+                    # Nothing to judge is briefing-missing's news, and leaves
+                    # this pipeline's streak where it was.
                     continue
-                try:
-                    jf, record = _judge(text, config, pipeline, today, client)
-                except Exception as e:
+                if client is None:
                     jf, record = (
-                        [Finding(INFO, "judge-skipped", f"Judge raised an exception: {e}", pipeline=pipeline)],
+                        [Finding(INFO, "judge-skipped", "No LLM client available for the quality judge", pipeline=pipeline)],
                         None,
                     )
+                else:
+                    try:
+                        jf, record = _judge(text, config, pipeline, today, client)
+                    except Exception as e:
+                        jf, record = (
+                            [Finding(INFO, "judge-skipped", f"Judge raised an exception: {e}", pipeline=pipeline)],
+                            None,
+                        )
+                for f in jf:
+                    if f.code != "judge-skipped":
+                        continue
+                    raw = f.detail.pop("raw", None)
+                    if raw and not dry_run:
+                        saved = save_judge_raw(raw, pipeline, today, directory=judge_raw_dir)
+                        if saved is not None:
+                            logger.warning(
+                                "Judge output for '%s' could not be parsed; raw output saved to %s",
+                                pipeline, saved,
+                            )
+                            f.message += f" (raw output saved to {saved})"
+                            f.detail["raw_path"] = str(saved)
+                    f.pipeline = f.pipeline or pipeline
+                    escalate_judge_skip(f, config, today, streaks)
+                if record is not None:
+                    streaks.pop(f"judge-skipped:{pipeline}", None)
                 findings.extend(jf)
                 if record is not None:
                     judge_records[pipeline] = record
@@ -714,6 +1106,12 @@ def run_checks(
                             append_score_record(record, path=scores_path)
                         except Exception as e:
                             logger.warning("Could not append judge score record: %s", e)
+            if not dry_run:
+                try:
+                    if streaks or Path(streaks_path or DEFAULT_STREAKS_PATH).exists():
+                        save_streaks(streaks, streaks_path)
+                except OSError as e:
+                    logger.warning("Could not save judge-skip streaks: %s", e)
 
     return sort_findings(findings), judge_records
 
@@ -782,8 +1180,12 @@ def render_digest(findings: List[Finding], judge_records: Dict[str, Dict[str, An
     return "\n".join(lines)
 
 
-def digest_path_for(today: date) -> str:
-    return f"logs/quality-digest-{today.isoformat()}.md"
+def digest_path_for(today: date, suffix: str = "") -> str:
+    """Digest file for a run. ``suffix`` keeps a second, narrower run on the
+    same morning (the finance check) from overwriting the first one's."""
+    suffix = re.sub(r"[^A-Za-z0-9_-]", "", suffix or "")
+    tail = f"-{suffix}" if suffix else ""
+    return f"logs/quality-digest-{today.isoformat()}{tail}.md"
 
 
 def write_digest(content: str, today: date, path: Optional[str] = None) -> Path:
@@ -1025,13 +1427,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         dest="configs",
         default=None,
-        help="Pipeline config file (repeatable). Default: config.yaml and config_local.yaml",
+        help="Pipeline config file (repeatable). Default: config.yaml, config_local.yaml "
+        "and config_finance.yaml",
     )
     parser.add_argument("--since", default="-2d", help="journald window for the source-health harvest")
     parser.add_argument("--deep", action="store_true", help="also live-probe blog_feeds (weekly run)")
     parser.add_argument("--no-judge", action="store_true", help="skip the Layer 3 LLM judge")
     parser.add_argument("--dry-run", action="store_true", help="compute and print, write nothing, notify nothing")
     parser.add_argument("--date", default=None, help="override 'today' as YYYY-MM-DD, for replaying a past day")
+    parser.add_argument(
+        "--digest-suffix",
+        default="",
+        help="write logs/quality-digest-DATE-<suffix>.md, so a run over a subset of "
+        "pipelines does not overwrite the day's main digest",
+    )
     return parser
 
 
@@ -1047,7 +1456,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.error("Invalid --date '%s', expected YYYY-MM-DD", args.date)
             return 2
 
-    config_paths = args.configs or ["config.yaml", "config_local.yaml"]
+    config_paths = args.configs or ["config.yaml", "config_local.yaml", "config_finance.yaml"]
 
     # Uses briefing_runner's own load_config -- the source of truth for
     # ${VAR:-default} interpolation -- imported lazily so a broken runner
@@ -1083,6 +1492,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             no_judge=args.no_judge,
             today=today,
             dry_run=args.dry_run,
+            # The runner writes each status file to its working directory,
+            # which the wrapper scripts make the repo root for both.
+            status_dir=".",
         )
     except Exception as e:
         logger.error("Quality check failed: %s", e)
@@ -1092,7 +1504,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         digest = render_digest(findings, judge_records, today)
         print(digest)
         if not args.dry_run:
-            write_digest(digest, today)
+            write_digest(digest, today, digest_path_for(today, args.digest_suffix))
         route_alerts(
             findings,
             digest_markdown=digest,

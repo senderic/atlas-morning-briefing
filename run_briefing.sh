@@ -23,11 +23,19 @@ fi
 RC_MAIN=0
 RC_LOCAL=0
 
+# A dry run changes nothing cron-facing tools read. Its log lines go to their
+# own journald tags, because the quality check harvests per-source yields from
+# the real ones; and it skips the pre-flight probe, which rewrites
+# .model-availability.json (the dry run still reads the existing file).
+DRY_RUN=0
+TAG_SUFFIX=""
+case " $* " in *" --dry-run "*) DRY_RUN=1; TAG_SUFFIX="-dryrun" ;; esac
+
 # Pre-flight model availability check. Probes the tiered model roster from
 # config.yaml and writes .model-availability.json, which both briefings read to
 # pin a working model per tier. A non-zero exit means some tier had no reachable
 # model; the run continues on the configured defaults either way.
-if [ "$RUN_LOCAL_ONLY" != "1" ]; then
+if [ "$RUN_LOCAL_ONLY" != "1" ] && [ "$DRY_RUN" != "1" ]; then
     "$DIR/.venv/bin/python3" "$DIR/scripts/preflight_model_check.py" \
         --config "$DIR/config.yaml" 2>&1 | logger -t preflight-check
     RC_PREFLIGHT="${PIPESTATUS[0]}"
@@ -40,13 +48,13 @@ fi
 # PIPESTATUS, not $?: the pipe ends in logger, so $? is logger's status and a
 # failed briefing would look like a success to cron.
 if [ "$RUN_LOCAL_ONLY" != "1" ]; then
-    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config.yaml" --log-level DEBUG "$@" 2>&1 | logger -t atlas-briefing
+    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config.yaml" --log-level DEBUG "$@" 2>&1 | logger -t "atlas-briefing$TAG_SUFFIX"
     RC_MAIN="${PIPESTATUS[0]}"
 fi
 
 # Local briefing runs after main in manual/full mode, or alone at 07:00 in cron.
 if [ "$RUN_MAIN_ONLY" != "1" ]; then
-    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config_local.yaml" --log-level DEBUG "$@" 2>&1 | logger -t local-briefing
+    "$DIR/.venv/bin/python3" "$DIR/scripts/briefing_runner.py" --config "$DIR/config_local.yaml" --log-level DEBUG "$@" 2>&1 | logger -t "local-briefing$TAG_SUFFIX"
     RC_LOCAL="${PIPESTATUS[0]}"
 fi
 
@@ -56,7 +64,9 @@ fi
 # missing when it was still being written. Running here means the audit starts
 # when the work is actually finished, whatever that takes.
 if [ "$RUN_MAIN_ONLY" != "1" ] && [ "${SKIP_QUALITY_CHECK:-0}" != "1" ]; then
-    QC_ARGS=()
+    # These two pipelines only: finance has not run yet at this point and is
+    # audited by run_finance_briefing.sh when it finishes.
+    QC_ARGS=(--config "$DIR/config.yaml" --config "$DIR/config_local.yaml")
     # Briefings run Mon-Sat, so the weekly deep probe rides along on Saturday
     # rather than firing on a Sunday when there is no briefing to audit.
     [ "$(date +%u)" = "6" ] && QC_ARGS+=("--deep")

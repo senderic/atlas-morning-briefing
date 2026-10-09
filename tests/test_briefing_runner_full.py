@@ -175,8 +175,10 @@ class TestStatePersistence:
         assert status["intelligence_degraded"] is True
         assert status["intelligence_calls"] == {"calls": 1, "successful": 0, "failed": 1}
 
-    def test_save_and_load_roundtrip(self, runner, tmp_path, monkeypatch):
+    def test_save_and_load_roundtrip(self, cfg, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
+        # A real run: a dry run reads state but never writes it.
+        runner = BriefingRunner(config=cfg, dry_run=False)
         papers = [{"title": "P1"}, {"title": "P2"}]
         runner._save_state(
             papers, [{"title": "B"}], [{"title": "N"}],

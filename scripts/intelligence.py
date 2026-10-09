@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from scripts.llm_client import BaseLLMClient
 from scripts.interest_graph import generate_graph_queries, parse_graph
 from scripts.leak_detection import is_cot_leak
+from scripts.prompt_safety import sanitize_prompt_input
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,25 +55,9 @@ SYSTEM_PROMPT = (
 )
 
 
-def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
-    """
-    Sanitize external input before embedding in LLM prompts.
-
-    Strips prompt injection markers and truncates to prevent abuse.
-
-    Args:
-        text: Raw input text from external source.
-        max_length: Maximum allowed character length.
-
-    Returns:
-        Sanitized text safe for prompt inclusion.
-    """
-    if not isinstance(text, str):
-        return ""
-    text = text[:max_length]
-    # Strip characters that could be used for prompt injection / XML tag spoofing
-    text = re.sub(r"</?(?:system|human|assistant|instructions?|prompt)[^>]*>", "", text, flags=re.IGNORECASE)
-    return text
+# Kept under its historical private name: this module's prompt builders and
+# the quality checker's judge both import it from here.
+_sanitize_prompt_input = sanitize_prompt_input
 
 
 # Meta-commentary markers a model sometimes appends to a ranked summary,
@@ -164,6 +149,15 @@ def _strip_trailing_rationale(text: str) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
+    # briefing_profile.reproduction.setup when the config gives none.
+    DEFAULT_REPRO_SETUP = (
+        "A single workstation or small server, no GPU cluster",
+        "Hosted LLM APIs for model access",
+        "Python and standard open-source ML libraries",
+    )
+    # The five reproduction-feasibility dimensions, 1-5 each, 25 in total.
+    REPRO_DIMENSIONS = ("code", "data", "infra", "api", "effort")
+
     def __init__(
         self,
         client: BaseLLMClient,
@@ -192,6 +186,14 @@ class BriefingIntelligence:
         self.briefing_landscape = profile.get(
             "landscape", "the AI and technology landscape"
         )
+        # What the reader can actually run a paper on. The reproduction-
+        # feasibility prompt used to hardcode one machine and one vendor's API
+        # (and kept scoring papers against it long after the reader had left
+        # both); it is config now, with a deliberately generic default.
+        repro = profile.get("reproduction") or {}
+        setup = [str(line).strip() for line in (repro.get("setup") or []) if str(line).strip()]
+        self.repro_setup = setup or list(self.DEFAULT_REPRO_SETUP)
+        self.repro_limits = str(repro.get("limits") or "").strip()
         # Ordered ranking tiers ("what matters most first"). Empty by default so
         # briefings without a configured order keep their previous behavior.
         self.briefing_priorities = [
@@ -678,8 +680,16 @@ class BriefingIntelligence:
             "Each item must start with [n] or n."
         )
 
+        # A blurb written from recall invents biographies; one written from a
+        # search cites them. The keyword is passed only when the feature is on
+        # -- a backend with search (Codex) honours it with every local tool
+        # still off, and the others ignore it. This prompt carries titles and
+        # names only, never article bodies.
+        extra: Dict[str, Any] = {}
+        if self.config.get("features", {}).get("author_blurb_web_search", False):
+            extra["web_search"] = True
         result = self.client.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT, **extra
         )
         if not result:
             return items
@@ -892,18 +902,19 @@ class BriefingIntelligence:
         Assess reproduction feasibility and re-rank papers by actionability.
 
         Uses structured scoring across 5 dimensions to filter out papers
-        that are not practically reproducible on our setup (single EC2,
-        Amazon Bedrock, no GPU cluster).
+        that are not practically reproducible on the reader's setup, which is
+        described in config (``briefing_profile.reproduction``).
 
         Scoring dimensions (each 1-5):
-          1. code_available — Is code open-source and runnable?
-          2. data_accessible — Is data open/downloadable (<10GB)?
-          3. infra_fit — Can run on single EC2 + Bedrock (no GPU cluster)?
-          4. bedrock_ready — Can use Bedrock models (Claude/Titan) directly?
+          1. code — Is code open-source and runnable?
+          2. data — Is data open/downloadable?
+          3. infra — Does it run on the configured setup?
+          4. api — Can the hosted LLM APIs in that setup stand in directly?
           5. effort — Time to reproduce (5=weekend, 1=months)
 
-        Papers scoring < 15/25 are demoted (moved below higher-scoring ones).
-        Papers scoring < 10/25 are dropped from top picks entirely.
+        Papers are re-ranked by total. One scoring below ``repro_min_score``
+        (of 25) is dropped; one whose line did not carry all five dimensions
+        was not assessed and is kept, after the papers that passed.
 
         Args:
             papers: Top-scored papers (typically 3-10).
@@ -924,22 +935,27 @@ class BriefingIntelligence:
             )
 
         papers_block = "\n\n".join(paper_texts)
+        setup_block = "\n".join(f"- {line}" for line in self.repro_setup)
+        limits_line = f"Limits: {self.repro_limits}\n" if self.repro_limits else ""
         prompt = (
             "You are evaluating papers for PRACTICAL reproduction on this setup:\n"
-            "- Single EC2 GPU instance available (g5.xlarge = 1x A10G 24GB, or trn1.2xlarge = AWS Trainium)\n"
-            "- Amazon Bedrock API (Claude Sonnet/Opus, Titan Embeddings)\n"
-            "- Python + standard ML libraries, Kubernetes OK if single-node\n"
-            "- Budget: <$50 per paper, <1 week effort\n\n"
+            f"{setup_block}\n"
+            f"{limits_line}\n"
             "Score each paper on 5 dimensions (1-5 each, 25 max):\n"
-            "1. code_available: 5=open repo+README, 3=partial code, 1=no code\n"
-            "2. data_accessible: 5=open data <50GB, 3=needs request/large, 1=proprietary\n"
-            "3. infra_fit: 5=CPU/API only, 4=single GPU(A10G/Trainium), 3=multi-GPU single node, 2=multi-node cluster, 1=datacenter/TPU pod\n"
-            "4. bedrock_ready: 5=can swap in Bedrock models directly, 3=needs adapter, 1=incompatible\n"
+            "1. code: 5=open repo+README, 3=partial code, 1=no code\n"
+            "2. data: 5=open data of manageable size, 3=needs request/very large, 1=proprietary\n"
+            "3. infra: 5=runs on the setup above as described, 4=needs one modest addition "
+            "(e.g. a single rented GPU), 3=multi-GPU single node, 2=multi-node cluster, "
+            "1=datacenter/TPU pod\n"
+            "4. api: 5=the hosted LLM APIs in the setup can be used directly, 3=needs an "
+            "adapter or a model swap, 1=needs something those APIs do not expose "
+            "(weights, internals, fine-tuning)\n"
             "5. effort: 5=weekend(S), 4=1week(M), 3=2weeks(L), 2=month(XL), 1=impossible\n\n"
-            "For each paper respond in this EXACT format (one line each):\n"
-            "[number] code:X data:X infra:X bedrock:X effort:X | verdict\n\n"
-            "Example: [1] code:5 data:4 infra:5 bedrock:5 effort:4 | Open benchmark + Bedrock RAG, easy to reproduce\n"
-            "Example: [2] code:1 data:1 infra:1 bedrock:2 effort:1 | No code, needs GPU cluster, skip\n\n"
+            "For each paper respond in this EXACT format (one line each), with all "
+            "five scores present:\n"
+            "[number] code:X data:X infra:X api:X effort:X | verdict\n\n"
+            "Example: [1] code:5 data:4 infra:5 api:5 effort:4 | Open benchmark, API-only pipeline, easy to reproduce\n"
+            "Example: [2] code:1 data:1 infra:1 api:2 effort:1 | No code, needs a GPU cluster, skip\n\n"
             f"<papers>\n{papers_block}\n</papers>"
         )
 
@@ -959,7 +975,7 @@ class BriefingIntelligence:
                 idx = int(line[1:bracket_end]) - 1
                 rest = line[bracket_end + 1:].strip()
 
-                # Parse scores: code:X data:X infra:X bedrock:X effort:X | verdict
+                # Parse scores: code:X data:X infra:X api:X effort:X | verdict
                 scores = {}
                 verdict = ""
                 if "|" in rest:
@@ -968,22 +984,34 @@ class BriefingIntelligence:
                 else:
                     scores_part = rest
 
-                for dim in ["code", "data", "infra", "bedrock", "effort"]:
-                    match = re.search(rf"{dim}:(\d)", scores_part)
+                for dim in self.REPRO_DIMENSIONS:
+                    match = re.search(rf"\b{dim}:\s*([1-5])(?!\d)", scores_part)
                     if match:
                         scores[dim] = int(match.group(1))
 
-                if 0 <= idx < len(papers) and scores:
-                    total = sum(scores.values())
-                    papers[idx]["repro_scores"] = scores
-                    papers[idx]["repro_total"] = total
-                    papers[idx]["repro_verdict"] = verdict
-                    papers[idx]["reproduction_assessment"] = (
-                        f"Score: {total}/25 "
-                        f"(code:{scores.get('code',0)} data:{scores.get('data',0)} "
-                        f"infra:{scores.get('infra',0)} bedrock:{scores.get('bedrock',0)} "
-                        f"effort:{scores.get('effort',0)}) — {verdict}"
+                if not 0 <= idx < len(papers):
+                    continue
+                # All five or nothing. A line with dimensions missing is not
+                # a low score, it is no assessment: summing what happened to
+                # parse turned one stray "code:4" into 4/25 and the gate
+                # below then dropped a paper that was never scored. Leaving
+                # the keys unset keeps it, without a repro line.
+                if len(scores) != len(self.REPRO_DIMENSIONS):
+                    missing = [d for d in self.REPRO_DIMENSIONS if d not in scores]
+                    logger.info(
+                        "Repro assessment for paper %d incomplete (missing %s); "
+                        "treating it as not assessed", idx + 1, ", ".join(missing),
                     )
+                    continue
+                total = sum(scores.values())
+                papers[idx]["repro_scores"] = scores
+                papers[idx]["repro_total"] = total
+                papers[idx]["repro_verdict"] = verdict
+                papers[idx]["reproduction_assessment"] = (
+                    f"Score: {total}/25 "
+                    + " ".join(f"{dim}:{scores[dim]}" for dim in self.REPRO_DIMENSIONS)
+                    + f" — {verdict}"
+                )
             except (ValueError, IndexError) as e:
                 logger.debug(f"Failed to parse repro line: {line}, error: {e}")
                 continue
@@ -1242,6 +1270,9 @@ class BriefingIntelligence:
             summary = _sanitize_prompt_input(
                 article.get("summary", "")[:summary_limit],
                 max_length=summary_limit + 100,
+                # A newsletter body runs to several stories; its paragraph
+                # breaks are content. An RSS snippet is one line.
+                multiline=article.get("input_type") == "email_newsletter",
             )
             published = _sanitize_prompt_input(article.get("published", ""), max_length=60)
             blog_lines.append(f"[{i+1}] {title} ({source}; published {published}): {summary}\n{_newsletter_date_note(article)}")
@@ -1358,7 +1389,9 @@ class BriefingIntelligence:
         for item in ranked[:5]:
             article = item.copy()
             excerpt = article.get("brief_summary") or article.get("summary") or article.get("description") or article.get("snippet") or ""
-            article["brief_summary"] = _sanitize_prompt_input(excerpt, max_length=2400)
+            article["brief_summary"] = _sanitize_prompt_input(
+                excerpt, max_length=2400, multiline=True
+            )
             result.append(article)
         return result
 
@@ -1505,11 +1538,11 @@ class BriefingIntelligence:
 
         titles = []
         for p in papers[:15]:
-            titles.append(f"[paper] {p.get('title', '')}")
+            titles.append(f"[paper] {_sanitize_prompt_input(p.get('title', ''), max_length=300)}")
         for b in blogs[:10]:
-            titles.append(f"[blog] {b.get('title', '')}")
+            titles.append(f"[blog] {_sanitize_prompt_input(b.get('title', ''), max_length=300)}")
         for n in news[:10]:
-            titles.append(f"[news] {n.get('title', '')}")
+            titles.append(f"[news] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}")
 
         if not titles:
             return []
@@ -1594,8 +1627,10 @@ class BriefingIntelligence:
         if papers:
             paper_items = []
             for p in papers[:10]:
-                title = p.get("title", "")
-                summary = p.get("brief_summary", p.get("ai_summary", ""))
+                title = _sanitize_prompt_input(p.get("title", ""), max_length=500)
+                summary = _sanitize_prompt_input(
+                    p.get("brief_summary", p.get("ai_summary", "")), max_length=1200
+                )
                 if summary:
                     paper_items.append(f"- {title}: {summary}")
                 else:
@@ -1608,13 +1643,20 @@ class BriefingIntelligence:
         if blogs:
             blog_items = []
             for b in blogs[:8]:
-                source = b.get("source", "")
-                title = b.get("title", "")
+                source = _sanitize_prompt_input(b.get("source", ""), max_length=100)
+                title = _sanitize_prompt_input(b.get("title", ""), max_length=300)
                 published = _sanitize_prompt_input(b.get("published", ""), max_length=60)
+                # A newsletter excerpt keeps its paragraphs; everything else
+                # in this list is a one-line field.
+                is_newsletter = b.get("input_type") == "email_newsletter"
                 summary = b.get("brief_summary") or b.get("summary", "")
-                summary = _sanitize_prompt_input(summary, max_length=2400)
-                if b.get("input_type") == "email_newsletter" and b.get("brief_summary"):
-                    summary += "\nSource excerpt: " + _sanitize_prompt_input(b.get("summary", ""), max_length=2400)
+                summary = _sanitize_prompt_input(
+                    summary, max_length=2400, multiline=is_newsletter
+                )
+                if is_newsletter and b.get("brief_summary"):
+                    summary += "\nSource excerpt: " + _sanitize_prompt_input(
+                        b.get("summary", ""), max_length=2400, multiline=True
+                    )
                 date_note = _newsletter_date_note(b)
                 if date_note:
                     summary += "\n" + date_note
@@ -1641,7 +1683,7 @@ class BriefingIntelligence:
         if news:
             news_items = []
             for n in news[:10]:
-                title = n.get("title", "")
+                title = _sanitize_prompt_input(n.get("title", ""), max_length=300)
                 summary = n.get("brief_summary") or n.get("description") or n.get("snippet", "")
                 summary = _sanitize_prompt_input(summary, max_length=1200)
                 if summary:
@@ -1653,9 +1695,10 @@ class BriefingIntelligence:
         if top_papers:
             top_items = []
             for p in top_papers:
-                reason = p.get("relevance_reason", "")
+                reason = _sanitize_prompt_input(p.get("relevance_reason", ""), max_length=300)
+                title = _sanitize_prompt_input(p.get("title", ""), max_length=500)
                 top_items.append(
-                    f"- {p.get('title', '')} (score: {p.get('score', 0):.1f})"
+                    f"- {title} (score: {p.get('score', 0):.1f})"
                     + (f" -- {reason}" if reason else "")
                 )
             sections.append("TOP PAPERS FOR REPRODUCTION:\n" + "\n".join(top_items))
@@ -1701,7 +1744,11 @@ class BriefingIntelligence:
             cross_source_note = (
                 "\n\n<cross_source_signals>\n"
                 "These topics appear in 2+ sources (PRIORITIZE in summary):\n"
-                + "\n".join(f"- {s}" for s in cross_source_signals)
+                # Built from n-grams of raw titles, so it is feed text too.
+                + "\n".join(
+                    f"- {_sanitize_prompt_input(s, max_length=300)}"
+                    for s in cross_source_signals
+                )
                 + "\n</cross_source_signals>"
             )
 
@@ -1847,11 +1894,11 @@ class BriefingIntelligence:
         # Build list of current items
         current_items = []
         for p in papers[:10]:
-            current_items.append(f"[paper] {p.get('title', '')}")
+            current_items.append(f"[paper] {_sanitize_prompt_input(p.get('title', ''), max_length=300)}")
         for b in blogs[:10]:
-            current_items.append(f"[blog] {b.get('title', '')}")
+            current_items.append(f"[blog] {_sanitize_prompt_input(b.get('title', ''), max_length=300)}")
         for n in news[:10]:
-            current_items.append(f"[news] {n.get('title', '')}")
+            current_items.append(f"[news] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}")
 
         if not current_items:
             return state, papers, blogs, news
@@ -2074,7 +2121,11 @@ class BriefingIntelligence:
         context_parts = []
         for date in sorted(items_by_date.keys()):
             items = items_by_date[date]
-            titles = [f"- {i.get('title', '')} ({i.get('type', 'item')})" for i in items]
+            titles = [
+                f"- {_sanitize_prompt_input(i.get('title', ''), max_length=300)} "
+                f"({_sanitize_prompt_input(str(i.get('type', 'item')), max_length=30)})"
+                for i in items
+            ]
             context_parts.append(f"{date}:\n" + "\n".join(titles))
 
         if not context_parts:

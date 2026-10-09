@@ -39,7 +39,9 @@ def _make_runner(tmp_path, monkeypatch, fetch_weekday=5):
         "gemini": {"enabled": False},
         "pdf": {"enabled": False},
     }
-    return BriefingRunner(config=config, dry_run=True)
+    # A real run (conftest makes delivery impossible): the cache lives in the
+    # state file, which a dry run does not write.
+    return BriefingRunner(config=config, dry_run=False)
 
 
 def _sample_happenings(n=3):
