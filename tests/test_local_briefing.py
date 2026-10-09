@@ -156,13 +156,15 @@ MAIN_CONFIG = {
 @pytest.fixture
 def local_runner(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(config=LOCAL_NEWS_CONFIG, dry_run=True)
+    # A real run (conftest makes delivery impossible): these tests check the
+    # state, snapshots and briefing a run writes, which a dry run does not.
+    return BriefingRunner(config=LOCAL_NEWS_CONFIG, dry_run=False)
 
 
 @pytest.fixture
 def main_runner(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(config=MAIN_CONFIG, dry_run=True)
+    return BriefingRunner(config=MAIN_CONFIG, dry_run=False)
 
 
 def _sample_news(n: int = 5):
@@ -272,6 +274,34 @@ class TestConfigDrivenDefaults:
 
 
 class TestLocalMarkdownRendering:
+    def test_raw_feed_html_cannot_hide_usage_footer_in_email(self, local_runner):
+        """Catches a truncated RSS tag swallowing the rest of the HTML email."""
+        from scripts.email_distributor import EmailDistributor
+
+        local_runner.llm_client.get_usage_summary = MagicMock(
+            return_value="\n---\n\n## LM Usage Summary\n\n| Input | Output |\n| ---: | ---: |\n| 123 | 45 |\n"
+        )
+        local_runner.report_writer.get_usage_summary = MagicMock(return_value="")
+        blogs = [{
+            "title": "Local update",
+            "source": "Local RSS",
+            "link": "https://example.com/update",
+            # The renderer truncates unprocessed summaries. Before the fix,
+            # that cut could land inside this tag and make the HTML sanitizer
+            # discard the token footer and everything after the article.
+            "summary": '<figure><img alt="' + ("x" * 400) + '">Visible update</figure>',
+        }]
+
+        markdown = local_runner.generate_markdown_briefing(
+            papers=[], blogs=blogs, stocks=[], news=[], top_papers=[]
+        )
+        html = EmailDistributor("", "")._markdown_to_html(markdown)
+
+        assert "Visible update" in html
+        assert "LM Usage Summary" in html
+        assert "123" in html
+        assert "45" in html
+
     def test_local_title(self, local_runner):
         news = _sample_news(5)
         blogs = _sample_blogs(4)
@@ -280,6 +310,30 @@ class TestLocalMarkdownRendering:
             top_papers=[], synthesis={}, weekly_deep_dive="",
         )
         assert "# San Diego Local News Briefing" in md
+
+    def test_final_render_drops_past_date_added_to_happening_summary(
+        self, local_runner, monkeypatch
+    ):
+        """Catches stale events that become evident only after LLM enrichment."""
+        import scripts.briefing_runner as br
+        from datetime import datetime as real_datetime
+
+        class SeptemberFirst(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 9, 1)
+
+        monkeypatch.setattr(br, "datetime", SeptemberFirst)
+        md = local_runner.generate_markdown_briefing(
+            papers=[], blogs=[], stocks=[], news=[], top_papers=[],
+            happenings=[{
+                "title": "Weekend street fair",
+                "url": "https://events.example/fair",
+                "brief_summary": "The fair ran August 29-30 in Pacific Beach.",
+            }],
+        )
+
+        assert "Weekend street fair" not in md
 
     def test_local_news_heading(self, local_runner):
         news = _sample_news(5)
@@ -469,7 +523,7 @@ class TestLocalRunOrchestration:
         base_config_local = dict(LOCAL_NEWS_CONFIG)
         base_config_local["interest_profile"] = [{"topic": "A", "weight": 1.0}]
         monkeypatch.chdir(tmp_path)
-        runner = BriefingRunner(config=base_config_local, dry_run=True)
+        runner = BriefingRunner(config=base_config_local, dry_run=False)
 
         runner.intelligence = MagicMock()
         runner.intelligence.available = True
@@ -560,7 +614,13 @@ class TestLocalRunOrchestration:
         main_runner.intelligence.assess_reproduction_feasibility.side_effect = lambda p: p
         main_runner.intelligence.generate_author_blurbs.side_effect = lambda items, t: items
         main_runner.intelligence.synthesize_briefing.return_value = {"editorial_intro": "Main summary"}
-        main_runner.intelligence.client.invoke.return_value = "Extension section body"
+        main_runner.report_writer = MagicMock()
+        main_runner.report_writer.available = True
+        main_runner.report_writer.model = "test-writer"
+        main_runner.report_writer.last_backend = "codex"
+        main_runner.report_writer.fallback_count = 0
+        main_runner.report_writer.invoke.return_value = "Extension section body"
+        main_runner.report_writer.get_usage_summary.return_value = ""
         main_runner.intelligence.detect_entity_mentions.return_value = []
         main_runner._enrich_papers = MagicMock(side_effect=lambda p, t: p)
 
@@ -572,10 +632,10 @@ class TestLocalRunOrchestration:
             rc = main_runner.run()
 
         assert rc in (0, 1)
-        # One client call per declared extension section.
+        # One writer call per declared extension section.
         tiers = [
             kwargs.get("tier")
-            for _, kwargs in main_runner.intelligence.client.invoke.call_args_list
+            for _, kwargs in main_runner.report_writer.invoke.call_args_list
         ]
         assert tiers == ["heavy", "heavy"]
 
@@ -623,6 +683,17 @@ class TestShippedLocalConfig:
     def test_happenings_lead_the_content_sections(self):
         order = self._config()["section_order"]
         assert order.index("happenings") < order.index("news") < order.index("blogs")
+
+    def test_happenings_heading_is_rendered_as_things_to_do(self):
+        config = self._config()
+        runner = BriefingRunner(config=config, dry_run=True)
+
+        rendered = runner._render_happenings([{
+            "title": "Pacific Beach cleanup",
+            "url": "https://events.example/cleanup",
+        }])
+
+        assert "## Things To Do In and Around Pacific Beach" in rendered
 
     def test_alerts_lead_the_section_order(self):
         assert self._config()["section_order"][0] == "alerts"

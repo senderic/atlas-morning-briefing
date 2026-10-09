@@ -5,7 +5,9 @@ Opencode CLI client.
 
 Calls `opencode run --format json` as a subprocess and parses the NDJSON
 event stream to extract response text. Uses free-tier OpenCode models
-(opencode/nemotron-3-ultra-free, opencode/deepseek-v4-flash-free) by default.
+(opencode/muse-spark-1.3-contributor-free,
+opencode/nemotron-3.5-lightning-free, opencode/ling-3.1-flash-free)
+by default.
 
 Reasoning control is handled via the capability registry (config/model_capabilities.yaml)
 which defines per-model how to disable reasoning (CLI flags, model swap, etc.).
@@ -28,17 +30,9 @@ logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
-    "heavy": "opencode/nemotron-3-ultra-free",
-    "medium": "opencode/deepseek-v4-flash-free",
-    "light": "opencode/deepseek-v4-flash-free",
-}
-
-# Backup models tried in order if the primary model for a tier fails
-# (non-zero exit, empty response, or timeout).
-DEFAULT_FALLBACK_MODELS = {
-    "heavy": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
-    "medium": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
-    "light": ["opencode/mimo-v2.5-free", "opencode/nemotron-3.5-lightning-free"],
+    "heavy": "opencode/muse-spark-1.3-contributor-free",
+    "medium": "opencode/nemotron-3.5-lightning-free",
+    "light": "opencode/ling-3.1-flash-free",
 }
 
 DEFAULT_PRICING = {
@@ -46,9 +40,9 @@ DEFAULT_PRICING = {
     "output_per_million": 0.28,
 }
 
-# Retry policy for retryable errors (rate limits, server overload).
-# Non-retryable errors (model not found, insufficient balance) skip
-# straight to the next model in the fallback chain.
+# Retry policy for retryable errors (rate limits, server overload), applied
+# to THIS model only. Non-retryable errors (model not found, insufficient
+# balance) fail the rung immediately so the chain can advance.
 MAX_RETRIES_PER_MODEL = 2
 RETRY_BACKOFF_BASE = 5
 RETRY_BACKOFF_MAX = 15
@@ -57,7 +51,7 @@ RETRY_BACKOFF_MAX = 15
 class OpencodeClient(BaseLLMClient):
     """LLM client that calls the `opencode` CLI in headless mode."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, preflight_models: Optional[Dict[str, Dict]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         Initialize OpencodeClient.
 
@@ -65,36 +59,21 @@ class OpencodeClient(BaseLLMClient):
             config: Optional opencode configuration from config.yaml.
                     Keys: models (dict of tier->model_id),
                     max_calls_per_run, pricing.
-            preflight_models: Optional dict from preflight check with per-tier
-                    available models. If provided, uses the first available
-                    model per tier (primary or fallback) instead of config.
         """
         config = config or {}
-        preflight_models = preflight_models or {}
         self.enabled = config.get("enabled", True)
         self.provider = config.get("provider", "opencode")
         self.render_key_rotation = True  # CompositeClient sets False to unify
 
-        # Determine models: use preflight results if available, else config, else defaults
+        # llm.chains decides which model serves a tier. These per-tier
+        # defaults only apply when this client is driven directly, without a
+        # chain; there is no internal fallback ladder any more.
         models_config = config.get("models", {})
-        fallback_config = config.get("fallback_models", {})
-        self.models = {}
-        self.fallback_models = {}
+        self.models = {
+            tier: models_config.get(tier, DEFAULT_MODELS[tier])
+            for tier in ("heavy", "medium", "light")
+        }
 
-        for tier in ("heavy", "medium", "light"):
-            # Check preflight first
-            pf = preflight_models.get(tier, {})
-            if pf.get("available") and pf.get("model"):
-                self.models[tier] = pf["model"]
-                logger.info(f"Opencode preflight override {tier}: using {pf['model']}")
-            else:
-                self.models[tier] = models_config.get(tier, DEFAULT_MODELS[tier])
-
-            # Build fallback chain: config fallbacks minus the selected primary
-            primary = self.models[tier]
-            config_fallbacks = list(fallback_config.get(tier, DEFAULT_FALLBACK_MODELS[tier]))
-            # Remove primary from fallbacks if present
-            self.fallback_models[tier] = [m for m in config_fallbacks if m != primary]
         self.max_calls = config.get("max_calls_per_run", 50)
         self._timeout = config.get("timeout", 600)
         self.max_retries = config.get("max_retries_per_model", MAX_RETRIES_PER_MODEL)
@@ -111,9 +90,6 @@ class OpencodeClient(BaseLLMClient):
         # surfaced in the usage summary so we can see fallbacks in action.
         self._tier_served_by: Dict[str, Optional[str]] = {
             "heavy": None, "medium": None, "light": None,
-        }
-        self._tier_fallback_hits: Dict[str, int] = {
-            "heavy": 0, "medium": 0, "light": 0,
         }
 
         pricing_config = config.get("pricing", {})
@@ -147,6 +123,7 @@ class OpencodeClient(BaseLLMClient):
         tier: str = "medium",
         system_prompt: Optional[str] = None,
         reasoning_enabled: bool = True,
+        model: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[str]:
         if kwargs:
@@ -157,9 +134,10 @@ class OpencodeClient(BaseLLMClient):
         """
         Send a prompt via `opencode run --format json` and parse the response.
 
-        The primary model for the tier is tried first. If it fails, each
-        model in `self.fallback_models[tier]` is tried in order until one
-        succeeds or the chain is exhausted.
+        Serves exactly the model it is given — `opencode run -m <model>` —
+        and does not substitute another on failure. Fallback across models is
+        the chain's job (see scripts/llm_chain.py), which is what lets a free
+        model on this transport sit ahead of a free model on OpenRouter's.
 
         Failure detection is immediate for structured errors the CLI returns
         in the NDJSON stream (model not found, insufficient balance, rate
@@ -172,10 +150,13 @@ class OpencodeClient(BaseLLMClient):
 
         Args:
             prompt: The user prompt.
-            tier: Model tier ("light", "medium", "heavy") — maps to model ID.
+            tier: Model tier ("light", "medium", "heavy"), for usage
+                accounting and reasoning defaults.
             system_prompt: Optional system-level instructions (prepended).
             reasoning_enabled: When False, applies reasoning control via
                 capability registry (CLI flags, model swap, etc.).
+            model: The exact model slug to run, passed straight to
+                `opencode run -m`. Defaults to the tier's model when absent.
 
         Returns:
             Response text, or None on failure.
@@ -191,10 +172,7 @@ class OpencodeClient(BaseLLMClient):
             )
             return None
 
-        primary = self.models.get(tier, self.models["medium"])
-        chain = [primary] + [
-            m for m in self.fallback_models.get(tier, []) if m != primary
-        ]
+        model = model or self.models.get(tier, self.models["medium"])
 
         if system_prompt:
             full_prompt = f"{system_prompt}\n\nUser Request: {prompt}"
@@ -204,23 +182,30 @@ class OpencodeClient(BaseLLMClient):
         full_prompt_len = len(full_prompt.encode("utf-8"))
         last_error_snippet = ""
 
-        for idx, model in enumerate(chain):
-            is_fallback = idx > 0
-            if is_fallback:
-                logger.info(
-                    "Opencode falling back to %s for tier=%s (primary %s failed)",
-                    model, tier, primary,
-                )
+        if self._call_count >= self.max_calls:
+            logger.warning(
+                "Opencode call budget exhausted (%d / %d)",
+                self._call_count, self.max_calls,
+            )
+            return None
 
-            if self._call_count >= self.max_calls:
-                logger.warning(
-                    "Opencode call budget exhausted during fallback (%d / %d)",
-                    self._call_count, self.max_calls,
-                )
-                return None
+        # Build base command
+        base_cmd = [
+            "opencode", "run",
+            "-m", model,
+            "--format", "json",
+            "--auto",
+            "--dir", "/tmp",
+            "--pure",
+            full_prompt,
+        ]
 
-            # Build base command
-            base_cmd = [
+        # Apply reasoning control via capability registry
+        cmd = self.apply_reasoning_control(model, base_cmd, reasoning_enabled)
+        # If apply_reasoning_control returns a string, it's a model swap
+        if isinstance(cmd, str):
+            model = cmd
+            cmd = [
                 "opencode", "run",
                 "-m", model,
                 "--format", "json",
@@ -230,139 +215,44 @@ class OpencodeClient(BaseLLMClient):
                 full_prompt,
             ]
 
-            # Apply reasoning control via capability registry
-            cmd = self.apply_reasoning_control(model, base_cmd, reasoning_enabled)
-            # If apply_reasoning_control returns a string, it's a model swap
-            if isinstance(cmd, str):
-                model = cmd
-                cmd = [
-                    "opencode", "run",
-                    "-m", model,
-                    "--format", "json",
-                    "--auto",
-                    "--dir", "/tmp",
-                    "--pure",
-                    full_prompt,
-                ]
+        for attempt in range(1 + self.max_retries):
+            if self._call_count >= self.max_calls:
+                break
 
-            # Track whether we should try the next model in the chain.
-            model_failed = True
+            logger.debug(
+                "Invoking opencode (tier=%s, model=%s, attempt=%d/%d, call=%d/%d)",
+                tier, model, attempt + 1, 1 + self.max_retries,
+                self._call_count + 1, self.max_calls,
+            )
 
-            for attempt in range(1 + self.max_retries):
-                if self._call_count >= self.max_calls:
-                    break
+            t0 = time.monotonic()
 
-                logger.debug(
-                    "Invoking opencode (tier=%s, model=%s, attempt=%d/%d, call=%d/%d%s)",
-                    tier, model, attempt + 1, 1 + self.max_retries,
-                    self._call_count + 1, self.max_calls,
-                    ", fallback" if is_fallback else "",
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
                 )
 
-                t0 = time.monotonic()
+                text, error = self._parse_ndjson_result(result.stdout)
+                elapsed = time.monotonic() - t0
+                self._tier_time[tier] += elapsed
 
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=self._timeout,
-                    )
+                if error:
+                    action = self._classify_error(error)
+                    err_name = error.get("name", "UnknownError")
+                    err_msg = error.get("message", "")[:200]
 
-                    text, error = self._parse_ndjson_result(result.stdout)
-                    elapsed = time.monotonic() - t0
-                    self._tier_time[tier] += elapsed
+                    if action == "fallback":
+                        logger.info(
+                            "Opencode fast-fallback for %s (tier=%s): "
+                            "%s — %s (%.1fs)",
+                            model, tier, err_name, err_msg, elapsed,
+                        )
+                        break  # skip retries, try next model
 
-                    if error:
-                        action = self._classify_error(error)
-                        err_name = error.get("name", "UnknownError")
-                        err_msg = error.get("message", "")[:200]
-
-                        if action == "fallback":
-                            logger.info(
-                                "Opencode fast-fallback for %s (tier=%s): "
-                                "%s — %s (%.1fs)",
-                                model, tier, err_name, err_msg, elapsed,
-                            )
-                            model_failed = True
-                            break  # skip retries, try next model
-
-                        # Retryable error (rate limit, server overload)
-                        if attempt < self.max_retries:
-                            backoff = min(
-                                RETRY_BACKOFF_BASE * (2 ** attempt)
-                                + random.uniform(0, 2),
-                                RETRY_BACKOFF_MAX,
-                            )
-                            logger.info(
-                                "Opencode retrying %s (tier=%s, attempt=%d/%d): "
-                                "%s — %s (%.1fs, backoff %.1fs)",
-                                model, tier, attempt + 1, 1 + self.max_retries,
-                                err_name, err_msg, elapsed, backoff,
-                            )
-                            time.sleep(backoff)
-                            continue  # retry same model
-                        else:
-                            logger.info(
-                                "Opencode exhausted retries for %s (tier=%s): "
-                                "%s — %s (%.1fs)",
-                                model, tier, err_name, err_msg, elapsed,
-                            )
-                            model_failed = True
-                            break  # all retries used, try next model
-
-                    if result.returncode != 0 and not text:
-                        last_error_snippet = (result.stderr or "")[:300]
-                        if attempt < self.max_retries:
-                            backoff = min(
-                                RETRY_BACKOFF_BASE * (2 ** attempt)
-                                + random.uniform(0, 2),
-                                RETRY_BACKOFF_MAX,
-                            )
-                            logger.info(
-                                "Opencode retrying %s (tier=%s, attempt=%d/%d): "
-                                "rc=%d (%.1fs, backoff %.1fs)",
-                                model, tier, attempt + 1, 1 + self.max_retries,
-                                result.returncode, elapsed, backoff,
-                            )
-                            time.sleep(backoff)
-                            continue
-                        else:
-                            model_failed = True
-                            break
-
-                    if text:
-                        # Check for CoT leakage when reasoning was disabled
-                        if not reasoning_enabled and self.detect_cot_leakage(text):
-                            logger.warning(
-                                "Opencode CoT leakage detected for %s (tier=%s) with reasoning disabled; "
-                                "treating as failure and falling back",
-                                model, tier,
-                            )
-                            model_failed = True
-                            break  # trigger fallback
-
-                        # Success
-                        self._call_count += 1
-                        self._tier_calls[tier] += 1
-                        self._tier_input_chars[tier] += full_prompt_len
-                        self._tier_output_chars[tier] += len(text.encode("utf-8"))
-                        self._tier_served_by[tier] = model
-                        if is_fallback:
-                            self._tier_fallback_hits[tier] += 1
-                        return text
-
-                    # Empty response (no text, no error, rc=0)
-                    logger.debug(
-                        "opencode returned empty NDJSON response (model=%s, attempt=%d)",
-                        model, attempt,
-                    )
-                    model_failed = True
-                    break  # no point retrying empty responses
-
-                except subprocess.TimeoutExpired:
-                    elapsed = time.monotonic() - t0
-                    self._tier_time[tier] += elapsed
+                    # Retryable error (rate limit, server overload)
                     if attempt < self.max_retries:
                         backoff = min(
                             RETRY_BACKOFF_BASE * (2 ** attempt)
@@ -371,41 +261,101 @@ class OpencodeClient(BaseLLMClient):
                         )
                         logger.info(
                             "Opencode retrying %s (tier=%s, attempt=%d/%d): "
-                            "timeout after %ds (backoff %.1fs)",
+                            "%s — %s (%.1fs, backoff %.1fs)",
                             model, tier, attempt + 1, 1 + self.max_retries,
-                            self._timeout, backoff,
+                            err_name, err_msg, elapsed, backoff,
+                        )
+                        time.sleep(backoff)
+                        continue  # retry same model
+                    else:
+                        logger.info(
+                            "Opencode exhausted retries for %s (tier=%s): "
+                            "%s — %s (%.1fs)",
+                            model, tier, err_name, err_msg, elapsed,
+                        )
+                        break  # all retries used, try next model
+
+                if result.returncode != 0 and not text:
+                    last_error_snippet = (result.stderr or "")[:300]
+                    if attempt < self.max_retries:
+                        backoff = min(
+                            RETRY_BACKOFF_BASE * (2 ** attempt)
+                            + random.uniform(0, 2),
+                            RETRY_BACKOFF_MAX,
+                        )
+                        logger.info(
+                            "Opencode retrying %s (tier=%s, attempt=%d/%d): "
+                            "rc=%d (%.1fs, backoff %.1fs)",
+                            model, tier, attempt + 1, 1 + self.max_retries,
+                            result.returncode, elapsed, backoff,
                         )
                         time.sleep(backoff)
                         continue
-                    logger.warning(
-                        "Opencode exhausted retries for %s (tier=%s): "
-                        "timeout after %ds",
-                        model, tier, self._timeout,
+                    else:
+                        break
+
+                if text:
+                    # Check for CoT leakage when reasoning was disabled
+                    if not reasoning_enabled and self.detect_cot_leakage(text):
+                        logger.warning(
+                            "Opencode CoT leakage detected for %s (tier=%s) with reasoning disabled; "
+                            "treating as failure and falling back",
+                            model, tier,
+                        )
+                        break  # trigger fallback
+
+                    # Success
+                    self._call_count += 1
+                    self._tier_calls[tier] += 1
+                    self._tier_input_chars[tier] += full_prompt_len
+                    self._tier_output_chars[tier] += len(text.encode("utf-8"))
+                    self._tier_served_by[tier] = model
+                    return text
+
+                # Empty response (no text, no error, rc=0)
+                logger.debug(
+                    "opencode returned empty NDJSON response (model=%s, attempt=%d)",
+                    model, attempt,
+                )
+                break  # no point retrying empty responses
+
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - t0
+                self._tier_time[tier] += elapsed
+                if attempt < self.max_retries:
+                    backoff = min(
+                        RETRY_BACKOFF_BASE * (2 ** attempt)
+                        + random.uniform(0, 2),
+                        RETRY_BACKOFF_MAX,
                     )
-                    model_failed = True
-                    break
+                    logger.info(
+                        "Opencode retrying %s (tier=%s, attempt=%d/%d): "
+                        "timeout after %ds (backoff %.1fs)",
+                        model, tier, attempt + 1, 1 + self.max_retries,
+                        self._timeout, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                logger.warning(
+                    "Opencode exhausted retries for %s (tier=%s): "
+                    "timeout after %ds",
+                    model, tier, self._timeout,
+                )
+                break
 
-                except Exception as e:
-                    logger.debug("opencode run exception (model=%s): %s", model, e)
-                    model_failed = True
-                    break
+            except Exception as e:
+                logger.debug("opencode run exception (model=%s): %s", model, e)
+                break
 
-            if model_failed:
-                continue  # try next model in the chain
-
-        # All models in the chain failed
+        # This rung failed; the chain advances to the next model.
         self._tier_failures[tier] += 1
         if last_error_snippet:
             logger.warning(
-                "All opencode models failed for tier=%s (primary=%s, tried %d models). "
-                "Last error: %s",
-                tier, primary, len(chain), last_error_snippet,
+                "Opencode model %s failed for tier=%s. Last error: %s",
+                model, tier, last_error_snippet,
             )
         else:
-            logger.warning(
-                "All opencode models failed for tier=%s (primary=%s, tried %d models)",
-                tier, primary, len(chain),
-            )
+            logger.warning("Opencode model %s failed for tier=%s", model, tier)
         return None
 
     @staticmethod
@@ -522,8 +472,8 @@ class OpencodeClient(BaseLLMClient):
         Generate a formatted markdown summary of opencode usage and estimated costs.
 
         The opencode CLI does not expose token counts, so input/output tokens
-        are estimated at ~4 bytes per token. Costs use configurable DeepSeek
-        V4 Flash pricing (default: $0.14/1M input, $0.28/1M output).
+        are estimated at ~4 bytes per token. Costs use the configured rates;
+        the production chain sets both to zero for its free model.
         """
         total_calls = sum(self._tier_calls.values())
         total_failures = sum(self._tier_failures.values())
@@ -534,8 +484,10 @@ class OpencodeClient(BaseLLMClient):
         out_rate = self._pricing["output_per_million"]
 
         lines = ["\n---\n\n## Opencode Usage Summary\n\n"]
-        lines.append("| Tier | Success | Failures | Input (est.) | Output (est.) | Est. Cost |\n")
-        lines.append("| :--- | :---: | :---: | :--- | :--- | :--- |\n")
+        lines.append(
+            "| Tier | Model | Success | Failures | Input (est.) | Output (est.) | Est. Cost |\n"
+        )
+        lines.append("| :--- | :--- | :---: | :---: | :--- | :--- | :--- |\n")
 
         total_cost = 0.0
         total_in_tok = 0
@@ -555,9 +507,10 @@ class OpencodeClient(BaseLLMClient):
             total_cost += cost
             total_in_tok += in_tok
             total_out_tok += out_tok
+            served = self._tier_served_by[tier] or self.models.get(tier, "?")
 
             lines.append(
-                f"| {tier.capitalize()} | {calls} | {failures} | "
+                f"| {tier.capitalize()} | `{served}` | {calls} | {failures} | "
                 f"{in_tok:,} | "
                 f"{out_tok:,} | "
                 f"${cost:.4f} |\n"
@@ -567,38 +520,18 @@ class OpencodeClient(BaseLLMClient):
         total_fail_label = f"**{total_failures}**"
         total_cost_label = f"**${total_cost:.4f}**"
         lines.append(
-            f"| **Total** | {total_label} | {total_fail_label} | "
+            f"| **Total** | | {total_label} | {total_fail_label} | "
             f"**{total_in_tok:,}** | **{total_out_tok:,}** | {total_cost_label} |\n\n"
         )
 
         lines.append(
-            f"*Costs estimated at ${in_rate:.2f}/1M input and ${out_rate:.2f}/1M output "
-            f"(DeepSeek V4 Flash paid-tier rates). "
-            f"Tokens estimated at ~4 bytes per token. "
-            f"This run used free opencode models (nemotron-3-ultra-free / deepseek-v4-flash-free) "
-            f"via the opencode CLI — actual cost was $0.00.*\n\n"
+            f"*Costs use the configured rates of ${in_rate:.2f}/1M input and "
+            f"${out_rate:.2f}/1M output. Tokens are estimated at ~4 bytes per token."
         )
-
-        # Surface which models actually served each tier so fallback activity
-        # is visible at a glance.
-        served_lines = []
-        for tier in ["heavy", "medium", "light"]:
-            served = self._tier_served_by[tier]
-            hits = self._tier_fallback_hits[tier]
-            if self._tier_calls[tier] == 0 and hits == 0:
-                continue
-            if served and served != self.models[tier]:
-                served_lines.append(
-                    f"- **{tier}**: served by `{served}` (fallback, {hits} fallback hit(s))"
-                )
-            elif hits > 0:
-                served_lines.append(
-                    f"- **{tier}**: {hits} fallback hit(s), last served by `{served or 'n/a'}`"
-                )
-        if served_lines:
-            lines.append("**Model fallback activity:**\n\n")
-            lines.extend(f"{l}\n" for l in served_lines)
-            lines.append("\n")
+        if in_rate == 0 and out_rate == 0:
+            lines.append(" Configured OpenCode models are free, so estimated cost is $0.00.*\n\n")
+        else:
+            lines.append("*\n\n")
 
         if start_time and end_time:
             duration = end_time - start_time

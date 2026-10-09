@@ -61,6 +61,53 @@ def intel_unavailable(client_unavailable, default_config):
     return BriefingIntelligence(client_unavailable, default_config)
 
 
+class TestReportWriterRouting:
+    def test_analysis_calls_stay_on_existing_client_when_writer_is_present(self, mock_client, default_config):
+        """Catches moving enrichment work onto the report-writing route."""
+        mock_client.invoke.return_value = "THEME: Existing analysis result"
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        intel = BriefingIntelligence(mock_client, default_config, report_writer=writer)
+
+        assert intel.detect_emerging_themes([{"title": "New topic"}], [], []) == [
+            "Existing analysis result"
+        ]
+        writer.invoke.assert_not_called()
+        mock_client.invoke.assert_called_once()
+
+    def test_writer_synthesizes_raw_inputs_when_analysis_is_unavailable(self, client_unavailable, default_config):
+        """Catches report prose being wrongly gated on the analysis chain."""
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        writer.invoke.return_value = "Writer executive summary."
+        intel = BriefingIntelligence(
+            client_unavailable, default_config, report_writer=writer
+        )
+
+        result = intel.synthesize_briefing(
+            papers=[{"title": "Raw paper"}], blogs=[], stocks=[], news=[], top_papers=[]
+        )
+
+        assert result == {"editorial_intro": "Writer executive summary."}
+        writer.invoke.assert_called_once()
+        client_unavailable.invoke.assert_not_called()
+
+    def test_writer_handles_weekly_deep_dive_without_analysis_chain(self, client_unavailable, default_config):
+        """Catches Saturday writing being skipped when enrichment is unavailable."""
+        writer = MagicMock(spec=BaseLLMClient)
+        writer.available = True
+        writer.invoke.return_value = "Writer weekly essay."
+        intel = BriefingIntelligence(
+            client_unavailable, default_config, report_writer=writer
+        )
+
+        result = intel.generate_weekly_deep_dive([{"date": "2026-09-19", "title": "Raw news"}])
+
+        assert result == "Writer weekly essay."
+        writer.invoke.assert_called_once()
+        client_unavailable.invoke.assert_not_called()
+
+
 # ---------- pure helpers ----------
 
 
@@ -499,8 +546,8 @@ class TestAssessReproductionFeasibility:
             {"title": "P2", "summary": "abs", "score_breakdown": {"has_code": False}},
         ]
         mock_client.invoke.return_value = (
-            "[1] code:5 data:4 infra:5 bedrock:5 effort:4 | Easy weekend repro\n"
-            "[2] code:1 data:1 infra:1 bedrock:2 effort:1 | Skip"
+            "[1] code:5 data:4 infra:5 api:5 effort:4 | Easy weekend repro\n"
+            "[2] code:1 data:1 infra:1 api:2 effort:1 | Skip"
         )
         result = intel.assess_reproduction_feasibility(papers)
         # Sorted by repro_total desc, only papers >= 12 kept
@@ -515,7 +562,7 @@ class TestAssessReproductionFeasibility:
         papers = [
             {"title": "P", "summary": "x", "score_breakdown": {"has_code": True}}
         ]
-        mock_client.invoke.return_value = "[1] code:5 data:5 infra:5 bedrock:5 effort:5"
+        mock_client.invoke.return_value = "[1] code:5 data:5 infra:5 api:5 effort:5"
         result = intel.assess_reproduction_feasibility(papers)
         assert result[0]["repro_total"] == 25
 
@@ -531,6 +578,103 @@ class TestAssessReproductionFeasibility:
         result = intel.assess_reproduction_feasibility(papers)
         # No scores parsed → repro_total not set; unscored papers retained
         assert "repro_total" not in result[0]
+
+    # --- an incomplete line is "not assessed", not a low score ---
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[1] code:4 | Only one dimension came back",
+            "[1] code:5 data:5 infra:5 effort:5 | hosted-API dimension missing",
+            "[1] code:5 data:5 infra:5 api:high effort:5 | non-numeric dimension",
+            "[1] code:5 data:5 infra:5 api:0 effort:5 | zero is not on the 1-5 scale",
+            "[1] code:5 data:5 infra:5 api:9 effort:5 | nine is not on the scale",
+            "[1] code:5 data:5 infra:5 bedrock:5 effort:5 | the retired dimension name",
+        ],
+    )
+    def test_incomplete_line_keeps_the_paper_unassessed(self, intel, mock_client, line):
+        """Summing whichever dimensions parsed made a one-dimension line total
+        4/25, and the gate then dropped a paper nobody had actually scored."""
+        papers = [{"title": "P", "summary": "x"}]
+        mock_client.invoke.return_value = line
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [p["title"] for p in result] == ["P"]
+        for key in ("repro_total", "repro_scores", "repro_verdict", "reproduction_assessment"):
+            assert key not in result[0]
+
+    def test_unassessed_papers_follow_the_ones_that_passed(self, intel, mock_client):
+        papers = [
+            {"title": "Unassessed", "summary": "x"},
+            {"title": "Weak", "summary": "x"},
+            {"title": "Strong", "summary": "x"},
+        ]
+        mock_client.invoke.return_value = (
+            "[1] code:4 | truncated\n"
+            "[2] code:1 data:1 infra:1 api:1 effort:1 | Skip\n"
+            "[3] code:5 data:4 infra:4 api:5 effort:4 | Doable"
+        )
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [p["title"] for p in result] == ["Strong", "Unassessed"]
+
+    def test_gate_threshold_and_total_are_unchanged(self, mock_client):
+        intel = BriefingIntelligence(mock_client, {"repro_min_score": 15})
+        papers = [{"title": "A", "summary": "x"}, {"title": "B", "summary": "x"}]
+        mock_client.invoke.return_value = (
+            "[1] code:3 data:3 infra:3 api:3 effort:3 | exactly at the gate\n"
+            "[2] code:3 data:3 infra:3 api:3 effort:2 | one under"
+        )
+        result = intel.assess_reproduction_feasibility(papers)
+        assert [(p["title"], p["repro_total"]) for p in result] == [("A", 15)]
+        assert result[0]["repro_scores"] == {
+            "code": 3, "data": 3, "infra": 3, "api": 3, "effort": 3,
+        }
+        assert "15/25" in result[0]["reproduction_assessment"]
+
+    def test_tolerates_spacing_and_markdown_around_scores(self, intel, mock_client):
+        papers = [{"title": "P", "summary": "x"}]
+        mock_client.invoke.return_value = "[1] code: 5 data: 4 infra:5  api:5 effort: 4 | ok"
+        assert intel.assess_reproduction_feasibility(papers)[0]["repro_total"] == 23
+
+    # --- the reader's setup comes from config, not from the prompt ---
+
+    def _prompt(self, mock_client, config):
+        mock_client.invoke.return_value = None
+        BriefingIntelligence(mock_client, config).assess_reproduction_feasibility(
+            [{"title": "P", "summary": "x"}]
+        )
+        return mock_client.invoke.call_args.args[0]
+
+    def test_default_prompt_names_no_vendor_stack(self, mock_client):
+        prompt = self._prompt(mock_client, {})
+        for word in ("Bedrock", "bedrock", "EC2", "A10G", "Trainium", "Titan", "Claude", "AWS", "Amazon"):
+            assert word not in prompt
+        assert "code:X data:X infra:X api:X effort:X" in prompt
+        assert "25 max" in prompt
+
+    def test_configured_setup_reaches_the_prompt(self, mock_client):
+        config = {"briefing_profile": {"reproduction": {
+            "setup": ["One home server, no GPU", "Hosted models via a CLI subscription"],
+            "limits": "a weekend, no new spend",
+        }}}
+        prompt = self._prompt(mock_client, config)
+        assert "- One home server, no GPU\n" in prompt
+        assert "- Hosted models via a CLI subscription\n" in prompt
+        assert "a weekend, no new spend" in prompt
+        assert "single workstation" not in prompt  # the generic default is replaced
+
+    def test_shipped_config_describes_the_setup_without_inventing_hardware(self, mock_client):
+        import yaml
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        config = yaml.safe_load((root / "config.yaml").read_text())
+        setup = " ".join(config["briefing_profile"]["reproduction"]["setup"])
+        assert "Codex CLI" in setup
+        assert "no discrete GPU" in setup or "No discrete GPU" in setup
+        for word in ("EC2", "A10G", "Bedrock", "Trainium", "CUDA available"):
+            assert word not in setup
+        example = yaml.safe_load((root / "config.yaml.example").read_text())
+        assert example["briefing_profile"]["reproduction"]["setup"]
 
 
 # ---------- rank_and_summarize_news ----------
@@ -577,13 +721,13 @@ class TestRankAndSummarizeNews:
         result = intel.rank_and_summarize_news(news, ["t"])
         assert result[0]["brief_summary"] == "desc text"
 
-    def test_llm_returns_none_early_returns_news(self, intel, mock_client):
+    def test_llm_returns_none_retains_source_excerpts(self, intel, mock_client):
         """When LLM is None on first call, function returns news[:5] without summaries."""
         news = [{"title": f"n{i}", "source": "s", "description": "d"} for i in range(3)]
         mock_client.invoke.return_value = None
         result = intel.rank_and_summarize_news(news, ["t"])
-        # No brief_summary added on this short-circuit path
-        assert all("brief_summary" not in n for n in result)
+        # A failed ranker must not turn available descriptions into bare links.
+        assert all(n["brief_summary"] == n["description"] for n in result)
         assert len(result) == 3
 
     def test_enforces_source_diversity(self, intel, mock_client):
@@ -617,6 +761,54 @@ class TestRankAndSummarizeNews:
 
 
 class TestRankAndSummarizeBlogs:
+    def test_selected_news_is_supplied_to_complementary_blog_selection(self, intel, mock_client):
+        blogs = [{"title": "Torrey Pines Road construction", "source": "Council", "summary": "Night work 7 pm–3 am"}]
+        news = [{"title": "Heat warning extended", "brief_summary": "Warning continues through Thursday."}]
+        mock_client.invoke.return_value = "[1] SCORE:5/5 Night work on Torrey Pines Road."
+        intel.rank_and_summarize_blogs(blogs, [], covered_news=news)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "Heat warning extended" in prompt
+        assert "Warning continues through Thursday." in prompt
+        assert "complement" in prompt.lower()
+
+    def test_stories_beyond_old_fifteen_item_window_can_be_selected(self, intel, mock_client):
+        blogs = [{"title": f"Routine {i}", "source": "outlet", "summary": "routine"} for i in range(20)]
+        blogs.append({"title": "Torrey Pines Road night closures", "source": "Council", "summary": "7 pm to 3 am"})
+        mock_client.invoke.return_value = "[21] SCORE:5/5 Torrey Pines Road work runs 7 pm to 3 am."
+        result = intel.rank_and_summarize_blogs(blogs, ["road closures"])
+        assert "Torrey Pines Road night closures" in mock_client.invoke.call_args.args[0]
+        assert result[0]["title"] == "Torrey Pines Road night closures"
+
+    def test_synthesis_keeps_raw_roadwork_evidence_when_summarizer_fails(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        blog = {"source": "Council", "title": "K-rail Replacement", "summary": "Torrey Pines Road, Sunday–Thursday, 7 pm–3 am; sidewalk impacted."}
+        intel.synthesize_briefing([], [blog], [], [], [])
+        assert "Torrey Pines Road, Sunday–Thursday, 7 pm–3 am" in mock_client.invoke.call_args.args[0]
+
+    def test_synthesis_receives_authoritative_alert_windows(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        alerts = [{"event": "Coastal Flood Advisory", "onset": "2026-10-07T06:00:00-07:00",
+                   "expires": "2026-10-09T11:00:00-07:00", "area": "San Diego coast"}]
+        intel.synthesize_briefing([], [], [], [], [], alerts=alerts)
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "2026-10-09T11:00:00-07:00" in prompt
+        assert "take precedence" in prompt
+        assert "San Diego coast" in prompt
+
+    def test_old_newsletter_next_week_is_anchored_to_its_issue_date(self, intel, mock_client):
+        mock_client.invoke.return_value = "Executive summary"
+        article = {"source": "Council", "title": "Road construction", "input_type": "email_newsletter",
+                   "published": "2026-10-03T01:50:03+00:00", "summary": "Night construction begins next week."}
+        intel.synthesize_briefing([], [article], [], [], [])
+        assert "week starting 2026-10-05" in mock_client.invoke.call_args.args[0]
+
+    def test_failed_ranker_selects_relevant_item_from_whole_pool(self, intel, mock_client):
+        mock_client.invoke.return_value = None
+        blogs = [{"title": f"Routine sports {i}", "source": "sports", "summary": "game"} for i in range(20)]
+        blogs.append({"title": "Agent Evaluation benchmark", "source": "research", "summary": "Measures agent evaluation and tool use."})
+        result = intel.rank_and_summarize_blogs(blogs, ["Agent Evaluation"])
+        assert result[0]["title"] == "Agent Evaluation benchmark"
+
     def test_unavailable(self, intel_unavailable):
         blogs = [{"title": f"b{i}", "source": "s", "summary": ""} for i in range(5)]
         assert len(intel_unavailable.rank_and_summarize_blogs(blogs, ["t"])) == 5
@@ -659,6 +851,25 @@ class TestRankAndSummarizeBlogs:
         intel.rank_and_summarize_blogs(blogs, ["t"])
         prompt = mock_client.invoke.call_args.args[0].lower()
         assert "never explain, list, or justify" in prompt
+
+    def test_newsletter_prompt_includes_story_content_beyond_email_preamble(
+        self, intel, mock_client
+    ):
+        """Catches ranking only the weather/header at the top of a newsletter."""
+        blogs = [{
+            "title": "Axios San Diego",
+            "source": "Axios San Diego",
+            "input_type": "email_newsletter",
+            "summary": ("Newsletter preamble. " * 300)
+            + "Pacific Beach Middle School field closed after reaching red status.",
+        }]
+        mock_client.invoke.return_value = "[1] SCORE:5/5 Field closure summary."
+
+        intel.rank_and_summarize_blogs(blogs, ["local warnings"])
+
+        prompt = mock_client.invoke.call_args.args[0]
+        assert "Pacific Beach Middle School field closed" in prompt
+        assert "include every actionable warning" in prompt.lower()
 
 
 # ---------- rank_and_summarize_happenings ----------
@@ -777,7 +988,32 @@ class TestEnforceSourceDiversity:
 # ---------- correlate_stocks_and_news ----------
 
 
+def test_source_blurbs_can_be_disabled_without_losing_story_attribution(intel, mock_client):
+    intel.config["features"] = {"source_blurbs": False}
+    items = [{"title": "Road repairs", "source": "City Council", "author": "Joe LaCava",
+              "author_blurb": "Unverified reputation claim"}]
+    result = intel.generate_author_blurbs(items, "blogs")
+    assert result[0]["source"] == "City Council"
+    assert result[0]["author"] == "Joe LaCava"
+    assert "author_blurb" not in result[0]
+    mock_client.invoke.assert_not_called()
+
+
 class TestCorrelateStocksAndNews:
+    def test_unrelated_headline_cannot_become_a_stock_driver(self, intel, mock_client):
+        stocks = [{"symbol": "NVDA", "name": "NVIDIA", "percent_change": 2.1}]
+        mock_client.invoke.return_value = "NVDA | 1 | AI optimism lifts"
+        result = intel.correlate_stocks_and_news(stocks, [{"title": "Army debates doctrine", "url": "https://army.mil/news"}])
+        assert "news_correlation" not in result[0]
+        mock_client.invoke.assert_not_called()
+
+    def test_related_news_retains_the_supporting_source(self, intel, mock_client):
+        stocks = [{"symbol": "NVDA", "name": "NVIDIA", "percent_change": 2.1}]
+        mock_client.invoke.return_value = "NVDA | 1 | New inference platform"
+        result = intel.correlate_stocks_and_news(stocks, [{"title": "NVIDIA announces inference platform", "url": "https://nvidia.com/news/platform"}])
+        assert result[0]["news_correlation"] == "New inference platform"
+        assert result[0]["news_correlation_source"] == "https://nvidia.com/news/platform"
+
     def test_unavailable(self, intel_unavailable):
         stocks = [{"symbol": "X"}]
         assert intel_unavailable.correlate_stocks_and_news(stocks, []) == stocks
@@ -790,8 +1026,8 @@ class TestCorrelateStocksAndNews:
             {"symbol": "GOOD", "name": "G", "percent_change": 1.0},
             {"symbol": "BAD", "error": "fail"},
         ]
-        news = [{"title": "Some headline"}]
-        mock_client.invoke.return_value = "GOOD | strong earnings"
+        news = [{"title": "GOOD reports strong earnings", "url": "https://example.com/earnings"}]
+        mock_client.invoke.return_value = "GOOD | 1 | strong earnings"
         result = intel.correlate_stocks_and_news(stocks, news)
         good = next(s for s in result if s["symbol"] == "GOOD")
         assert good["news_correlation"] == "strong earnings"
@@ -1429,3 +1665,87 @@ class TestExecutiveSummaryLeadInstruction:
         lead_block = prompt[prompt.index("GRAMMATICAL SUBJECT"):prompt.index("glanceable")]
         for term in ("kill chain", "Nvidia", "ISR", "counter-UAS", "defense", "arXiv"):
             assert term.lower() not in lead_block.lower(), f"{term} hardcoded in lead instruction"
+
+
+class _RecordingWriter:
+    """In-memory report route that records the complete reader-facing prompt."""
+
+    available = True
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def invoke(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        return self.response
+
+
+class TestExecutiveSummaryEditorialPolicy:
+    def _synthesize(self, mock_client, default_config, news, response):
+        writer = _RecordingWriter(response)
+        intel = BriefingIntelligence(mock_client, default_config, report_writer=writer)
+
+        result = intel.synthesize_briefing(
+            papers=[], blogs=[], stocks=[], news=news, top_papers=[]
+        )
+
+        assert result == {"editorial_intro": response}
+        assert len(writer.calls) == 1
+        assert mock_client.invoke.call_count == 0
+        return writer.calls[0][0]
+
+    def test_completed_boardwalk_incident_stays_context_not_actionable_hazard(
+        self, mock_client, default_config
+    ):
+        """Catches turning an ended boardwalk incident into fresh avoidance advice."""
+        headline = "Mission Bay boardwalk reopened after Sept. 18 gas leak; no advisory remains"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Context, not a warning."
+        )
+
+        assert headline in prompt
+        assert "treat completed incidents as context rather than current hazards" in prompt.lower()
+        assert "only when supplied data establishes" in prompt.lower()
+
+    def test_duplicate_coverage_confirms_event_without_claiming_a_pattern(
+        self, mock_client, default_config
+    ):
+        """Catches treating several headlines about one incident as a local trend."""
+        title_one = "Mission Bay boardwalk reopened after Sept. 18 gas leak"
+        title_two = "City confirms boardwalk reopened after Sept. 18 gas leak"
+        prompt = self._synthesize(
+            mock_client,
+            default_config,
+            [{"title": title_one}, {"title": title_two}],
+            "The reports corroborate one completed event.",
+        )
+
+        assert title_one in prompt and title_two in prompt
+        assert "does not establish prevalence, a trend, or ongoing risk" in prompt.lower()
+
+    def test_active_closure_or_advisory_requires_clear_reader_action(
+        self, mock_client, default_config
+    ):
+        """Catches suppressing useful action when supplied data reports a live advisory."""
+        headline = "County issues active water-contact advisory at Pacific Beach through Monday"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Avoid water contact through Monday."
+        )
+
+        assert headline in prompt
+        assert "active closure or advisory" in prompt.lower()
+        assert "clearly state the action, timing, or decision" in prompt.lower()
+
+    def test_repeated_pattern_requires_clear_reader_action(
+        self, mock_client, default_config
+    ):
+        """Catches suppressing advice when the data actually documents recurrence."""
+        headline = "Third sewage spill this month closes the same Mission Bay shoreline"
+        prompt = self._synthesize(
+            mock_client, default_config, [{"title": headline}], "Plan around recurring closures."
+        )
+
+        assert headline in prompt
+        assert "repeated pattern" in prompt.lower()
+        assert "clearly state the action, timing, or decision" in prompt.lower()

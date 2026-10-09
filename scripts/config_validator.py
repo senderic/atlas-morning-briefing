@@ -7,6 +7,7 @@ Validates config.yaml values at startup to catch errors early.
 """
 
 import logging
+import math
 import os
 import shutil
 from typing import Any, Dict, List, Tuple
@@ -62,6 +63,74 @@ def _validate_interest_graph(
 
     for i, root in enumerate(roots):
         _validate_node(root, f"interest_graph.roots[{i}]")
+
+
+def _validate_codex_chain(
+    chain: Any,
+    llm: Any,
+    supported_reasoning: set,
+    errors: List[str],
+    warnings: List[str],
+) -> None:
+    """Validate `codex.chain`, the settings behind `codex/` rungs in llm.chains.
+
+    Every key is optional; the defaults mirror CodexClient's.
+    """
+    if chain is None:
+        chain = {}
+    if not isinstance(chain, dict):
+        errors.append("'codex.chain' must be a dictionary")
+        return
+
+    def _number(key: str, default: float, positive: bool, integer: bool) -> float:
+        value = chain.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int if integer else (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (positive and value == 0)
+        ):
+            errors.append(
+                f"'codex.chain.{key}' must be a "
+                f"{'positive' if positive else 'non-negative'} "
+                f"{'integer' if integer else 'finite number'}"
+            )
+            return default
+        return value
+
+    _number("max_calls_per_run", 40, positive=True, integer=True)
+    _number("max_concurrent_requests", 3, positive=True, integer=True)
+    _number("max_consecutive_failures", 3, positive=False, integer=True)
+    timeout = _number("timeout_seconds", 180, positive=True, integer=False)
+    retries = _number("max_retries", 1, positive=False, integer=True)
+    queue = _number("queue_timeout_seconds", 120, positive=False, integer=False)
+
+    efforts = chain.get("reasoning_effort")
+    if efforts is not None:
+        if not isinstance(efforts, dict):
+            errors.append(
+                "'codex.chain.reasoning_effort' must map a tier "
+                "(heavy, medium, light) to an effort"
+            )
+        else:
+            for tier, effort in efforts.items():
+                if tier not in ("heavy", "medium", "light") or effort not in supported_reasoning:
+                    errors.append(
+                        f"'codex.chain.reasoning_effort.{tier}' must set a tier "
+                        "(heavy, medium, light) to one of "
+                        f"{sorted(supported_reasoning)}"
+                    )
+
+    # A rung that overruns its window is cut off on every slow call.
+    window = llm.get("rung_timeout_seconds") if isinstance(llm, dict) else None
+    worst = queue + timeout * (1 + retries)
+    if isinstance(window, (int, float)) and not isinstance(window, bool) and worst > window:
+        warnings.append(
+            f"codex.chain needs up to {worst:.0f}s per rung (queue_timeout_seconds "
+            "+ timeout_seconds x (1 + max_retries)) but llm.rung_timeout_seconds "
+            f"is {window:.0f}s — a slow Codex call will be cut off mid-retry"
+        )
 
 
 def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -209,17 +278,111 @@ def validate_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                     "'opencode.enabled' is true but 'opencode' binary not found "
                     "on PATH — install opencode or set 'opencode.enabled: false'"
                 )
-            models = opencode.get("models")
-            if models is not None:
-                if not isinstance(models, dict):
-                    errors.append("opencode.models must be a dictionary")
-                else:
-                    for tier in models:
-                        if tier not in ("heavy", "medium", "light"):
-                            warnings.append(
-                                f"opencode.models.{tier} is not a recognized tier "
-                                "(expected: heavy, medium, light)"
+
+    # --- Codex config (report writer + `codex/` chain rungs) ---
+    codex = config.get("codex")
+    if codex is not None:
+        if not isinstance(codex, dict):
+            errors.append("'codex' must be a dictionary")
+        elif bool(codex.get("enabled", True)):
+            binary = codex.get(
+                "executable", codex.get("binary", codex.get("cli_binary"))
+            )
+            if not isinstance(binary, str) or not binary.strip():
+                errors.append("'codex.binary' must be a non-empty string when enabled")
+
+            model = codex.get("model")
+            if not isinstance(model, str) or not model.strip():
+                errors.append("'codex.model' must be a non-empty string when enabled")
+
+            timeout = codex.get("timeout_seconds", codex.get("timeout", 300))
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or timeout <= 0
+            ):
+                errors.append("'codex.timeout_seconds' must be a positive finite number")
+
+            max_calls = codex.get(
+                "max_calls_per_run", codex.get("max_calls", 5)
+            )
+            if (
+                isinstance(max_calls, bool)
+                or not isinstance(max_calls, int)
+                or max_calls <= 0
+            ):
+                errors.append("'codex.max_calls_per_run' must be a positive integer")
+
+            reasoning = codex.get(
+                "reasoning_effort", codex.get("reasoning", "high")
+            )
+            supported_reasoning = {"low", "medium", "high", "xhigh"}
+            if reasoning not in supported_reasoning:
+                errors.append(
+                    "'codex.reasoning_effort' must be one of "
+                    f"{sorted(supported_reasoning)}"
+                )
+
+            _validate_codex_chain(
+                codex.get("chain"), config.get("llm"), supported_reasoning,
+                errors, warnings,
+            )
+    # --- LLM model chains ---
+    # The chain is the roster now: a typo here is not a tier that falls back,
+    # it is a rung that silently never runs.
+    llm = config.get("llm")
+    if llm is not None:
+        if not isinstance(llm, dict):
+            errors.append("'llm' must be a dictionary")
+        else:
+            chains = llm.get("chains")
+            if chains is not None and not isinstance(chains, dict):
+                errors.append("llm.chains must be a dictionary of tier -> model list")
+            elif isinstance(chains, dict):
+                from scripts.llm_chain import TIERS, resolve_backend
+
+                enabled_backends = {
+                    name
+                    for name in ("codex", "openrouter", "nvidia", "opencode", "gemini")
+                    if isinstance(config.get(name), dict) and config[name].get("enabled")
+                }
+                for tier, models in chains.items():
+                    if tier not in TIERS:
+                        warnings.append(
+                            f"llm.chains.{tier} is not a recognized tier "
+                            "(expected: heavy, medium, light)"
+                        )
+                        continue
+                    if not isinstance(models, list) or not models:
+                        errors.append(f"llm.chains.{tier} must be a non-empty list")
+                        continue
+                    for model in models:
+                        backend = resolve_backend(model) if isinstance(model, str) else None
+                        if backend is None:
+                            errors.append(
+                                f"llm.chains.{tier}: {model!r} has no known routing "
+                                "prefix (expected codex/, openrouter/, "
+                                "nvidia-direct/, opencode/, opencode-go/ or gemini/)"
                             )
+                        elif backend not in enabled_backends:
+                            warnings.append(
+                                f"llm.chains.{tier}: {model} needs the '{backend}' "
+                                "backend, which is not enabled — it will be skipped"
+                            )
+                missing = [t for t in TIERS if t not in chains]
+                if missing:
+                    warnings.append(
+                        f"llm.chains has no entry for {', '.join(missing)}; "
+                        "built-in defaults will be used"
+                    )
+                leads = [m[0] for t, m in chains.items()
+                         if t in TIERS and isinstance(m, list) and m]
+                if len(leads) == len(TIERS) and len(set(leads)) < len(TIERS):
+                    warnings.append(
+                        "llm.chains: two tiers lead with the same model, so they "
+                        "are no longer distinct tiers"
+                    )
 
     # --- Bedrock config ---
     bedrock = config.get("bedrock")

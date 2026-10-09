@@ -229,6 +229,25 @@ quality_check:
   # that trains the reader to ignore the section.
   judge:
     dimensions: ["lead_alignment", "actionability", "specificity", "freshness"]
+    # A morning the judge produced no score is INFO. It becomes WARN after
+    # skip_warn_days consecutive unjudged days and CRITICAL after
+    # skip_critical_days. The count is per pipeline (logs/quality-streaks.json)
+    # and resets on the first scored day.
+    skip_warn_days: 2
+    skip_critical_days: 3
+    # Characters of the briefing the judge reads, after its usage footers are
+    # removed. Cut at a line boundary when exceeded.
+    max_chars: 40000
+
+  # Read from the pipeline's own status file (status_file_path). Share of the
+  # run's LLM calls that failed on every rung of the chain: WARN at
+  # failed_ratio_warn, CRITICAL at failed_ratio_critical or when every call
+  # failed. Also reported: synthesis_degraded (CRITICAL), writer_fallback_count
+  # > 0 (WARN), and a status file that is missing or from an earlier day (WARN).
+  # `enabled: false` turns the layer off for a pipeline.
+  status_health:
+    failed_ratio_warn: 0.25
+    failed_ratio_critical: 0.5
 
   source_health:
     dead_url_runs: 3        # consecutive error+zero-yield runs before CRITICAL

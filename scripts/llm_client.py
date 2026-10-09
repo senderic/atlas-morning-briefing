@@ -166,17 +166,24 @@ class BaseLLMClient(ABC, ReasoningControlMixin):
         tier: str = "medium",
         system_prompt: Optional[str] = None,
         reasoning_enabled: bool = True,
+        model: Optional[str] = None,
     ) -> Optional[str]:
         """
         Send a prompt to the LLM and return the response text.
 
         Args:
             prompt: The user prompt.
-            tier: Model tier ("light", "medium", "heavy").
+            tier: Model tier ("light", "medium", "heavy"). Used for usage
+                accounting and reasoning defaults; it no longer selects the
+                model when `model` is given.
             system_prompt: Optional system-level instructions.
             reasoning_enabled: When False, disables chain-of-thought / reasoning
                 tokens for models that support it (e.g. DeepSeek V4 Pro).
                 Non-reasoning backends ignore this flag.
+            model: Serve exactly this model and do not fall back to another one.
+                CompositeClient owns the fallback order across the whole chain,
+                so a backend that substituted its own model here would jump the
+                queue — possibly onto a paid rung the chain had placed last.
 
         Returns:
             Response string, or None on failure.

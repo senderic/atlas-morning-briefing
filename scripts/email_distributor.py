@@ -25,8 +25,20 @@ try:
 except ImportError:
     HAS_NH3 = False
 
+try:
+    from premailer import transform
+    HAS_PREMAILER = True
+except ImportError:
+    HAS_PREMAILER = False
+    def transform(html: str, **kwargs) -> str:
+        return html
+
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# Gmail clips messages larger than 102KB
+GMAIL_CLIP_LIMIT_KB = 102
+GMAIL_WARN_LIMIT_KB = 90
 
 
 class EmailDistributor:
@@ -59,7 +71,12 @@ class EmailDistributor:
 
     def _markdown_to_html(self, md_content: str) -> str:
         """
-        Convert markdown briefing to rich HTML email.
+        Convert markdown briefing to responsive HTML email.
+
+        Optimized for the Gmail mobile app, which shrinks the whole message to
+        fit the screen when any element is wider than the viewport — the reason
+        a 14px font can arrive looking like 8px. The template therefore has no
+        fixed pixel widths and forces long tokens (model IDs, URLs) to wrap.
 
         Args:
             md_content: Markdown string.
@@ -81,154 +98,288 @@ class EmailDistributor:
             logger.warning("nh3 not installed; HTML email output is not sanitized")
 
         # Handle [RIGHT] markers for alignment — applied after sanitization so
-        # the injected style attribute is not stripped by nh3.
+        # the injected style attribute is not stripped by nh3. Floats are
+        # unreliable in email clients, so this only nudges the byline right.
         html_body = html_body.replace("[RIGHT]", '<span style="float: right;">').replace("[/RIGHT]", "</span>")
 
-        # Wrap in a styled HTML template
-        html = f"""<!DOCTYPE html>
-<html>
+        html = self._wrap_in_template(html_body)
+
+        # Inline the CSS. Gmail with a Google account honours the <style> block,
+        # but Gmail for non-Google accounts, Outlook and Yahoo strip it, so both
+        # forms ship. keep_style_tags keeps the media queries alive; classes are
+        # kept for the same reason (remove_classes would break them).
+        if HAS_PREMAILER:
+            html = transform(
+                html,
+                base_url=None,
+                keep_style_tags=True,
+                strip_important=False,
+                remove_classes=False,
+                exclude_pseudoclasses=":hover, :active, :focus, :visited",
+            )
+        else:
+            logger.warning("premailer not installed; CSS not inlined for email clients")
+
+        # Warn if HTML size approaches Gmail's clip limit
+        size_kb = len(html.encode("utf-8")) / 1024
+        if size_kb > GMAIL_WARN_LIMIT_KB:
+            logger.warning(
+                f"HTML email size: {size_kb:.1f}KB (Gmail clips at {GMAIL_CLIP_LIMIT_KB}KB)"
+            )
+
+        return html
+
+    def _wrap_in_template(self, html_body: str) -> str:
+        """
+        Wrap the converted markdown in a fluid, table-based email shell.
+
+        Rules this template follows, in priority order:
+
+        1. No element may be wider than the screen. The Gmail app scales the
+           entire message down to fit its widest element, so one 577px table
+           shrinks every paragraph with it. Hence width:100%/max-width instead
+           of a fixed 600px, table-layout:fixed, and word-break on code spans
+           (the usage tables carry 48-character model IDs that cannot wrap).
+        2. min-width:100% on the outer table, which is what stops the Gmail
+           Android app "munging" the layout narrower still.
+        3. 16px base text, 15px in tables — under ~14px Gmail may re-scale text
+           on its own, and this is read on a phone at arm's length.
+        4. Layout in tables, not divs; only properties in Gmail's supported CSS
+           list; padding, never margin, for structural spacing.
+        """
+        return f"""<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="format-detection" content="telephone=no">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
 <style>
+  /* Inlined by premailer where possible; the block itself is kept so that
+     the media query below still applies in clients that honour <style>. */
   body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    width: 100% !important;
+    background-color: #f6f8fa;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 16px;
     line-height: 1.6;
     color: #1a1a1a;
-    max-width: 680px;
-    margin: 0 auto;
-    padding: 20px;
-    background-color: #f8f9fa;
+    -webkit-text-size-adjust: 100%;
+    -ms-text-size-adjust: 100%;
+  }}
+  .wrapper {{
+    width: 100%;
+    min-width: 100%;
+    background-color: #f6f8fa;
+  }}
+  .gutter {{
+    padding: 16px 8px;
   }}
   .container {{
+    width: 100%;
+    max-width: 600px;
+    margin: 0 auto;
     background-color: #ffffff;
-    border-radius: 8px;
-    padding: 32px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    border: 1px solid #d8dee4;
+  }}
+  .content {{
+    padding: 20px;
   }}
   h1 {{
     color: #0d1117;
     font-size: 24px;
+    font-weight: 700;
+    line-height: 1.25;
     border-bottom: 2px solid #58a6ff;
     padding-bottom: 8px;
-    margin-top: 0;
+    margin: 0 0 12px 0;
   }}
   h2 {{
     color: #1f6feb;
-    font-size: 18px;
-    margin-top: 28px;
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1.3;
     border-bottom: 1px solid #e1e4e8;
     padding-bottom: 6px;
+    margin: 28px 0 12px 0;
   }}
   h3 {{
     color: #24292f;
-    font-size: 15px;
-    margin-top: 20px;
-    margin-bottom: 4px;
+    font-size: 17px;
+    font-weight: 600;
+    line-height: 1.35;
+    margin: 22px 0 6px 0;
   }}
   h4 {{
     color: #57606a;
-    font-size: 12px;
-    font-weight: 600;
-    margin-top: 16px;
-    margin-bottom: 2px;
-    text-transform: uppercase;
-    letter-spacing: 0.02em;
-  }}
-  h4 + p {{
     font-size: 13px;
-    color: #57606a;
-    margin-top: 0;
-    line-height: 1.4;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin: 16px 0 4px 0;
   }}
   p {{
-    margin: 8px 0;
-    font-size: 14px;
+    margin: 0 0 12px 0;
+    font-size: 16px;
+    line-height: 1.6;
+  }}
+  h4 + p {{
+    font-size: 15px;
+    color: #444d56;
+    margin-top: 0;
   }}
   em {{
     color: #57606a;
   }}
   strong {{
     color: #0d1117;
+    font-weight: 700;
   }}
   a {{
-    color: #1f6feb;
-    text-decoration: none;
-  }}
-  a:hover {{
+    color: #0969da;
     text-decoration: underline;
+    word-break: break-word;
   }}
   ul, ol {{
-    padding-left: 24px;
-    font-size: 14px;
+    padding-left: 22px;
+    margin: 0 0 12px 0;
   }}
   li {{
-    margin: 4px 0;
+    font-size: 16px;
+    line-height: 1.55;
+    margin: 0 0 6px 0;
+  }}
+  /* Tables must never set the message width — see rule 1 above. */
+  /* Auto layout, not table-layout:fixed: fixed gives every column an equal
+     share, which is narrow enough that ordinary words ("Semiconductor") break
+     mid-word. Auto plus the break rules below fits the width without that. */
+  table {{
+    width: 100%;
+    max-width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 14px 0;
+  }}
+  /* Only the properties that keep a table from setting the message width are
+     inlined per cell; a briefing can carry 200+ cells and inlining the full
+     rule on each one added ~30KB, pushing the message toward Gmail's 102KB
+     clip limit. The decoration lives in the non-inlined block below. */
+  th, td {{
+    font-size: 15px;
+    padding: 7px 8px;
+    /* The dense diagnostic tables (6 columns of model IDs and token counts)
+       have a min-content width of ~460px, so cells must be allowed to break
+       inside a word — otherwise the table sets the message width and the Gmail
+       app shrinks the entire briefing to fit it. Auto table layout keeps this
+       from firing on the roomier tables. */
+    word-break: break-word;
   }}
   code {{
     background-color: #f0f3f6;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 13px;
-    font-family: 'SFMono-Regular', Consolas, monospace;
+    padding: 1px 4px;
+    font-size: 14px;
+    font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
+    /* Model IDs are 45+ characters with no spaces; without this they set a
+       floor on the message width and the whole email shrinks. */
+    word-break: break-all;
+    overflow-wrap: anywhere;
   }}
   pre {{
     background-color: #0d1117;
     color: #e6edf3;
-    padding: 16px;
-    border-radius: 6px;
-    overflow-x: auto;
+    padding: 14px;
     font-size: 13px;
+    font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0 0 14px 0;
   }}
   pre code {{
     background: none;
     padding: 0;
     color: inherit;
-  }}
-  table {{
-    border-collapse: collapse;
-    width: 100%;
-    margin: 12px 0;
     font-size: 13px;
   }}
-  th, td {{
-    border: 1px solid #d0d7de;
-    padding: 8px 12px;
-    text-align: left;
-  }}
-  th {{
-    background-color: #f0f3f6;
-    font-weight: 600;
+  blockquote {{
+    border-left: 3px solid #d0d7de;
+    padding: 2px 0 2px 12px;
+    margin: 0 0 12px 0;
+    color: #57606a;
   }}
   hr {{
-    border: none;
+    border: 0;
     border-top: 1px solid #e1e4e8;
     margin: 20px 0;
   }}
+  img {{
+    max-width: 100%;
+    height: auto;
+  }}
   .footer {{
-    margin-top: 32px;
-    padding-top: 16px;
+    margin-top: 28px;
+    padding-top: 12px;
     border-top: 1px solid #e1e4e8;
-    font-size: 12px;
-    color: #8b949e;
+    font-size: 13px;
+    color: #6e7781;
     text-align: center;
   }}
-  /* Stock colors */
-  .stock-up {{ color: #1a7f37; font-weight: 600; }}
-  .stock-down {{ color: #cf222e; font-weight: 600; }}
+  .stock-up {{ color: #1a7f37; font-weight: 700; }}
+  .stock-down {{ color: #cf222e; font-weight: 700; }}
+</style>
+<style data-premailer="ignore">
+  /* Left in the <style> block on purpose — Gmail with a Google account honours
+     it, and inlining any of this per cell is what blew up the message size. */
+  th, td {{
+    line-height: 1.4;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid #e1e4e8;
+  }}
+  th {{
+    background-color: #f6f8fa;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: #57606a;
+    /* Headers are short; let them size the column rather than wrap mid-word. */
+    overflow-wrap: normal;
+  }}
+
+  /* Phones: reclaim the horizontal padding and tighten the dense tables. */
+  @media only screen and (max-width: 600px) {{
+    .gutter {{ padding: 8px 4px !important; }}
+    .content {{ padding: 16px 14px !important; }}
+    h1 {{ font-size: 22px !important; }}
+    h2 {{ font-size: 19px !important; }}
+    th, td {{ font-size: 14px !important; padding: 6px 5px !important; }}
+    th {{ font-size: 12px !important; }}
+    code {{ font-size: 13px !important; }}
+  }}
 </style>
 </head>
 <body>
-<div class="container">
+<table role="presentation" class="wrapper" width="100%" cellpadding="0" cellspacing="0" border="0">
+  <tr>
+    <td class="gutter" align="center">
+      <table role="presentation" class="container" width="100%" cellpadding="0" cellspacing="0" border="0" align="center">
+        <tr>
+          <td class="content">
 {html_body}
-<div class="footer">
-  Atlas Morning Briefing<br>
-  <a href="https://github.com/senderic/atlas-morning-briefing">GitHub</a>
-</div>
-</div>
+            <div class="footer">
+              Atlas Morning Briefing<br>
+              <a href="https://github.com/senderic/atlas-morning-briefing">GitHub</a>
+            </div>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
 </body>
 </html>"""
-        return html
 
     def send_kindle(
         self,
@@ -457,4 +608,3 @@ class EmailDistributor:
             results.update(html_results)
 
         return results
-

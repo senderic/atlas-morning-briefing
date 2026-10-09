@@ -6,9 +6,9 @@ A single-machine, cron-driven pipeline that fetches ArXiv papers, RSS blogs, sto
 
 ## Schedule
 
-Cron (America/Los_Angeles): `0 6 * * 1-6` — 6:00 AM Mon-Sat.
-Downstream consumer: `~/sender-trades/` runs at 6:30 AM Mon-Fri.
-Quality check: `40 6 * * 1-6` — reviews what both briefings produced; `15 7 * * 0` adds a deep feed probe.
+Cron (America/Los_Angeles): main Atlas at `0 6 * * 1-6`; San Diego local at `0 7 * * 1-6` so the ~6:30 AM Axios newsletter is available.
+Downstream consumer: `~/sender-trades/` runs at 6:28 AM Mon-Fri, after Atlas and before the local briefing.
+Quality check: chained after the 7:00 AM local run; Saturday adds the deep feed probe.
 
 ## Active Binary Paths
 
@@ -24,7 +24,7 @@ Quality check: `40 6 * * 1-6` — reviews what both briefings produced; `15 7 * 
 # Full run
 ./run_briefing.sh
 
-# Dry run (no email, no state writes)
+# Dry run (no email; redirect output/status/state paths for isolated previews)
 python3 scripts/briefing_runner.py --config config.yaml --dry-run
 
 # Tests
@@ -34,10 +34,10 @@ uv run pytest tests/test_briefing_runner.py -v --tb=short
 
 ## Critical Context
 
-- **Active LLM backend is Gemini CLI** (not Amazon Bedrock). `config.yaml` has `gemini.enabled: true`, `bedrock.enabled: false`. The README's Bedrock framing is aspirational/legacy.
+- **Active analysis uses the model chains in `llm.chains`.** Every tier starts with a Codex CLI rung (heavy `codex/gpt-5.6-sol`, medium `codex/gpt-5.6-terra`, light `codex/gpt-5.6-luna`), with free NVIDIA NIM and OpenRouter rungs behind it as fallback. OpenCode, Gemini and Bedrock are disabled. Codex CLI also writes the reader-facing report prose, through a separate client with its own call budget (`codex.max_calls_per_run`; the chain's is `codex.chain.max_calls_per_run`). NVIDIA reasoning budgets are bounded so reasoning cannot consume the entire answer allowance.
 - **v0.1 runner is the active one** (`scripts/briefing_runner.py`). `briefing_runner_v2.py` is experimental.
 - **Two config files exist:** `config.yaml` (main config, 10KB) and `config.json` (small model override for opencode, 100B). The shell script references `config.yaml`.
-- **THREE configs for runs — blanket changes must touch all of them:** `config.yaml` (main Atlas briefing) AND `config_local.yaml` (San Diego local briefing, run via `run_briefing.sh` second invocation) both need the same model/LLM edits — e.g. 2026-08-08 heavy-tier OpenRouter model was updated in `config.yaml` but not `config_local.yaml`, so the local run kept using `deepseek/deepseek-chat`. `config.json` only overrides the opencode editor model. `scripts/openrouter_client.py` etc. hold code defaults that must match too.
+- **THREE configs for runs — blanket model/LLM changes must touch all of them:** `config.yaml` (Atlas), `config_local.yaml` (San Diego), and `config_finance.yaml` (finance). Also keep code defaults and `config/model_capabilities.yaml` aligned. `config.json` only overrides the OpenCode editor model.
 - **`.gitignore` ignores all `*.md`** except a whitelist. Add new doc files to `.gitignore` whitelist.
 - **Scripts in `scripts/` that are NOT pytest tests:** `test_briefing_alignment.py`, `verify_agy.py`, `audit_gemini.py`, `benchmark_*.py`, `check_weekly_state.py` — these are live diagnostics needing API keys. Test paths are pinned to `tests/`.
 - **Config topics are intentional** — defense/space/AI theming is user-specific, not placeholder.
@@ -55,7 +55,11 @@ load .atlas-state.json → [LLM] expand arxiv topics
   → write status.json + .atlas-state.json
 ```
 
-Every LLM step has a deterministic fallback (TF-IDF scoring, flat headlines) for when Gemini CLI is unavailable.
+Analysis has deterministic fallbacks (TF-IDF ranking and actual source excerpts) when all rungs fail. `status.json` records completed `intelligence_calls` and `intelligence_degraded`; credential presence alone does not prove analysis succeeded.
+
+`--dry-run` skips distribution but still writes report artifacts, status and state. For reviews, use a copied config with separate `output_dir`, `status_file_path`, `state_file_path`, and call-log paths, and disable snapshot writes.
+
+Email newsletters use an explicit sender allowlist, read-only IMAP and BODY.PEEK. Local digests are split into stories; newsletter ranking complements selected news. Relative dates are anchored to the issue date, and official NWS alert windows take precedence in the executive summary. Union-Tribune newsletter text is available; its e-Edition requires an authenticated subscriber session.
 
 ## Pipeline Outputs (Consumed by sender-trades)
 

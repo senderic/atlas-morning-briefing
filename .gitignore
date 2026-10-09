@@ -47,11 +47,16 @@ logs/*.svg
 logs/alignment-report-*.txt
 logs/mock-briefing.md
 logs/gemini-calls*.jsonl
+logs/codex-calls.jsonl
+logs/local-codex-calls.jsonl
 logs/gemini-audit-*.txt
 # Quality-check run artifacts (scripts/quality_check.py)
 logs/source-health.jsonl
 logs/quality-scores.jsonl
 logs/quality-alerts.json
+logs/quality-streaks.json
+logs/judge-raw-*.txt
+logs/.quality-check.lock
 logs/quality-digest-*.md
 logs/local-gemini-calls.jsonl
 
@@ -83,6 +88,7 @@ htmlcov/
 !skills/*.md
 !.opencode/commands/*.md
 !.opencode/command/*.md
+!.superpowers/sdd/codex-report-writer-plan/task-2-report.md
 atlas-morning-briefing.json
 .env
 uv.lock

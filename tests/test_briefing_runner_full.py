@@ -39,6 +39,12 @@ def runner(cfg):
 # ---------- format/render helpers ----------
 
 
+def test_summary_that_shares_only_a_headline_prefix_is_preserved(runner):
+    title = "Unarmed security guard fatally shot near Crystal Pier; San Diego police investigating"
+    summary = "Unarmed security guard fatally shot near Crystal Pier early Monday morning; police are investigating."
+    assert runner._clean_summary(summary, title) == summary
+
+
 class TestFormatFilename:
     def test_default_pattern(self, runner):
         result = runner._format_filename(datetime(2026, 5, 22))
@@ -143,8 +149,36 @@ class TestDedupAgainstPrevious:
 
 
 class TestStatePersistence:
-    def test_save_and_load_roundtrip(self, runner, tmp_path, monkeypatch):
+    def test_saved_newsletter_is_split_before_ranking(self, runner):
+        runner.config["email_newsletters"] = {"sources": [{
+            "name": "Axios", "mode": "sections", "section_title_pattern": r"^\d+\.\s*"
+        }]}
+        inputs = [{"source": "Axios", "title": "Daily digest", "input_type": "email_newsletter",
+                   "summary": "1. Road closures\nTorrey Pines Road work runs 7 pm–3 am.\n2. Padres\nGame at 6:30 pm.\n"}]
+        result = runner._prepare_blog_articles(inputs)
+        assert [a["title"] for a in result] == ["Road closures", "Padres"]
+        assert "7 pm–3 am" in result[0]["summary"]
+
+    def test_saved_status_distinguishes_failed_analysis_from_successful_writer(self, runner, tmp_path):
+        from scripts.composite_client import CompositeClient
+        from scripts.llm_chain import Rung
+        class FailedBackend:
+            available = True
+            def invoke(self, *args, **kwargs): return None
+        runner.llm_client = CompositeClient({"openrouter": FailedBackend()}, {
+            "medium": [Rung("openrouter/model:free", "openrouter")]
+        })
+        runner.llm_client.invoke("rank")
+        runner.save_status(str(tmp_path))
+        status = json.loads((tmp_path / "status.json").read_text())
+        assert status["intelligence_enabled"] is False
+        assert status["intelligence_degraded"] is True
+        assert status["intelligence_calls"] == {"calls": 1, "successful": 0, "failed": 1}
+
+    def test_save_and_load_roundtrip(self, cfg, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
+        # A real run: a dry run reads state but never writes it.
+        runner = BriefingRunner(config=cfg, dry_run=False)
         papers = [{"title": "P1"}, {"title": "P2"}]
         runner._save_state(
             papers, [{"title": "B"}], [{"title": "N"}],
@@ -188,6 +222,12 @@ class TestSaveStatus:
 
 
 class TestRenderStocks(object):
+    def test_ticker_table_stays_first_for_downstream_parser(self, runner):
+        md = runner._render_stocks([{"symbol": "NVDA", "current_price": 100, "percent_change": 1}], market_trend="Price movements today.")
+        body_lines = [line for line in md.splitlines() if line.strip() and not line.startswith("##")]
+        assert body_lines[0].startswith("| Ticker")
+        assert body_lines[-1] == "Price movements today."
+
     def test_renders_table_with_market_trend(self, runner):
         stocks = [
             {"symbol": "AAPL", "current_price": 150, "percent_change": 1.2,
@@ -427,6 +467,86 @@ class TestScanWrappers:
 
     def test_blog_scan_no_feeds(self, runner):
         assert runner.run_blog_scan() == []
+
+    @patch("scripts.briefing_runner.EmailNewsletterScanner")
+    def test_blog_scan_accepts_email_newsletters_without_rss_feeds(
+        self, newsletter_cls, runner, monkeypatch
+    ):
+        """Catches the RSS empty-list guard skipping configured email inputs."""
+        runner.config["email_newsletters"] = {
+            "enabled": True,
+            "username_env": "TEST_IMAP_USER",
+            "password_env": "TEST_IMAP_PASSWORD",
+            "sources": [{"name": "Axios San Diego", "from": "sandiego@axios.com"}],
+        }
+        monkeypatch.setenv("TEST_IMAP_USER", "reader@example.com")
+        monkeypatch.setenv("TEST_IMAP_PASSWORD", "app-password")
+        newsletter_cls.return_value.scan.return_value = [
+            {"title": "PB field closure", "source": "Axios San Diego"}
+        ]
+
+        articles = runner.run_blog_scan()
+
+        assert [article["title"] for article in articles] == ["PB field closure"]
+        assert runner.status["blogs_found"] == 1
+
+    @patch("scripts.briefing_runner.EmailNewsletterScanner")
+    @patch("scripts.briefing_runner.BlogScanner")
+    def test_blog_scan_puts_newsletters_before_rss_candidates(
+        self, blog_cls, newsletter_cls, runner, monkeypatch
+    ):
+        """Catches newsletter items falling outside the ranker's candidate window."""
+        runner.config["blog_feeds"] = [{"name": "RSS", "url": "https://example.com/feed"}]
+        runner.config["email_newsletters"] = {
+            "enabled": True,
+            "username_env": "TEST_IMAP_USER",
+            "password_env": "TEST_IMAP_PASSWORD",
+            "sources": [{"name": "Axios San Diego", "from": "sandiego@axios.com"}],
+        }
+        monkeypatch.setenv("TEST_IMAP_USER", "reader@example.com")
+        monkeypatch.setenv("TEST_IMAP_PASSWORD", "app-password")
+        blog_cls.return_value.scan_all_feeds.return_value = [
+            {"title": "RSS item", "source": "RSS"}
+        ]
+        newsletter_cls.return_value.scan.return_value = [
+            {"title": "Axios item", "source": "Axios San Diego"}
+        ]
+
+        articles = runner.run_blog_scan()
+
+        assert [article["title"] for article in articles] == ["Axios item", "RSS item"]
+
+    @patch("scripts.briefing_runner.EmailNewsletterScanner")
+    @patch("scripts.briefing_runner.BlogScanner")
+    def test_blog_scan_interleaves_multiple_email_and_rss_candidates(
+        self, blog_cls, newsletter_cls, runner, monkeypatch
+    ):
+        """Catches several newsletters crowding all RSS out of fallback ranking."""
+        runner.config["blog_feeds"] = [{"name": "RSS", "url": "https://example.com/feed"}]
+        runner.config["email_newsletters"] = {
+            "enabled": True,
+            "username_env": "TEST_IMAP_USER",
+            "password_env": "TEST_IMAP_PASSWORD",
+            "sources": [{"name": "Newsletter", "from": "news@example.com"}],
+        }
+        monkeypatch.setenv("TEST_IMAP_USER", "reader@example.com")
+        monkeypatch.setenv("TEST_IMAP_PASSWORD", "app-password")
+        newsletter_cls.return_value.scan.return_value = [
+            {"title": "Email 1", "source": "Newsletter"},
+            {"title": "Email 2", "source": "Newsletter"},
+            {"title": "Email 3", "source": "Newsletter"},
+        ]
+        blog_cls.return_value.scan_all_feeds.return_value = [
+            {"title": "RSS 1", "source": "RSS"},
+            {"title": "RSS 2", "source": "RSS"},
+            {"title": "RSS 3", "source": "RSS"},
+        ]
+
+        articles = runner.run_blog_scan()
+
+        assert [article["title"] for article in articles] == [
+            "Email 1", "RSS 1", "Email 2", "RSS 2", "Email 3", "RSS 3"
+        ]
 
     def test_stock_fetch_no_api_key(self, runner, monkeypatch):
         monkeypatch.delenv("FINNHUB_API_KEY", raising=False)

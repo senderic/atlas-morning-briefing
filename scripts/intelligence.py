@@ -9,14 +9,35 @@ briefing pipeline. Falls back gracefully when the LLM client is unavailable.
 
 import logging
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.llm_client import BaseLLMClient
 from scripts.interest_graph import generate_graph_queries, parse_graph
 from scripts.leak_detection import is_cot_leak
+from scripts.prompt_safety import sanitize_prompt_input
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _newsletter_date_note(article: Dict[str, Any]) -> str:
+    """Anchor an issue's relative language before a model can carry it forward."""
+    if article.get("input_type") != "email_newsletter":
+        return ""
+    text = str(article.get("summary") or "") + " " + str(article.get("brief_summary") or "")
+    if not re.search(r"\bnext\s+week\b", text, re.IGNORECASE):
+        return ""
+    try:
+        published = datetime.fromisoformat(str(article.get("published") or "").replace("Z", "+00:00"))
+        issued = published.astimezone().date()
+    except (ValueError, TypeError):
+        return ""
+    next_monday = issued + timedelta(days=7 - issued.weekday())
+    return (
+        f"Calendar anchor: this issue's 'next week' means the week starting {next_monday.isoformat()}, "
+        "not next week relative to today's briefing. Use the anchored calendar date."
+    )
 
 
 SYSTEM_PROMPT = (
@@ -34,25 +55,9 @@ SYSTEM_PROMPT = (
 )
 
 
-def _sanitize_prompt_input(text: str, max_length: int = 10000) -> str:
-    """
-    Sanitize external input before embedding in LLM prompts.
-
-    Strips prompt injection markers and truncates to prevent abuse.
-
-    Args:
-        text: Raw input text from external source.
-        max_length: Maximum allowed character length.
-
-    Returns:
-        Sanitized text safe for prompt inclusion.
-    """
-    if not isinstance(text, str):
-        return ""
-    text = text[:max_length]
-    # Strip characters that could be used for prompt injection / XML tag spoofing
-    text = re.sub(r"</?(?:system|human|assistant|instructions?|prompt)[^>]*>", "", text, flags=re.IGNORECASE)
-    return text
+# Kept under its historical private name: this module's prompt builders and
+# the quality checker's judge both import it from here.
+_sanitize_prompt_input = sanitize_prompt_input
 
 
 # Meta-commentary markers a model sometimes appends to a ranked summary,
@@ -144,15 +149,33 @@ def _strip_trailing_rationale(text: str) -> str:
 class BriefingIntelligence:
     """Adds LLM-powered intelligence to the briefing pipeline."""
 
-    def __init__(self, client: BaseLLMClient, config: Dict[str, Any]):
+    # briefing_profile.reproduction.setup when the config gives none.
+    DEFAULT_REPRO_SETUP = (
+        "A single workstation or small server, no GPU cluster",
+        "Hosted LLM APIs for model access",
+        "Python and standard open-source ML libraries",
+    )
+    # The five reproduction-feasibility dimensions, 1-5 each, 25 in total.
+    REPRO_DIMENSIONS = ("code", "data", "infra", "api", "effort")
+
+    def __init__(
+        self,
+        client: BaseLLMClient,
+        config: Dict[str, Any],
+        report_writer: Optional[BaseLLMClient] = None,
+    ):
         """
         Initialize BriefingIntelligence.
 
         Args:
             client: BaseLLMClient instance.
             config: Full config dictionary.
+            report_writer: Optional reader-facing prose client. Analysis stays
+                on ``client``; only synthesis and long-form report writing use
+                this separate route.
         """
         self.client = client
+        self.report_writer = report_writer
         self.config = config
         self.topics = config.get("arxiv_topics", [])
         # Domain framing for prompts is config-driven, never hardcoded here.
@@ -163,6 +186,14 @@ class BriefingIntelligence:
         self.briefing_landscape = profile.get(
             "landscape", "the AI and technology landscape"
         )
+        # What the reader can actually run a paper on. The reproduction-
+        # feasibility prompt used to hardcode one machine and one vendor's API
+        # (and kept scoring papers against it long after the reader had left
+        # both); it is config now, with a deliberately generic default.
+        repro = profile.get("reproduction") or {}
+        setup = [str(line).strip() for line in (repro.get("setup") or []) if str(line).strip()]
+        self.repro_setup = setup or list(self.DEFAULT_REPRO_SETUP)
+        self.repro_limits = str(repro.get("limits") or "").strip()
         # Ordered ranking tiers ("what matters most first"). Empty by default so
         # briefings without a configured order keep their previous behavior.
         self.briefing_priorities = [
@@ -185,6 +216,12 @@ class BriefingIntelligence:
     def available(self) -> bool:
         """Check if intelligence features are available."""
         return self.client.available
+
+    @property
+    def report_writer_available(self) -> bool:
+        """Whether reader-facing prose can be generated independently."""
+        writer = self.report_writer or self.client
+        return writer.available
 
     def _priority_block(self) -> str:
         """
@@ -567,6 +604,12 @@ class BriefingIntelligence:
         Returns:
             Items with added 'author_blurb' key.
         """
+        if item_type in {"news", "blogs"} and not self.config.get("features", {}).get("source_blurbs", True):
+            # Attribution comes from the feed. A model's recalled awards,
+            # ownership and reputation are not verified source evidence.
+            for item in items:
+                item.pop("author_blurb", None)
+            return items
         if not self.available or not items:
             return items
 
@@ -637,8 +680,16 @@ class BriefingIntelligence:
             "Each item must start with [n] or n."
         )
 
+        # A blurb written from recall invents biographies; one written from a
+        # search cites them. The keyword is passed only when the feature is on
+        # -- a backend with search (Codex) honours it with every local tool
+        # still off, and the others ignore it. This prompt carries titles and
+        # names only, never article bodies.
+        extra: Dict[str, Any] = {}
+        if self.config.get("features", {}).get("author_blurb_web_search", False):
+            extra["web_search"] = True
         result = self.client.invoke(
-            prompt, tier="light", system_prompt=SYSTEM_PROMPT
+            prompt, tier="light", system_prompt=SYSTEM_PROMPT, **extra
         )
         if not result:
             return items
@@ -851,18 +902,19 @@ class BriefingIntelligence:
         Assess reproduction feasibility and re-rank papers by actionability.
 
         Uses structured scoring across 5 dimensions to filter out papers
-        that are not practically reproducible on our setup (single EC2,
-        Amazon Bedrock, no GPU cluster).
+        that are not practically reproducible on the reader's setup, which is
+        described in config (``briefing_profile.reproduction``).
 
         Scoring dimensions (each 1-5):
-          1. code_available — Is code open-source and runnable?
-          2. data_accessible — Is data open/downloadable (<10GB)?
-          3. infra_fit — Can run on single EC2 + Bedrock (no GPU cluster)?
-          4. bedrock_ready — Can use Bedrock models (Claude/Titan) directly?
+          1. code — Is code open-source and runnable?
+          2. data — Is data open/downloadable?
+          3. infra — Does it run on the configured setup?
+          4. api — Can the hosted LLM APIs in that setup stand in directly?
           5. effort — Time to reproduce (5=weekend, 1=months)
 
-        Papers scoring < 15/25 are demoted (moved below higher-scoring ones).
-        Papers scoring < 10/25 are dropped from top picks entirely.
+        Papers are re-ranked by total. One scoring below ``repro_min_score``
+        (of 25) is dropped; one whose line did not carry all five dimensions
+        was not assessed and is kept, after the papers that passed.
 
         Args:
             papers: Top-scored papers (typically 3-10).
@@ -883,22 +935,27 @@ class BriefingIntelligence:
             )
 
         papers_block = "\n\n".join(paper_texts)
+        setup_block = "\n".join(f"- {line}" for line in self.repro_setup)
+        limits_line = f"Limits: {self.repro_limits}\n" if self.repro_limits else ""
         prompt = (
             "You are evaluating papers for PRACTICAL reproduction on this setup:\n"
-            "- Single EC2 GPU instance available (g5.xlarge = 1x A10G 24GB, or trn1.2xlarge = AWS Trainium)\n"
-            "- Amazon Bedrock API (Claude Sonnet/Opus, Titan Embeddings)\n"
-            "- Python + standard ML libraries, Kubernetes OK if single-node\n"
-            "- Budget: <$50 per paper, <1 week effort\n\n"
+            f"{setup_block}\n"
+            f"{limits_line}\n"
             "Score each paper on 5 dimensions (1-5 each, 25 max):\n"
-            "1. code_available: 5=open repo+README, 3=partial code, 1=no code\n"
-            "2. data_accessible: 5=open data <50GB, 3=needs request/large, 1=proprietary\n"
-            "3. infra_fit: 5=CPU/API only, 4=single GPU(A10G/Trainium), 3=multi-GPU single node, 2=multi-node cluster, 1=datacenter/TPU pod\n"
-            "4. bedrock_ready: 5=can swap in Bedrock models directly, 3=needs adapter, 1=incompatible\n"
+            "1. code: 5=open repo+README, 3=partial code, 1=no code\n"
+            "2. data: 5=open data of manageable size, 3=needs request/very large, 1=proprietary\n"
+            "3. infra: 5=runs on the setup above as described, 4=needs one modest addition "
+            "(e.g. a single rented GPU), 3=multi-GPU single node, 2=multi-node cluster, "
+            "1=datacenter/TPU pod\n"
+            "4. api: 5=the hosted LLM APIs in the setup can be used directly, 3=needs an "
+            "adapter or a model swap, 1=needs something those APIs do not expose "
+            "(weights, internals, fine-tuning)\n"
             "5. effort: 5=weekend(S), 4=1week(M), 3=2weeks(L), 2=month(XL), 1=impossible\n\n"
-            "For each paper respond in this EXACT format (one line each):\n"
-            "[number] code:X data:X infra:X bedrock:X effort:X | verdict\n\n"
-            "Example: [1] code:5 data:4 infra:5 bedrock:5 effort:4 | Open benchmark + Bedrock RAG, easy to reproduce\n"
-            "Example: [2] code:1 data:1 infra:1 bedrock:2 effort:1 | No code, needs GPU cluster, skip\n\n"
+            "For each paper respond in this EXACT format (one line each), with all "
+            "five scores present:\n"
+            "[number] code:X data:X infra:X api:X effort:X | verdict\n\n"
+            "Example: [1] code:5 data:4 infra:5 api:5 effort:4 | Open benchmark, API-only pipeline, easy to reproduce\n"
+            "Example: [2] code:1 data:1 infra:1 api:2 effort:1 | No code, needs a GPU cluster, skip\n\n"
             f"<papers>\n{papers_block}\n</papers>"
         )
 
@@ -918,7 +975,7 @@ class BriefingIntelligence:
                 idx = int(line[1:bracket_end]) - 1
                 rest = line[bracket_end + 1:].strip()
 
-                # Parse scores: code:X data:X infra:X bedrock:X effort:X | verdict
+                # Parse scores: code:X data:X infra:X api:X effort:X | verdict
                 scores = {}
                 verdict = ""
                 if "|" in rest:
@@ -927,22 +984,34 @@ class BriefingIntelligence:
                 else:
                     scores_part = rest
 
-                for dim in ["code", "data", "infra", "bedrock", "effort"]:
-                    match = re.search(rf"{dim}:(\d)", scores_part)
+                for dim in self.REPRO_DIMENSIONS:
+                    match = re.search(rf"\b{dim}:\s*([1-5])(?!\d)", scores_part)
                     if match:
                         scores[dim] = int(match.group(1))
 
-                if 0 <= idx < len(papers) and scores:
-                    total = sum(scores.values())
-                    papers[idx]["repro_scores"] = scores
-                    papers[idx]["repro_total"] = total
-                    papers[idx]["repro_verdict"] = verdict
-                    papers[idx]["reproduction_assessment"] = (
-                        f"Score: {total}/25 "
-                        f"(code:{scores.get('code',0)} data:{scores.get('data',0)} "
-                        f"infra:{scores.get('infra',0)} bedrock:{scores.get('bedrock',0)} "
-                        f"effort:{scores.get('effort',0)}) — {verdict}"
+                if not 0 <= idx < len(papers):
+                    continue
+                # All five or nothing. A line with dimensions missing is not
+                # a low score, it is no assessment: summing what happened to
+                # parse turned one stray "code:4" into 4/25 and the gate
+                # below then dropped a paper that was never scored. Leaving
+                # the keys unset keeps it, without a repro line.
+                if len(scores) != len(self.REPRO_DIMENSIONS):
+                    missing = [d for d in self.REPRO_DIMENSIONS if d not in scores]
+                    logger.info(
+                        "Repro assessment for paper %d incomplete (missing %s); "
+                        "treating it as not assessed", idx + 1, ", ".join(missing),
                     )
+                    continue
+                total = sum(scores.values())
+                papers[idx]["repro_scores"] = scores
+                papers[idx]["repro_total"] = total
+                papers[idx]["repro_verdict"] = verdict
+                papers[idx]["reproduction_assessment"] = (
+                    f"Score: {total}/25 "
+                    + " ".join(f"{dim}:{scores[dim]}" for dim in self.REPRO_DIMENSIONS)
+                    + f" — {verdict}"
+                )
             except (ValueError, IndexError) as e:
                 logger.debug(f"Failed to parse repro line: {line}, error: {e}")
                 continue
@@ -982,10 +1051,11 @@ class BriefingIntelligence:
         """
         if not self.available or not news:
             logger.info(f"News ranking skipped: available={self.available}, news_count={len(news)}")
-            return news[:5]
+            return self._fallback_items(news, topics)
 
         news_lines = []
-        for i, article in enumerate(news[:20]):
+        candidates = news[:int(self.config.get("ranking_candidate_limit", 60))]
+        for i, article in enumerate(candidates):
             title = _sanitize_prompt_input(article.get("title", ""), max_length=300)
             source = _sanitize_prompt_input(article.get("source", ""), max_length=100)
             snippet = _sanitize_prompt_input(
@@ -1010,7 +1080,10 @@ class BriefingIntelligence:
             "In each summary, lead with what actually happened and the concrete "
             "stakes, then deliver the 'so what' -- the implication or what it "
             "signals. Active voice, specific names and numbers, no hype, no "
-            f"filler. {self._rank_directive()} Be factual. Do not invent details."
+            f"filler. {self._rank_directive()} Use only facts in that item's supplied "
+            "text. Do not invent dates, locations, patrols, attendance rules or "
+            "causes, and do not borrow facts from a different item. Label any "
+            "implication as an inference rather than an observed fact."
             f"{self._actionability_note()}"
         )
 
@@ -1018,7 +1091,7 @@ class BriefingIntelligence:
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
-            return news[:5]
+            return self._fallback_items(news, topics)
 
         logger.debug(f"News LLM response:\n{result[:500]}")
 
@@ -1027,8 +1100,8 @@ class BriefingIntelligence:
         logger.info(f"News parsing: {len(parsed)} items parsed from LLM response")
         ranked_news = []
         for idx, text in parsed:
-            if 0 <= idx < len(news):
-                article = news[idx].copy()
+            if 0 <= idx < len(candidates):
+                article = candidates[idx].copy()
                 article["brief_summary"] = _strip_trailing_rationale(text)
                 ranked_news.append(article)
 
@@ -1047,8 +1120,8 @@ class BriefingIntelligence:
         if retry_result:
             parsed_retry = self._parse_ranked_response(retry_result)
             for idx, text in parsed_retry:
-                if 0 <= idx < len(news):
-                    article = news[idx].copy()
+                if 0 <= idx < len(candidates):
+                    article = candidates[idx].copy()
                     article["brief_summary"] = _strip_trailing_rationale(text)
                     ranked_news.append(article)
             if ranked_news:
@@ -1057,12 +1130,7 @@ class BriefingIntelligence:
                 return diversified[:5]
 
         logger.warning("News ranking failed after retry, using description fallback")
-        fallback = []
-        for article in news[:5]:
-            a = article.copy()
-            a["brief_summary"] = a.get("description", a.get("snippet", ""))
-            fallback.append(a)
-        return fallback
+        return self._fallback_items(news, topics)
 
     def rank_and_summarize_happenings(
         self, happenings: List[Dict[str, Any]], max_items: int = 6
@@ -1168,12 +1236,13 @@ class BriefingIntelligence:
         return fallback
 
     def rank_and_summarize_blogs(
-        self, blogs: List[Dict[str, Any]], topics: List[str]
+        self, blogs: List[Dict[str, Any]], topics: List[str],
+        covered_news: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Rank blogs by relevance and generate 1-2 sentence summaries for top items.
 
-        Uses the light tier model to save cost.
+        Uses the medium tier model; optional news context avoids repetition.
 
         Args:
             blogs: List of blog article dictionaries.
@@ -1183,26 +1252,74 @@ class BriefingIntelligence:
             Top 5 blog articles, ranked and summarized.
         """
         if not self.available or not blogs:
-            return blogs[:5]
+            return self._fallback_items(blogs, topics)
 
         blog_lines = []
-        for i, article in enumerate(blogs[:15]):
+        candidates = blogs[:int(self.config.get("ranking_candidate_limit", 60))]
+        for i, article in enumerate(candidates):
             title = _sanitize_prompt_input(article.get("title", ""), max_length=300)
             source = _sanitize_prompt_input(article.get("source", ""), max_length=100)
-            summary = _sanitize_prompt_input(article.get("summary", "")[:200], max_length=300)
-            blog_lines.append(f"[{i+1}] {title} ({source}): {summary}")
+            # A newsletter's lead story normally begins after its masthead,
+            # weather, and other preamble. The RSS-sized 200-character window
+            # hid the actual local reporting from the ranker.
+            summary_limit = (
+                int(self.config.get("email_newsletter_prompt_chars", 10_000))
+                if article.get("input_type") == "email_newsletter"
+                else 200
+            )
+            summary = _sanitize_prompt_input(
+                article.get("summary", "")[:summary_limit],
+                max_length=summary_limit + 100,
+                # A newsletter body runs to several stories; its paragraph
+                # breaks are content. An RSS snippet is one line.
+                multiline=article.get("input_type") == "email_newsletter",
+            )
+            published = _sanitize_prompt_input(article.get("published", ""), max_length=60)
+            blog_lines.append(f"[{i+1}] {title} ({source}; published {published}): {summary}\n{_newsletter_date_note(article)}")
 
         blogs_block = "\n".join(blog_lines)
+        covered_note = ""
+        if covered_news:
+            covered = "\n".join(
+                _sanitize_prompt_input(f"{n.get('title', '')}: {n.get('brief_summary', '')}", max_length=700)
+                for n in covered_news[:5]
+            )
+            covered_note = (
+                "The news section already covers these developments:\n"
+                f"<covered_news>\n{covered}\n</covered_news>\n\n"
+                "Choose complementary stories rather than repeating those "
+                "weather advisories, outages or incidents. Prioritize original "
+                "newsletter details such as roads and construction hours, "
+                "benefit or coverage changes, fees and deadlines. Repeat a "
+                "development only if this item adds a specific decision or "
+                "actionable detail absent from the news section.\n\n"
+            )
+        newsletter_note = ""
+        if any(
+            article.get("input_type") == "email_newsletter"
+            for article in candidates
+        ):
+            newsletter_note = (
+                "For an email newsletter, include every actionable warning, "
+                "closure, fee or bill change, time-sensitive local activity, "
+                "and investment-relevant development in the supplied text -- "
+                "not only its lead story. Compress these into up to 4 concise "
+                "sentences when needed.\n"
+            )
         prompt = (
             f"You are curating a daily {self.briefing_domain} briefing. From these "
             f"blog posts, select the TOP 5 most relevant for {self.briefing_audience}.\n\n"
             f"{self._priority_block()}"
+            f"{covered_note}"
             f"<interests>{', '.join(self._ranking_interests(topics))}</interests>\n\n"
             f"<blogs>\n{blogs_block}\n</blogs>\n\n"
             "For each of your top 5 picks, respond in this exact format:\n"
-            "[original_number] SCORE:X/5 1-2 sentence summary.\n\n"
+            "[original_number] SCORE:X/5 concise summary.\n\n"
             "Return only the numbered picks in that exact format -- never "
             "explain, list, or justify which posts you left out.\n\n"
+            f"{newsletter_note}"
+            "Resolve relative dates using each issue's publication date. Preserve "
+            "the actual road, location, hours, closure, and deadline when supplied.\n"
             "In the summary, name the specific thing the post is about and state "
             "what it concretely claims, builds, or shows -- the actual takeaway a "
             "reader would quote. Lead with the subject (the product, method, or "
@@ -1211,6 +1328,8 @@ class BriefingIntelligence:
             "any sentence that would read the same for a dozen different posts. If "
             "the provided text is too thin to say anything specific, summarize the "
             "headline plainly rather than inflating it into a generic principle.\n"
+            "Use only facts in that item's supplied text. Do not invent dates, "
+            "locations or rules, and do not borrow facts from a different item. "
             "Specific, plainspoken, active voice.\n"
             "SCORE is a combined rating (1-5) of impact, complexity, and innovation. "
             "5 = groundbreaking, 1 = routine.\n"
@@ -1222,14 +1341,14 @@ class BriefingIntelligence:
             prompt, tier="medium", system_prompt=SYSTEM_PROMPT
         )
         if not result:
-            return blogs[:5]
+            return self._fallback_items(blogs, topics)
 
         # Parse ranked results using shared parser
         parsed = self._parse_ranked_response(result)
         ranked_blogs = []
         for idx, text in parsed:
-            if 0 <= idx < len(blogs):
-                article = blogs[idx].copy()
+            if 0 <= idx < len(candidates):
+                article = candidates[idx].copy()
                 score, summary = self.extract_score(text)
                 article["brief_summary"] = _strip_trailing_rationale(summary)
                 if score:
@@ -1243,7 +1362,38 @@ class BriefingIntelligence:
             logger.info(f"Ranked and summarized {len(diversified)} blog articles")
             return diversified[:5]
 
-        return self._enforce_source_diversity(blogs, max_per_source=self.max_per_source)[:5]
+        return self._fallback_items(blogs, topics)
+
+    def _fallback_items(self, items: List[Dict[str, Any]], topics: List[str]) -> List[Dict[str, Any]]:
+        """Rank the whole pool deterministically and retain actual source excerpts."""
+        if not items:
+            return []
+        ranked = list(items)
+        interests = self._ranking_interests(topics)
+        if interests:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            documents = [
+                f"{item.get('title', '')} {item.get('title', '')} "
+                + str(item.get("summary") or item.get("description") or item.get("snippet") or "")
+                for item in items
+            ]
+            try:
+                matrix = TfidfVectorizer(stop_words="english").fit_transform(documents + [" ".join(interests)])
+                scores = (matrix[:-1] @ matrix[-1].T).toarray().ravel()
+                ranked = [items[i] for i in sorted(range(len(items)), key=lambda i: -scores[i])]
+            except ValueError:
+                pass  # empty vocabulary: retain source ordering
+        if len({a.get("source", "") for a in ranked}) > 1:
+            ranked = self._enforce_source_diversity(ranked, self.max_per_source)
+        result = []
+        for item in ranked[:5]:
+            article = item.copy()
+            excerpt = article.get("brief_summary") or article.get("summary") or article.get("description") or article.get("snippet") or ""
+            article["brief_summary"] = _sanitize_prompt_input(
+                excerpt, max_length=2400, multiline=True
+            )
+            result.append(article)
+        return result
 
     @staticmethod
     def _enforce_source_diversity(
@@ -1293,8 +1443,26 @@ class BriefingIntelligence:
         if not stock_lines:
             return stocks
 
+        def names_stock(stock: Dict[str, Any], headline: Dict[str, Any]) -> bool:
+            symbol = str(stock.get("symbol") or "")
+            name = str(stock.get("name") or symbol)
+            names = [n for n in (symbol, name) if n]
+            brand = name.split()[0] if name else ""
+            if len(brand) >= 3 and brand.lower() not in {"the", "global", "united"}:
+                names.append(brand)
+            title = str(headline.get("title", ""))
+            return any(re.search(r"(?<!\w)" + re.escape(n) + r"(?!\w)", title, re.IGNORECASE) for n in names)
+
+        candidates = [
+            n for n in news[:15]
+            if str(n.get("url") or n.get("link") or "").startswith(("https://", "http://"))
+            and any(names_stock(s, n) for s in stocks if "error" not in s)
+        ]
+        if not candidates:
+            return stocks
         news_lines = [
-            f"- {_sanitize_prompt_input(n.get('title', ''), max_length=300)}" for n in news[:15]
+            f"[{i+1}] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}"
+            for i, n in enumerate(candidates)
         ]
 
         stocks_block = "\n".join(stock_lines)
@@ -1304,12 +1472,12 @@ class BriefingIntelligence:
             f"<stocks>\n{stocks_block}\n</stocks>\n\n"
             "Today's headlines:\n"
             f"<headlines>\n{headlines_block}\n</headlines>\n\n"
-            "For EVERY stock, write a short driver (max 4 words). "
-            "Use the headlines if related, otherwise use general market context "
-            "(e.g. 'Broad tech selloff', 'Sector rotation').\n"
-            "Respond with one line per stock:\n"
-            "SYMBOL | short driver\n"
-            "Every stock MUST have a driver. Never leave blank."
+            "Only for stocks directly named in a headline, identify the related "
+            "development (max 4 words). This is context, NOT a proven cause of "
+            "the price move. Omit unrelated stocks; never invent market drivers.\n"
+            "Respond with one line per supported stock:\n"
+            "SYMBOL | headline_number | related development\n"
+            "Return no lines if none of these stocks has related reporting."
         )
 
         result = self.client.invoke(
@@ -1320,18 +1488,30 @@ class BriefingIntelligence:
 
         # Parse correlations
         correlations = {}
+        stocks_by_symbol = {s.get("symbol", "").upper(): s for s in stocks if "error" not in s}
         for line in result.strip().split("\n"):
-            if "|" in line:
-                parts = line.split("|", 1)
-                symbol = parts[0].strip().upper()
-                correlation = parts[1].strip()
-                if correlation and correlation.lower() != "no clear driver":
-                    correlations[symbol] = correlation
+            parts = [part.strip() for part in line.split("|", 2)]
+            if len(parts) != 3 or parts[0].upper() not in stocks_by_symbol:
+                continue
+            symbol = parts[0].upper()
+            try:
+                index = int(parts[1].strip("[]")) - 1
+            except ValueError:
+                continue
+            if not 0 <= index < len(candidates):
+                continue
+            headline = candidates[index]
+            supported = names_stock(stocks_by_symbol[symbol], headline)
+            url = headline.get("url") or headline.get("link") or ""
+            if supported and url.startswith(("https://", "http://")) and parts[2]:
+                correlations[symbol] = (parts[2], url)
 
         for stock in stocks:
             symbol = stock.get("symbol", "")
+            stock.pop("news_correlation", None)
+            stock.pop("news_correlation_source", None)
             if symbol in correlations:
-                stock["news_correlation"] = correlations[symbol]
+                stock["news_correlation"], stock["news_correlation_source"] = correlations[symbol]
 
         logger.info(f"Correlated {len(correlations)} stocks with news")
         return stocks
@@ -1358,11 +1538,11 @@ class BriefingIntelligence:
 
         titles = []
         for p in papers[:15]:
-            titles.append(f"[paper] {p.get('title', '')}")
+            titles.append(f"[paper] {_sanitize_prompt_input(p.get('title', ''), max_length=300)}")
         for b in blogs[:10]:
-            titles.append(f"[blog] {b.get('title', '')}")
+            titles.append(f"[blog] {_sanitize_prompt_input(b.get('title', ''), max_length=300)}")
         for n in news[:10]:
-            titles.append(f"[news] {n.get('title', '')}")
+            titles.append(f"[news] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}")
 
         if not titles:
             return []
@@ -1402,6 +1582,7 @@ class BriefingIntelligence:
         top_papers: List[Dict[str, Any]],
         emerging_themes: Optional[List[str]] = None,
         previous_state: Optional[Dict[str, Any]] = None,
+        alerts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         """
         Synthesize cross-section connections and generate editorial content.
@@ -1421,17 +1602,35 @@ class BriefingIntelligence:
             Dictionary with key:
               - 'editorial_intro': Executive summary paragraph for the briefing.
         """
-        if not self.available:
+        if not self.report_writer_available:
             return {}
 
         # Build a compact summary of all data for the synthesis prompt
         sections = []
 
+        if alerts:
+            alert_lines = []
+            for alert in alerts[:10]:
+                details = " | ".join(
+                    f"{field}: {alert.get(field, '')}" for field in
+                    ("event", "severity", "onset", "expires", "area", "areaDesc", "instruction")
+                )
+                alert_lines.append(_sanitize_prompt_input(details, max_length=1600))
+            sections.append(
+                "CURRENT OFFICIAL NATIONAL WEATHER SERVICE ALERTS:\n"
+                + "\n".join(alert_lines)
+                + "\nThese current official alert windows take precedence over "
+                "older news snippets. Preserve their onset and expiry dates and "
+                "times; do not replace them with a conflicting article's window."
+            )
+
         if papers:
             paper_items = []
             for p in papers[:10]:
-                title = p.get("title", "")
-                summary = p.get("brief_summary", p.get("ai_summary", ""))
+                title = _sanitize_prompt_input(p.get("title", ""), max_length=500)
+                summary = _sanitize_prompt_input(
+                    p.get("brief_summary", p.get("ai_summary", "")), max_length=1200
+                )
                 if summary:
                     paper_items.append(f"- {title}: {summary}")
                 else:
@@ -1444,11 +1643,25 @@ class BriefingIntelligence:
         if blogs:
             blog_items = []
             for b in blogs[:8]:
-                source = b.get("source", "")
-                title = b.get("title", "")
-                summary = b.get("brief_summary", "")
+                source = _sanitize_prompt_input(b.get("source", ""), max_length=100)
+                title = _sanitize_prompt_input(b.get("title", ""), max_length=300)
+                published = _sanitize_prompt_input(b.get("published", ""), max_length=60)
+                # A newsletter excerpt keeps its paragraphs; everything else
+                # in this list is a one-line field.
+                is_newsletter = b.get("input_type") == "email_newsletter"
+                summary = b.get("brief_summary") or b.get("summary", "")
+                summary = _sanitize_prompt_input(
+                    summary, max_length=2400, multiline=is_newsletter
+                )
+                if is_newsletter and b.get("brief_summary"):
+                    summary += "\nSource excerpt: " + _sanitize_prompt_input(
+                        b.get("summary", ""), max_length=2400, multiline=True
+                    )
+                date_note = _newsletter_date_note(b)
+                if date_note:
+                    summary += "\n" + date_note
                 if summary:
-                    blog_items.append(f"- [{source}] {title}: {summary}")
+                    blog_items.append(f"- [{source}; published {published}] {title}: {summary}")
                 else:
                     blog_items.append(f"- [{source}] {title}")
             sections.append("BLOGS:\n" + "\n".join(blog_items))
@@ -1470,8 +1683,9 @@ class BriefingIntelligence:
         if news:
             news_items = []
             for n in news[:10]:
-                title = n.get("title", "")
-                summary = n.get("brief_summary", "")
+                title = _sanitize_prompt_input(n.get("title", ""), max_length=300)
+                summary = n.get("brief_summary") or n.get("description") or n.get("snippet", "")
+                summary = _sanitize_prompt_input(summary, max_length=1200)
                 if summary:
                     news_items.append(f"- {title}: {summary}")
                 else:
@@ -1481,9 +1695,10 @@ class BriefingIntelligence:
         if top_papers:
             top_items = []
             for p in top_papers:
-                reason = p.get("relevance_reason", "")
+                reason = _sanitize_prompt_input(p.get("relevance_reason", ""), max_length=300)
+                title = _sanitize_prompt_input(p.get("title", ""), max_length=500)
                 top_items.append(
-                    f"- {p.get('title', '')} (score: {p.get('score', 0):.1f})"
+                    f"- {title} (score: {p.get('score', 0):.1f})"
                     + (f" -- {reason}" if reason else "")
                 )
             sections.append("TOP PAPERS FOR REPRODUCTION:\n" + "\n".join(top_items))
@@ -1529,7 +1744,11 @@ class BriefingIntelligence:
             cross_source_note = (
                 "\n\n<cross_source_signals>\n"
                 "These topics appear in 2+ sources (PRIORITIZE in summary):\n"
-                + "\n".join(f"- {s}" for s in cross_source_signals)
+                # Built from n-grams of raw titles, so it is feed text too.
+                + "\n".join(
+                    f"- {_sanitize_prompt_input(s, max_length=300)}"
+                    for s in cross_source_signals
+                )
                 + "\n</cross_source_signals>"
             )
 
@@ -1555,8 +1774,8 @@ class BriefingIntelligence:
             f"{self.briefing_audience} — or that reader's plan, assumptions, "
             "budget, or routine. An organization, a product, a market move, or "
             "a trend must NOT be the subject; name the development later in "
-            "the sentence, as the reason. State what the reader should now do "
-            "differently.\n"
+            "the sentence, as the reason. Make any implication match the supplied "
+            "evidence; do not manufacture a behavioral change.\n"
             "  Shape that FAILS — '<Organization> did <thing>, which signals "
             "<trend>.' The reader appears nowhere.\n"
             "  Shape that FAILS — '<Trend> is now <state of the world>.' True, "
@@ -1565,8 +1784,8 @@ class BriefingIntelligence:
             "<by when> — <development> just <changed the constraint>.'\n"
             "  Two tests before you commit to it: (1) could this sentence "
             "appear verbatim in the press release of whoever is mentioned? If "
-            "yes, rewrite. (2) Does a reader learn something to DO, not just "
-            "something that HAPPENED? If no, rewrite. "
+            "yes, rewrite. (2) Does the takeaway reflect the evidence rather "
+            "than turn a completed event into a fresh warning? If no, rewrite. "
             "This is the glanceable takeaway. "
             "No throat-clearing, no 'Today's briefing covers...'.\n"
             "- 3-5 short paragraphs (1-2 sentences each) separated by blank "
@@ -1588,6 +1807,17 @@ class BriefingIntelligence:
             "qualitatively. A vaguer true sentence beats a precise invented one.\n"
             f"- Today's date is exactly {_today_str} — do not infer a different "
             "date if you reference one.\n"
+            "- EDITORIAL EVIDENCE POLICY: Give behavioral advice only when supplied "
+            "data establishes an active closure or advisory, a continuing threat, "
+            "a repeated pattern, a deadline, a scheduled decision, or a measured "
+            "risk. Then clearly state the action, timing, or decision.\n"
+            "- Treat completed incidents as context rather than current hazards; "
+            "do not recast them as active risks or invent avoidance advice.\n"
+            "- Duplicate coverage confirms an event but does not establish prevalence, "
+            "a trend, or ongoing risk.\n"
+            "- If the supplied data does not establish one of those conditions, give "
+            "a concise reader-centered takeaway about what matters and why, without "
+            "telling the reader to change behavior.\n"
             "- Never output your internal reasoning, verification, or grounding "
             "steps; output only the final editorial text.\n\n"
             "IMPORTANT: Topics in <cross_source_signals> appear in multiple "
@@ -1599,18 +1829,19 @@ class BriefingIntelligence:
             f"{cross_source_note}"
         )
 
-        result = self.client.invoke(
+        writer = self.report_writer or self.client
+        result = writer.invoke(
             prompt,
             tier="heavy",
             system_prompt=SYSTEM_PROMPT,
             reasoning_enabled=True,
         )
-        if result and is_cot_leak(result):
+        if self.report_writer is None and result and is_cot_leak(result):
             logger.warning(
                 "Editorial synthesis leaked CoT scaffolding; "
                 "retrying without reasoning."
             )
-            result = self.client.invoke(
+            result = writer.invoke(
                 prompt,
                 tier="heavy",
                 system_prompt=SYSTEM_PROMPT,
@@ -1663,11 +1894,11 @@ class BriefingIntelligence:
         # Build list of current items
         current_items = []
         for p in papers[:10]:
-            current_items.append(f"[paper] {p.get('title', '')}")
+            current_items.append(f"[paper] {_sanitize_prompt_input(p.get('title', ''), max_length=300)}")
         for b in blogs[:10]:
-            current_items.append(f"[blog] {b.get('title', '')}")
+            current_items.append(f"[blog] {_sanitize_prompt_input(b.get('title', ''), max_length=300)}")
         for n in news[:10]:
-            current_items.append(f"[news] {n.get('title', '')}")
+            current_items.append(f"[news] {_sanitize_prompt_input(n.get('title', ''), max_length=300)}")
 
         if not current_items:
             return state, papers, blogs, news
@@ -1875,7 +2106,7 @@ class BriefingIntelligence:
         Returns:
             Markdown string for the "This Week in AI" section (500-800 words).
         """
-        if not self.available or not weekly_items:
+        if not self.report_writer_available or not weekly_items:
             return ""
 
         # Group items by date
@@ -1890,7 +2121,11 @@ class BriefingIntelligence:
         context_parts = []
         for date in sorted(items_by_date.keys()):
             items = items_by_date[date]
-            titles = [f"- {i.get('title', '')} ({i.get('type', 'item')})" for i in items]
+            titles = [
+                f"- {_sanitize_prompt_input(i.get('title', ''), max_length=300)} "
+                f"({_sanitize_prompt_input(str(i.get('type', 'item')), max_length=30)})"
+                for i in items
+            ]
             context_parts.append(f"{date}:\n" + "\n".join(titles))
 
         if not context_parts:
@@ -1927,15 +2162,16 @@ class BriefingIntelligence:
             f"<week_items>\n{context_str}\n</week_items>"
         )
 
-        result = self.client.invoke(
+        writer = self.report_writer or self.client
+        result = writer.invoke(
             prompt, tier="heavy", system_prompt=SYSTEM_PROMPT
         )
-        if result and is_cot_leak(result):
+        if self.report_writer is None and result and is_cot_leak(result):
             logger.warning(
                 "Weekly Deep Dive leaked CoT scaffolding; "
                 "retrying without reasoning."
             )
-            result = self.client.invoke(
+            result = writer.invoke(
                 prompt,
                 tier="heavy",
                 system_prompt=SYSTEM_PROMPT,

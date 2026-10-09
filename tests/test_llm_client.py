@@ -98,17 +98,21 @@ class TestCapabilityRegistry:
             assert entry["api_param_name"] == "reasoning", model
             assert entry["api_param_value"] == {"enabled": False}, model
 
-    def test_default_roster_models_are_all_registered(self):
-        """An unregistered model silently loses reasoning control."""
+    def test_every_configured_rung_is_registered(self):
+        """An unregistered model silently loses reasoning control.
+
+        The chain in config.yaml is the roster now, so this checks the live
+        chain rather than a per-client default table.
+        """
+        import yaml
+
         from scripts.llm_client import _load_capabilities
-        from scripts.openrouter_client import DEFAULT_FALLBACK_MODELS, DEFAULT_MODELS
 
         caps = _load_capabilities()["model_capabilities"]
-        roster = set(DEFAULT_MODELS.values())
-        for chain in DEFAULT_FALLBACK_MODELS.values():
-            roster.update(chain)
+        chains = yaml.safe_load(open("config.yaml"))["llm"]["chains"]
+        roster = {model for rungs in chains.values() for model in rungs}
         missing = roster - set(caps)
-        assert not missing, f"unregistered models in the default roster: {missing}"
+        assert not missing, f"unregistered rungs in llm.chains: {missing}"
 
 
 class TestApiParamDefaults:

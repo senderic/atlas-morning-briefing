@@ -43,6 +43,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts.leak_detection import is_cot_leak
+from scripts.prompt_safety import sanitize_prompt_input
 
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -188,19 +189,22 @@ def build_signals(
         The signal text, or "" when there is nothing to say.
     """
 
+    # Every field here came from a feed or from a model that read one, and the
+    # payload is wrapped in <signals>: each is one line with no tags of its own.
+    def clean(value: Any, max_length: int) -> str:
+        return sanitize_prompt_input(str(value or ""), max_length=max_length).strip()
+
     def summarize(item: Dict[str, Any]) -> str:
-        return str(
-            item.get("brief_summary") or item.get("ai_summary") or ""
-        ).strip()
+        return clean(item.get("brief_summary") or item.get("ai_summary"), 2400)
 
     def plain(item: Dict[str, Any]) -> str:
-        title = str(item.get("title", "")).strip()
+        title = clean(item.get("title"), 500)
         summary = summarize(item)
         return f"- {title}: {summary}" if summary else f"- {title}"
 
     def sourced(item: Dict[str, Any]) -> str:
-        source = str(item.get("source", "")).strip()
-        title = str(item.get("title", "")).strip()
+        source = clean(item.get("source"), 100)
+        title = clean(item.get("title"), 500)
         summary = summarize(item)
         head = f"- [{source}] {title}" if source else f"- {title}"
         return f"{head}: {summary}" if summary else head
@@ -213,7 +217,9 @@ def build_signals(
     ]
     themes = list(emerging_themes or [])[: section.limit("emerging_themes")]
     if themes:
-        blocks.append("EMERGING THEMES:\n" + "\n".join(f"- {t}" for t in themes))
+        blocks.append(
+            "EMERGING THEMES:\n" + "\n".join(f"- {clean(t, 300)}" for t in themes)
+        )
     return "\n\n".join(b for b in blocks if b)
 
 

@@ -37,7 +37,9 @@ def base_config():
 def runner_with_data(base_config, tmp_path, monkeypatch):
     """Builds a runner with no real scanners — methods are patched per test."""
     monkeypatch.chdir(tmp_path)
-    return BriefingRunner(base_config, dry_run=True)
+    # A real run (conftest makes delivery impossible): these tests check what
+    # a run writes, which a dry run no longer does.
+    return BriefingRunner(base_config, dry_run=False)
 
 
 class TestRunOrchestration:
@@ -64,6 +66,102 @@ class TestRunOrchestration:
         assert len(md_files) == 1
         assert len(epub_files) == 1
 
+    def test_default_codex_writer_never_starts_a_real_cli_process(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Catches a test config accidentally invoking the local Codex CLI."""
+        monkeypatch.chdir(tmp_path)
+        runner = BriefingRunner(base_config, dry_run=True)
+        papers = [{"title": "P1", "summary": "abs", "published": "", "arxiv_url": ""}]
+        with patch("scripts.codex_client.subprocess.run") as subprocess_run, \
+             patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            runner.run()
+
+        subprocess_run.assert_not_called()
+
+    def test_chain_and_writer_get_separate_codex_clients(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Catches analysis traffic and report prose sharing one call budget."""
+        monkeypatch.chdir(tmp_path)
+        base_config["codex"] = {
+            "enabled": True,
+            "binary": "/opt/codex",
+            "max_calls_per_run": 5,
+            "chain": {"max_calls_per_run": 40},
+        }
+        base_config["llm"] = {"chains": {
+            "heavy": ["codex/gpt-5.6-sol"],
+            "medium": ["codex/gpt-5.6-terra"],
+            "light": ["codex/gpt-5.6-luna"],
+        }}
+        runner = BriefingRunner(base_config, dry_run=True)
+
+        chain_client = runner.llm_client.clients["codex"]
+        assert chain_client is not runner.codex_client
+        assert (chain_client.role, chain_client.max_calls) == ("chain", 40)
+        assert (runner.codex_client.role, runner.codex_client.max_calls) == ("writer", 5)
+        assert runner.report_writer.codex is runner.codex_client
+        assert [r.model for r in runner.llm_client.chains["medium"]] == ["codex/gpt-5.6-terra"]
+
+    def test_unavailable_codex_leaves_the_deterministic_pipeline_intact(
+        self, base_config, tmp_path, monkeypatch
+    ):
+        """Codex first on every tier must not cost a run that has no Codex."""
+        monkeypatch.chdir(tmp_path)
+        base_config["codex"] = {"enabled": True, "binary": "/opt/missing-codex"}
+        base_config["llm"] = {"chains": {
+            "heavy": ["codex/gpt-5.6-sol"],
+            "medium": ["codex/gpt-5.6-terra"],
+            "light": ["codex/gpt-5.6-luna"],
+        }}
+        runner = BriefingRunner(base_config, dry_run=True)
+        assert runner.intelligence.available is False
+
+        papers = [{"title": "P1", "summary": "abs", "published": "", "arxiv_url": ""}]
+        with patch("scripts.codex_client.subprocess.run") as subprocess_run, \
+             patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            rc = runner.run()
+
+        assert rc in (0, 1)
+        subprocess_run.assert_not_called()
+        # A dry run renders into its own directory, beside the real output.
+        assert len(list((tmp_path / "briefings" / "dry-run").glob("Test-*.md"))) == 1
+
+    def test_writer_generates_executive_and_extension_from_raw_inputs(self, base_config, tmp_path, monkeypatch):
+        """Catches report writing being nested inside unavailable analysis work."""
+        monkeypatch.chdir(tmp_path)
+        base_config["extension_sections"] = [{"key": "reader_angle", "heading": "Reader Angle"}]
+        runner = BriefingRunner(base_config, dry_run=False)
+        writer = MagicMock()
+        writer.available = True
+        writer.invoke.side_effect = ["Writer lede.", "Writer extension."]
+        writer.get_usage_summary.return_value = ""
+        runner.report_writer = writer
+        runner.intelligence.report_writer = writer
+        analysis_client = MagicMock()
+        analysis_client.available = False
+        runner.intelligence.client = analysis_client
+
+        papers = [{"title": "Raw paper", "summary": "Raw abstract", "published": "", "arxiv_url": ""}]
+        with patch.object(runner, "run_arxiv_scan", return_value=papers), \
+             patch.object(runner, "run_blog_scan", return_value=[]), \
+             patch.object(runner, "run_stock_fetch", return_value=[]), \
+             patch.object(runner, "run_news_aggregation", return_value=[]):
+            assert runner.run() in (0, 1)
+
+        markdown = next((tmp_path / "briefings").glob("Test-*.md")).read_text()
+        assert "Writer lede." in markdown
+        assert "## Reader Angle" in markdown
+        assert "Writer extension." in markdown
+        analysis_client.invoke.assert_not_called()
+
     def test_run_with_pdf_enabled(self, base_config, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         base_config["pdf"]["enabled"] = True
@@ -74,7 +172,7 @@ class TestRunOrchestration:
              patch.object(runner, "run_stock_fetch", return_value=[]), \
              patch.object(runner, "run_news_aggregation", return_value=[]):
             runner.run()
-        assert list((tmp_path / "briefings").glob("Test-*.pdf"))
+        assert list((tmp_path / "briefings" / "dry-run").glob("Test-*.pdf"))
         assert runner.status["pdf_generated"] is True
 
     def test_run_records_errors_returns_1(self, runner_with_data):
@@ -305,7 +403,7 @@ class TestStatusFilePerPipeline:
         monkeypatch.chdir(tmp_path)
         config = dict(base_config)
         config.update(overrides)
-        return BriefingRunner(config, dry_run=True)
+        return BriefingRunner(config, dry_run=False)
 
     def test_defaults_to_status_json(self, base_config, tmp_path, monkeypatch):
         runner = self._runner(base_config, tmp_path, monkeypatch)
@@ -356,7 +454,7 @@ class TestDegradedSynthesisIsRecorded:
 
     def _runner(self, base_config, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        return BriefingRunner(base_config, dry_run=True)
+        return BriefingRunner(base_config, dry_run=False)
 
     def test_placeholder_summary_records_an_error(self, base_config, tmp_path, monkeypatch):
         runner = self._runner(base_config, tmp_path, monkeypatch)
